@@ -1817,6 +1817,46 @@ s_nop 1
 v_cndmask_b32_e32 v[vgprLocalReadAddrB], v[vgprLocalReadAddrB], v[vgprTmp0], vcc
 
 
+// VMEM Read A
+s_mov_b32 m0, s[sgprLocalWriteAddrA]               // m0 <- LDS write address
+buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], 0 offen offset:0 sc1 lds // G -> Reg 0_0_0_0
+s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
+buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+0] offen offset:0 sc1 lds // G -> Reg 0_0_1_0
+s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
+buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+1] offen offset:0 sc1 lds // G -> Reg 0_0_2_0
+s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
+buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+2] offen offset:0 sc1 lds // G -> Reg 0_0_3_0
+s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
+buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+3] offen offset:0 sc1 lds // G -> Reg 0_0_4_0
+s_waitcnt lgkmcnt(0)                               // wait for prior local read local write old=0, new=0 newLW=0 newLR=0
+s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
+buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+4] offen offset:0 sc1 lds // G -> Reg 0_0_5_0
+s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
+buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+5] offen offset:0 sc1 lds // G -> Reg 0_0_6_0
+s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
+buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+6] offen offset:0 sc1 lds // G -> Reg 0_0_7_0
+
+// VMEM Read B
+s_mov_b32 m0, s[sgprLocalWriteAddrB]               // m0 <- LDS write address
+buffer_load_dwordx4 v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], 0 offen offset:0 sc0 lds // G -> Reg 0_0_0_0
+s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
+buffer_load_dwordx4 v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], s[sgprScalarGlobalReadOffsetB+0] offen offset:0 sc0 lds // G -> Reg 0_0_1_0
+s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
+buffer_load_dwordx4 v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], s[sgprScalarGlobalReadOffsetB+1] offen offset:0 sc0 lds // G -> Reg 0_0_2_0
+
+// Double buffer A & B
+;s_xor_b32 s[sgprLocalWriteAddrA], 0x10000, s[sgprLocalWriteAddrA] // swap Red Blk SGPR
+;s_xor_b32 s[sgprLocalWriteAddrB], 0x10000, s[sgprLocalWriteAddrB] // swap Red Blk SGPR
+s_add_u32 s[sgprLocalWriteAddrA], s[sgprLocalWriteAddrA], LDSBufferSize
+s_add_u32 s[sgprLocalWriteAddrB], s[sgprLocalWriteAddrB], LDSBufferSize
+s_sub_u32 s[sgprTmp0], s[sgprLocalWriteAddrA], TotalLDSBufferSize
+s_sub_u32 s[sgprTmp1], s[sgprLocalWriteAddrB], TotalLDSBufferSize
+s_cmp_ge_u32 s[sgprLocalWriteAddrA], TotalLDSBufferSize
+s_cselect_b32 s[sgprLocalWriteAddrA], s[sgprTmp0], s[sgprLocalWriteAddrA]
+s_cselect_b32 s[sgprLocalWriteAddrB], s[sgprTmp1], s[sgprLocalWriteAddrB]
+
+
+
 //K=0
 v_mfma_f32_16x16x32_bf16 acc[0:3], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+0+0+0:vgprValuA_X0_I0+0+0+0+3], acc[0:3] // left value = acc[0+0:3+0]
 v_mfma_f32_16x16x32_bf16 acc[4:7], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+4+0+0:vgprValuA_X0_I0+4+0+0+3], acc[4:7] // left value = acc[4+0:7+0]
@@ -1871,44 +1911,6 @@ v_mfma_f32_16x16x32_bf16 acc[84:87], v[vgprValuB_X1_I0+8+0+0:vgprValuB_X1_I0+8+0
 v_mfma_f32_16x16x32_bf16 acc[88:91], v[vgprValuB_X1_I0+8+0+0:vgprValuB_X1_I0+8+0+0+3], v[vgprValuA_X1_I0+24+0+0:vgprValuA_X1_I0+24+0+0+3], acc[88:91] // left value = acc[88+0:91+0]
 v_mfma_f32_16x16x32_bf16 acc[92:95], v[vgprValuB_X1_I0+8+0+0:vgprValuB_X1_I0+8+0+0+3], v[vgprValuA_X1_I0+28+0+0:vgprValuA_X1_I0+28+0+0+3], acc[92:95] // left value = acc[92+0:95+0]
 
-
-// VMEM Read A
-s_mov_b32 m0, s[sgprLocalWriteAddrA]               // m0 <- LDS write address
-buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], 0 offen offset:0 sc1 lds // G -> Reg 0_0_0_0
-s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
-buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+0] offen offset:0 sc1 lds // G -> Reg 0_0_1_0
-s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
-buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+1] offen offset:0 sc1 lds // G -> Reg 0_0_2_0
-s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
-buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+2] offen offset:0 sc1 lds // G -> Reg 0_0_3_0
-s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
-buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+3] offen offset:0 sc1 lds // G -> Reg 0_0_4_0
-s_waitcnt lgkmcnt(0)                               // wait for prior local read local write old=0, new=0 newLW=0 newLR=0
-s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
-buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+4] offen offset:0 sc1 lds // G -> Reg 0_0_5_0
-s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
-buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+5] offen offset:0 sc1 lds // G -> Reg 0_0_6_0
-s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
-buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], s[sgprScalarGlobalReadOffsetA+6] offen offset:0 sc1 lds // G -> Reg 0_0_7_0
-
-// VMEM Read B
-s_mov_b32 m0, s[sgprLocalWriteAddrB]               // m0 <- LDS write address
-buffer_load_dwordx4 v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], 0 offen offset:0 sc0 lds // G -> Reg 0_0_0_0
-s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
-buffer_load_dwordx4 v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], s[sgprScalarGlobalReadOffsetB+0] offen offset:0 sc0 lds // G -> Reg 0_0_1_0
-s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
-buffer_load_dwordx4 v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], s[sgprScalarGlobalReadOffsetB+1] offen offset:0 sc0 lds // G -> Reg 0_0_2_0
-
-// Double buffer A & B
-;s_xor_b32 s[sgprLocalWriteAddrA], 0x10000, s[sgprLocalWriteAddrA] // swap Red Blk SGPR
-;s_xor_b32 s[sgprLocalWriteAddrB], 0x10000, s[sgprLocalWriteAddrB] // swap Red Blk SGPR
-s_add_u32 s[sgprLocalWriteAddrA], s[sgprLocalWriteAddrA], LDSBufferSize
-s_add_u32 s[sgprLocalWriteAddrB], s[sgprLocalWriteAddrB], LDSBufferSize
-s_sub_u32 s[sgprTmp0], s[sgprLocalWriteAddrA], TotalLDSBufferSize
-s_sub_u32 s[sgprTmp1], s[sgprLocalWriteAddrB], TotalLDSBufferSize
-s_cmp_ge_u32 s[sgprLocalWriteAddrA], TotalLDSBufferSize
-s_cselect_b32 s[sgprLocalWriteAddrA], s[sgprTmp0], s[sgprLocalWriteAddrA]
-s_cselect_b32 s[sgprLocalWriteAddrB], s[sgprTmp1], s[sgprLocalWriteAddrB]
 
 // WAIT for previous global-to-lds before reading 0
 s_waitcnt vmcnt(11) 
