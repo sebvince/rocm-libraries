@@ -1773,6 +1773,35 @@ label_LoopBeginL:
 
 s_waitcnt lgkmcnt(0)                               // wait for prior local read local write old=0, new=2 newLW=0 newLR=2 for iteration == 0
 
+
+//K=0
+v_mfma_f32_16x16x32_bf16 acc[0:3], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+0+0+0:vgprValuA_X0_I0+0+0+0+3], acc[0:3] // left value = acc[0+0:3+0]
+v_mfma_f32_16x16x32_bf16 acc[4:7], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+4+0+0:vgprValuA_X0_I0+4+0+0+3], acc[4:7] // left value = acc[4+0:7+0]
+v_mfma_f32_16x16x32_bf16 acc[8:11], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+8+0+0:vgprValuA_X0_I0+8+0+0+3], acc[8:11] // left value = acc[8+0:11+0]
+v_mfma_f32_16x16x32_bf16 acc[12:15], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+12+0+0:vgprValuA_X0_I0+12+0+0+3], acc[12:15] // left value = acc[12+0:15+0]
+v_mfma_f32_16x16x32_bf16 acc[16:19], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+16+0+0:vgprValuA_X0_I0+16+0+0+3], acc[16:19] // left value = acc[16+0:19+0]
+v_mfma_f32_16x16x32_bf16 acc[20:23], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+20+0+0:vgprValuA_X0_I0+20+0+0+3], acc[20:23] // left value = acc[20+0:23+0]
+v_mfma_f32_16x16x32_bf16 acc[24:27], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+24+0+0:vgprValuA_X0_I0+24+0+0+3], acc[24:27] // left value = acc[24+0:27+0]
+v_mfma_f32_16x16x32_bf16 acc[28:31], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+28+0+0:vgprValuA_X0_I0+28+0+0+3], acc[28:31] // left value = acc[28+0:31+0]
+v_mfma_f32_16x16x32_bf16 acc[32:35], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+0+0+0:vgprValuA_X0_I0+0+0+0+3], acc[32:35] // left value = acc[32+0:35+0]
+v_mfma_f32_16x16x32_bf16 acc[36:39], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+4+0+0:vgprValuA_X0_I0+4+0+0+3], acc[36:39] // left value = acc[36+0:39+0]
+v_mfma_f32_16x16x32_bf16 acc[40:43], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+8+0+0:vgprValuA_X0_I0+8+0+0+3], acc[40:43] // left value = acc[40+0:43+0]
+v_mfma_f32_16x16x32_bf16 acc[44:47], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+12+0+0:vgprValuA_X0_I0+12+0+0+3], acc[44:47] // left value = acc[44+0:47+0]
+v_mfma_f32_16x16x32_bf16 acc[48:51], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+16+0+0:vgprValuA_X0_I0+16+0+0+3], acc[48:51] // left value = acc[48+0:51+0]
+v_mfma_f32_16x16x32_bf16 acc[52:55], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+20+0+0:vgprValuA_X0_I0+20+0+0+3], acc[52:55] // left value = acc[52+0:55+0]
+v_mfma_f32_16x16x32_bf16 acc[56:59], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+24+0+0:vgprValuA_X0_I0+24+0+0+3], acc[56:59] // left value = acc[56+0:59+0]
+v_mfma_f32_16x16x32_bf16 acc[60:63], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+28+0+0:vgprValuA_X0_I0+28+0+0+3], acc[60:63] // left value = acc[60+0:63+0]
+v_mfma_f32_16x16x32_bf16 acc[64:67], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+0+0+0:vgprValuA_X0_I0+0+0+0+3], acc[64:67] // left value = acc[64+0:67+0]
+v_mfma_f32_16x16x32_bf16 acc[68:71], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+4+0+0:vgprValuA_X0_I0+4+0+0+3], acc[68:71] // left value = acc[68+0:71+0]
+v_mfma_f32_16x16x32_bf16 acc[72:75], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+8+0+0:vgprValuA_X0_I0+8+0+0+3], acc[72:75] // left value = acc[72+0:75+0]
+v_mfma_f32_16x16x32_bf16 acc[76:79], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+12+0+0:vgprValuA_X0_I0+12+0+0+3], acc[76:79] // left value = acc[76+0:79+0]
+v_mfma_f32_16x16x32_bf16 acc[84:87], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+20+0+0:vgprValuA_X0_I0+20+0+0+3], acc[84:87] // left value = acc[84+0:87+0]
+v_mfma_f32_16x16x32_bf16 acc[80:83], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+16+0+0:vgprValuA_X0_I0+16+0+0+3], acc[80:83] // left value = acc[80+0:83+0]
+v_mfma_f32_16x16x32_bf16 acc[88:91], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+24+0+0:vgprValuA_X0_I0+24+0+0+3], acc[88:91] // left value = acc[88+0:91+0]
+v_mfma_f32_16x16x32_bf16 acc[92:95], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+28+0+0:vgprValuA_X0_I0+28+0+0+3], acc[92:95] // left value = acc[92+0:95+0]
+
+
+
 //Offsets for VMEM
 s_cmp_eq_u32 s[sgprLoopCounterL], s[sgprStaggerUIter] // Is this the wrapIter?
 s_cselect_b32 s60, s[sgprWrapUA+0], s[sgprGlobalReadIncsA+0] // incLower <- ?
@@ -1851,35 +1880,7 @@ s_cmp_ge_u32 s[sgprLocalWriteAddrA], TotalLDSBufferSize
 s_cselect_b32 s[sgprLocalWriteAddrA], s[sgprTmp0], s[sgprLocalWriteAddrA]
 s_cselect_b32 s[sgprLocalWriteAddrB], s[sgprTmp1], s[sgprLocalWriteAddrB]
 
-
-
-//K=0
-v_mfma_f32_16x16x32_bf16 acc[0:3], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+0+0+0:vgprValuA_X0_I0+0+0+0+3], acc[0:3] // left value = acc[0+0:3+0]
-v_mfma_f32_16x16x32_bf16 acc[4:7], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+4+0+0:vgprValuA_X0_I0+4+0+0+3], acc[4:7] // left value = acc[4+0:7+0]
-v_mfma_f32_16x16x32_bf16 acc[8:11], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+8+0+0:vgprValuA_X0_I0+8+0+0+3], acc[8:11] // left value = acc[8+0:11+0]
-v_mfma_f32_16x16x32_bf16 acc[12:15], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+12+0+0:vgprValuA_X0_I0+12+0+0+3], acc[12:15] // left value = acc[12+0:15+0]
-v_mfma_f32_16x16x32_bf16 acc[16:19], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+16+0+0:vgprValuA_X0_I0+16+0+0+3], acc[16:19] // left value = acc[16+0:19+0]
-v_mfma_f32_16x16x32_bf16 acc[20:23], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+20+0+0:vgprValuA_X0_I0+20+0+0+3], acc[20:23] // left value = acc[20+0:23+0]
-v_mfma_f32_16x16x32_bf16 acc[24:27], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+24+0+0:vgprValuA_X0_I0+24+0+0+3], acc[24:27] // left value = acc[24+0:27+0]
-v_mfma_f32_16x16x32_bf16 acc[28:31], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+28+0+0:vgprValuA_X0_I0+28+0+0+3], acc[28:31] // left value = acc[28+0:31+0]
-v_mfma_f32_16x16x32_bf16 acc[32:35], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+0+0+0:vgprValuA_X0_I0+0+0+0+3], acc[32:35] // left value = acc[32+0:35+0]
-v_mfma_f32_16x16x32_bf16 acc[36:39], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+4+0+0:vgprValuA_X0_I0+4+0+0+3], acc[36:39] // left value = acc[36+0:39+0]
-v_mfma_f32_16x16x32_bf16 acc[40:43], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+8+0+0:vgprValuA_X0_I0+8+0+0+3], acc[40:43] // left value = acc[40+0:43+0]
-v_mfma_f32_16x16x32_bf16 acc[44:47], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+12+0+0:vgprValuA_X0_I0+12+0+0+3], acc[44:47] // left value = acc[44+0:47+0]
-v_mfma_f32_16x16x32_bf16 acc[48:51], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+16+0+0:vgprValuA_X0_I0+16+0+0+3], acc[48:51] // left value = acc[48+0:51+0]
-v_mfma_f32_16x16x32_bf16 acc[52:55], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+20+0+0:vgprValuA_X0_I0+20+0+0+3], acc[52:55] // left value = acc[52+0:55+0]
-v_mfma_f32_16x16x32_bf16 acc[56:59], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+24+0+0:vgprValuA_X0_I0+24+0+0+3], acc[56:59] // left value = acc[56+0:59+0]
-v_mfma_f32_16x16x32_bf16 acc[60:63], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+28+0+0:vgprValuA_X0_I0+28+0+0+3], acc[60:63] // left value = acc[60+0:63+0]
-v_mfma_f32_16x16x32_bf16 acc[64:67], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+0+0+0:vgprValuA_X0_I0+0+0+0+3], acc[64:67] // left value = acc[64+0:67+0]
-v_mfma_f32_16x16x32_bf16 acc[68:71], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+4+0+0:vgprValuA_X0_I0+4+0+0+3], acc[68:71] // left value = acc[68+0:71+0]
-v_mfma_f32_16x16x32_bf16 acc[72:75], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+8+0+0:vgprValuA_X0_I0+8+0+0+3], acc[72:75] // left value = acc[72+0:75+0]
-v_mfma_f32_16x16x32_bf16 acc[76:79], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+12+0+0:vgprValuA_X0_I0+12+0+0+3], acc[76:79] // left value = acc[76+0:79+0]
-v_mfma_f32_16x16x32_bf16 acc[84:87], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+20+0+0:vgprValuA_X0_I0+20+0+0+3], acc[84:87] // left value = acc[84+0:87+0]
-v_mfma_f32_16x16x32_bf16 acc[80:83], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+16+0+0:vgprValuA_X0_I0+16+0+0+3], acc[80:83] // left value = acc[80+0:83+0]
-v_mfma_f32_16x16x32_bf16 acc[88:91], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+24+0+0:vgprValuA_X0_I0+24+0+0+3], acc[88:91] // left value = acc[88+0:91+0]
-v_mfma_f32_16x16x32_bf16 acc[92:95], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+28+0+0:vgprValuA_X0_I0+28+0+0+3], acc[92:95] // left value = acc[92+0:95+0]
-
-
+s_waitcnt lgkmcnt(0)    
 //K=1
 v_mfma_f32_16x16x32_bf16 acc[0:3], v[vgprValuB_X1_I0+0+0+0:vgprValuB_X1_I0+0+0+0+3], v[vgprValuA_X1_I0+0+0+0:vgprValuA_X1_I0+0+0+0+3], acc[0:3] // left value = acc[0+0:3+0]
 v_mfma_f32_16x16x32_bf16 acc[4:7], v[vgprValuB_X1_I0+0+0+0:vgprValuB_X1_I0+0+0+0+3], v[vgprValuA_X1_I0+4+0+0:vgprValuA_X1_I0+4+0+0+3], acc[4:7] // left value = acc[4+0:7+0]
