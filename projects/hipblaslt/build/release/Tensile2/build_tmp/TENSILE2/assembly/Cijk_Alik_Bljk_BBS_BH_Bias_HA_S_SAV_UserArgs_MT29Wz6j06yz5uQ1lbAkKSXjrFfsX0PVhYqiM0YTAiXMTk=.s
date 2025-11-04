@@ -1773,7 +1773,7 @@ label_LoopBeginL:
 
 s_waitcnt lgkmcnt(0)                               // wait for prior local read local write old=0, new=2 newLW=0 newLR=2 for iteration == 0
 
-
+//Offsets for VMEM
 s_cmp_eq_u32 s[sgprLoopCounterL], s[sgprStaggerUIter] // Is this the wrapIter?
 s_cselect_b32 s60, s[sgprWrapUA+0], s[sgprGlobalReadIncsA+0] // incLower <- ?
 s_cselect_b32 s61, s[sgprWrapUA+1], 0              // incUpper <- ?
@@ -1801,8 +1801,6 @@ ds_read_b128 v[vgprValuB_X1_I0+4:vgprValuB_X1_I0+4+3], v[vgprLocalReadAddrB] off
 ds_read_b128 v[vgprValuB_X1_I0+8:vgprValuB_X1_I0+8+3], v[vgprLocalReadAddrB] offset:8512 // L -> Reg lro=32 swapByteOffset=0 ti=32 vIdx=2 eIdx=0 rIdx=0 oIdx=0 buffer=1 iui=0
 
 //double buffer read LDS
-;v_xor_b32 v[vgprLocalReadAddrA], 0x10000, v[vgprLocalReadAddrA] // swap Red Blk
-;v_xor_b32 v[vgprLocalReadAddrB], 0x10000, v[vgprLocalReadAddrB] // swap Red Blk
 
 v_add_u32 v[vgprLocalReadAddrA], LDSBufferSize, v[vgprLocalReadAddrA]
 v_subrev_u32 v[vgprTmp0], TotalLDSBufferSize, v[vgprLocalReadAddrA]
@@ -1845,8 +1843,6 @@ s_add_u32 m0, m0, 4224                             // Move LDS write address to 
 buffer_load_dwordx4 v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], s[sgprScalarGlobalReadOffsetB+1] offen offset:0 sc0 lds // G -> Reg 0_0_2_0
 
 // Double buffer A & B
-;s_xor_b32 s[sgprLocalWriteAddrA], 0x10000, s[sgprLocalWriteAddrA] // swap Red Blk SGPR
-;s_xor_b32 s[sgprLocalWriteAddrB], 0x10000, s[sgprLocalWriteAddrB] // swap Red Blk SGPR
 s_add_u32 s[sgprLocalWriteAddrA], s[sgprLocalWriteAddrA], LDSBufferSize
 s_add_u32 s[sgprLocalWriteAddrB], s[sgprLocalWriteAddrB], LDSBufferSize
 s_sub_u32 s[sgprTmp0], s[sgprLocalWriteAddrA], TotalLDSBufferSize
@@ -1883,7 +1879,6 @@ v_mfma_f32_16x16x32_bf16 acc[80:83], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0
 v_mfma_f32_16x16x32_bf16 acc[88:91], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+24+0+0:vgprValuA_X0_I0+24+0+0+3], acc[88:91] // left value = acc[88+0:91+0]
 v_mfma_f32_16x16x32_bf16 acc[92:95], v[vgprValuB_X0_I0+8+0+0:vgprValuB_X0_I0+8+0+0+3], v[vgprValuA_X0_I0+28+0+0:vgprValuA_X0_I0+28+0+0+3], acc[92:95] // left value = acc[92+0:95+0]
 
-s_waitcnt lgkmcnt(0)
 
 //K=1
 v_mfma_f32_16x16x32_bf16 acc[0:3], v[vgprValuB_X1_I0+0+0+0:vgprValuB_X1_I0+0+0+0+3], v[vgprValuA_X1_I0+0+0+0:vgprValuA_X1_I0+0+0+0+3], acc[0:3] // left value = acc[0+0:3+0]
