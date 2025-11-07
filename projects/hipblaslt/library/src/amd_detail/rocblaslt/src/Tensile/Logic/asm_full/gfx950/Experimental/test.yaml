@@ -99,10 +99,10 @@
     ConvertAfterDS: false
     CustomKernelName: ''
     DebugStreamK: 0
-    DepthU: 128
-    DirectToLds: 0
-    DirectToLdsA: false
-    DirectToLdsB: false
+    DepthU: 64
+    DirectToLds: true
+    DirectToLdsA: true
+    DirectToLdsB: true
     DirectToVgprA: false
     DirectToVgprB: false
     DirectToVgprSparseMetadata: false
@@ -180,7 +180,7 @@
     MIOutputVectorWidth: 4
     MIRegPerOut: 1
     MIWaveGroup: [2, 2]
-    MIWaveTile: [4, 3]
+    MIWaveTile: [3, 3]
     MIWaveTileA: 4
     MIWaveTileB: 3
     MIWaveTileMetadata: 0
@@ -207,10 +207,10 @@
     NonDTLTailLoopA: true
     NonDTLTailLoopB: true
     NonTemporal: -1
-    NonTemporalA: 1
-    NonTemporalB: 7
+    NonTemporalA: 5
+    NonTemporalB: 6
     NonTemporalC: 5
-    NonTemporalD: 7
+    NonTemporalD: 5
     NonTemporalE: 0
     NonTemporalMetadata: 0
     NonTemporalWS: 0
@@ -250,7 +250,7 @@
     StoreRemapVectorWidth: 0
     StoreSwapAddr: false
     StoreSyncOpt: 0
-    StoreVectorWidth: 4
+    StoreVectorWidth: 1
     StreamK: 3
     StreamKAtomic: 0
     StreamKFixupTreeReduction: 0
@@ -283,7 +283,7 @@
     UseSgprForGRO: -1
     Valid: true
     VectorStore: -1
-    VectorWidthA: 4
+    VectorWidthA: 1
     VectorWidthB: 1
     WaveSeparateGlobalReadA: 0
     WaveSeparateGlobalReadB: 0
@@ -296,9 +296,9 @@
     WorkGroupMappingXCCGroup: -1
     WorkGroupReduction: false
     WorkspaceCheck: [4, 0, 0]
-    _DepthU: 128
-    _DepthUA: 128
-    _DepthUB: 128
+    _DepthU: 64
+    _DepthUA: 64
+    _DepthUB: 64
     _DepthUMetadata: 128
     _GlobalAccumulation: PartialsBuffer
     _UseSgprForGRO: 1
@@ -315,7 +315,7 @@
     tailLoopOptA: true
     tailLoopOptB: true
 - [2, 3, 0, 1]
-- - - [768, 3072, 1, 2560]
+- - - [1536, 3072, 1, 2560]
     - [0, 0.0]
 - null
 - null
