@@ -273,6 +273,7 @@ def hasCustomSchedule(kernel):
     is256x256x64DTL  = [MT0, MT1, DU, PGR, PLR, DTL] == [256, 256, 64, 2, 1, True]
     is192x256x64DTL  = [MT0, MT1, DU, PGR, PLR, DTL] == [192, 256, 64, 2, 1, True]
     is256x256x128DTL = [MT0, MT1, DU, PGR, PLR, DTL] == [256, 256, 128, 2, 0, True]
+    is256x160x64DTL  = [MT0, MT1, DU, PGR, PLR, DTL] == [256, 160, 64, 2, 1, True]
 
 
     transA = kernel["ProblemType"]["TransposeA"]
@@ -516,6 +517,45 @@ def hasCustomSchedule(kernel):
             return False, None
 
         numMfma = 96
+        opt1 = ScheduleInfo(2, numMfma, optSchedule, syncCode)
+        return True, opt1
+    elif is256x160x64DTL and is16bit and not isMixed and ([GRVWA, GRVWB, LRVW] == [8,8,8]) and MI == [16,16,32,1] and MIWG == [2,2]:
+        kernel["MfmaInitCVgprs"] = True
+
+        optSchedule = dict()
+        syncCode = []
+        if isTN and TLDS == 1:
+            optSchedule = {
+                'SYNC'   : [[-1,8,21, 21,63, 63]],
+                #Addr. update (be done before GRA/GRB)
+                'GRIncB' : [[0,1,2,3,4,5,6,7,8]],
+                'GRIncA' : [[9,10,11,12,13,14,15,16,17]],
+                #Current iteration
+                'LRA0'   : [[0,1,2,3,4,5,6,7]],
+                'LRB0'   : [[8,9,10,11,12]],
+                #Buffer loads.
+                'GRA'    : [[19,21, 23,23, 26,26, 30,30, 33,33, 37,37, 40,40, 44,44]],
+                'GRB'    : [[47,47, 51,51, 54,54, 57,57, 61,61]],
+                #Prefetch next iteration.
+                'LRA1'   : [[64,66,67,68,69,70,71,72]],
+                'LRB1'   : [[65,73,74,75,76]],
+                'LRSA'   : [[39]],#swap buffers
+                'LRSB'   : [[39]],#swap buffers
+                'LWSA'   : [[61]],#swap buffers
+                'LWSB'   : [[61]],#swap buffers
+                'LCC'   : [[79, 79]], #loop control
+            }
+            syncCode = [SWaitCnt(dscnt=4, vlcnt=-1, vscnt=-1, comment=""),
+                        SWaitCnt(dscnt=8, vlcnt=-1, vscnt=-1, comment=""),
+                        SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment=""),
+                        SBarrier(comment=""),
+                        SWaitCnt(dscnt=-1, vlcnt=(5 + 8), vscnt=-1, comment="Wait for previous GRA to completely"),
+                        SBarrier(comment="")]
+        else:
+            return False, None
+
+
+        numMfma = 80
         opt1 = ScheduleInfo(2, numMfma, optSchedule, syncCode)
         return True, opt1
 
