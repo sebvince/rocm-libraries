@@ -560,11 +560,13 @@ def hasCustomSchedule(kernel):
                 'GRIncB' : [[0,1,2,3,4,5,6,7,8]],
                 'GRIncA' : [[9,10,11,12,13,14,15,16,17]],
                 #Current iteration
-                'LRA0'   : [[0,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10]],
-                'LRB0'   : [[2,11,12,13,14]],
+                # 'LRA0'   : [[0,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10]],
+                # 'LRB0'   : [[2,11,12,13,14]],
+                'LRA0'   : [[5,5,7,7,9,9,11,11,13,13,15,15,17,17,19,19]],
+                'LRB0'   : [[0,0,1,2,3]],
                 #Buffer loads.
                 'GRA'    : [[24,24, 27,27, 30,30, 33,33, 36,36, 40,40, 43,43, 47,47]],
-                'GRB'    : [[50,50, 54,54, 57,57, 77,77, 78,78]], 
+                'GRB'    : [[50,50, 54,54, 57,57, 77,77, 78, 78]], 
                 #Prefetch next iteration.
                 'LRA1'   : [[64,65,65,66,66,67,67,68,68,69,69,70,70,71,71,72]],
                 'LRB1'   : [[64,73,74,75,76]],
@@ -575,7 +577,7 @@ def hasCustomSchedule(kernel):
                 'LCC'   : [[79, 79]], #loop control
             }
             syncCode = [SWaitCnt(dscnt=4, vlcnt=-1, vscnt=-1, comment=""),
-                        SWaitCnt(dscnt=14, vlcnt=-1, vscnt=-1, comment=""),
+                        SWaitCnt(dscnt=9, vlcnt=-1, vscnt=-1, comment=""),
                         SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment=""),
                         SBarrier(comment=""),
                         SWaitCnt(dscnt=-1, vlcnt=(5 + 8), vscnt=-1, comment="Wait for previous GRA to completely"),
