@@ -582,7 +582,7 @@ def hasCustomSchedule(kernel):
                 'LWSB'   : [[60]],
                 'LCC'   : [[79, 79]], #loop control
             }
-            syncCode = [SWaitCnt(dscnt=4, vlcnt=-1, vscnt=-1, comment=""),
+            syncCode = [SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment=""),
                         SWaitCnt(dscnt=5, vlcnt=-1, vscnt=-1, comment=""),
                         SBarrier(comment=""),
                         SWaitCnt(dscnt=9, vlcnt=-1, vscnt=-1, comment=""),
