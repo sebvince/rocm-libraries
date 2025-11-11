@@ -559,12 +559,12 @@ def hasCustomSchedule(kernel):
                 12,12,#Wait for B
                 8,
                 24, 24,#wait LRB0
-                27,27,#wait GRB
+                # 27,27,#wait GRB
                 61, 61 #wait GRA
                 ]],
                 #Addr. update (be done before GRA/GRB)
                 'GRIncB' : [[0,1,2,3,4,5,6,7,8]],
-                'GRIncA' : [[9,10,11,12,13,14,15,16,17]],
+                'GRIncA' : [[9,10,10,10,13,14,15,16,17]],
                 #Current iteration
                 # 'LRA0'   : [[0,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10]],
                 # 'LRB0'   : [[2,11,12,13,14]],
@@ -572,7 +572,7 @@ def hasCustomSchedule(kernel):
                 'LRB0'   : [[0,0,1,2,3]],
                 #Buffer loads.
                 'GRA'    : [[30,30, 33,33, 36,36, 52,52, 56,56, 60,61, 76,77, 78,78]],
-                'GRB'    : [[12,12, 16,16, 20,20, 23,25, 26, 28]], 
+                'GRB'    : [[11,12, 16,16, 20,20, 23,25, 26, 28]], 
                 #Prefetch next iteration.
                 'LRA1'   : [[62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77]],
                 'LRB1'   : [[41,42,43,44,45]],
@@ -586,11 +586,11 @@ def hasCustomSchedule(kernel):
                         SWaitCnt(dscnt=5, vlcnt=-1, vscnt=-1, comment=""),
                         SBarrier(comment=""),
                         SWaitCnt(dscnt=9, vlcnt=-1, vscnt=-1, comment=""),
-                        SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment=""),
+                        SWaitCnt(dscnt=0, vlcnt=(5 + 5 - 1 ), vscnt=-1, comment=""),
                         SBarrier(comment=""),
                         #Wait for GRB to complete
-                        SWaitCnt(dscnt=-1, vlcnt=(5 + 5), vscnt=-1, comment="Wait for previous GRB to complete"),
-                        SBarrier(comment=""),
+                        # SWaitCnt(dscnt=-1, vlcnt=(5 + 5), vscnt=-1, comment="Wait for previous GRB to complete"),
+                        # SBarrier(comment=""),
                         #Wait for GRA to complete
                         SWaitCnt(dscnt=-1, vlcnt=(5 + 8), vscnt=-1, comment="Wait for previous GRA to complete"),
                         SBarrier(comment="")]
