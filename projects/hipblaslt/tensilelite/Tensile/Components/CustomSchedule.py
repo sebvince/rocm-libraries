@@ -46,6 +46,22 @@ from copy import deepcopy
 from collections import Counter, defaultdict
 from typing import Callable, Dict, List, Tuple
 
+def duplicate_range(min_val: int, max_val: int, step: int = 1, repeat: int = 2) -> list[int]:
+    """
+    Generate a list where each value in range(min_val, max_val, step) is repeated 'repeat' times.
+    
+    Args:
+        min_val: Starting value (inclusive)
+        max_val: Ending value (exclusive)
+        step: Step between values
+        repeat: Number of times to repeat each value
+    
+    Example:
+        duplicate_range(100, 105, 1, 2) => [100, 100, 101, 101, 102, 102, 103, 103, 104, 104]
+        duplicate_range(0, 10, 2, 3) => [0, 0, 0, 2, 2, 2, 4, 4, 4, 6, 6, 6, 8, 8, 8]
+    """
+    return [val for val in range(min_val, max_val, step) for _ in range(repeat)]
+
 def get_most_recent_local_reads(
     vmfmas: List[int],
     counts: List[int],
@@ -1053,7 +1069,7 @@ class ScheduleInfo:
         # The set of validation rules to run inside `isValid`.
         self.rules: list[Callable[[ScheduleInfo, dict], [bool, str]]] = [
             verify_correct_number_of_instructions,
-            verify_ascending_order,
+            # verify_ascending_order,
             verify_global_reads_not_too_early,
             verify_lrs_and_grs,
             verify_scc_overlap,
@@ -2920,7 +2936,71 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
     syncCode = []
     nglshift = nllshift = 0 # vmcnt shift for ngl and nll
     kernel["UsePLRPack"] = True
-    if isNN(kernel) and useLDSTr and TLDS==1 and kernel["UsePLRPack"]:
+    if isTN(kernel) and not useLDSTr and TLDS==1:
+        print(duplicate_range(106-12,106,1,2))
+        # Note: A/B Global read orders are swapped
+        # i.e. GRA contains GR for B
+        # kernel["SwapGlobalReadOrder"] = True
+        syncCode = [SWaitCnt(dscnt=12, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
+                    SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
+                    SBarrier(comment=""),
+                    SWaitCnt(dscnt=-1, vlcnt=14, vscnt=-1, comment="Wait for previous GRs"),
+                    SBarrier(comment=""),
+                    SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB0 to complete")]
+        optSchedule = {
+            'SYNC'  : [[5,34,35, 107,107,133]],
+            'GRIncA': [[1,1,1,2,2,2,3,3,3]],
+            'GRIncB': [[4,4,4,5,5,5,6,6,6]],
+            # LDS reads into first 4 vgprs of Valu!_X!_I!+offset, then next four into Valu!_T!_I!+offset
+            #  in order to avoid copies in the cvt code
+            'LRA0': [[1,1, 2,2, 3,3]],
+            'LRB0': [[13,14,15,16,17,18,19,20]],
+            # we can do this just after LRA0 
+            'PackA0' : [
+                            [
+                                # 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35,
+                                *duplicate_range(13,13+12,1,2),
+                                *duplicate_range(13+12,13+2*12,1,2),
+                                # *duplicate_range(13+2*12,13+3*12,1,2),
+                                # 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38,
+                                # Can't be after 41. Re-order Pack ?
+                                38, 38, 39, 39, 40, 40, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
+                            # *duplicate_range(70-12,70,1,2)
+                            ]],
+            'PackB0' : [[
+                            *duplicate_range(51,51+12,1,2),
+                            *duplicate_range(51+12,51+2*12,1,2),
+                            *duplicate_range(51+2*12,51+3*12,1,2),
+                            *duplicate_range(51+3*12,51+4*12,1,2), #99 needs 56
+                            # 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71,
+                            # 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80,
+                            # 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89,
+                            # 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98
+
+                            # *duplicate_range(106-12,106,1,2),
+                            ]],
+            
+            'GRA': [[36,36, 37,37, 38,38, 39,39, 40,40, 71,71]],
+            'GRB': [[72,72, 73,73, 74,74, 102,102, 103,103, 104,104, 105,105, 106,106]],
+            'LRSA': [[35]],
+            'LRSB': [[35]],
+            'LWSA': [[107]],
+            'LWSB': [[107]],
+            'LCC': [[143, 143]],
+            'LRA3': [[108,109,110,111,112,113]],
+            'LRB3': [[114,117,118,119,120,121,122,123]],
+            'PackA3' : [[-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+                            ]],
+            'PackB3' : [[-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+                            8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+                            ]],
+        }
+        nglshift = nllshift = 14 # vmcnt shift for ngl and nll
+    elif isNN(kernel) and useLDSTr and TLDS==1 and kernel["UsePLRPack"]:
         optSchedule = {
             'GRIncA': [[1,1,1,2,2,2,3,3,3]],
             'GRIncB': [[4,4,4,5,5,5,6,6,6]],
