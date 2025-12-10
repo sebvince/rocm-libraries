@@ -2937,20 +2937,15 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
     nglshift = nllshift = 0 # vmcnt shift for ngl and nll
     kernel["UsePLRPack"] = True
     if isTN(kernel) and not useLDSTr and TLDS==1:
-        print(duplicate_range(106-12,106,1,2))
-        # Note: A/B Global read orders are swapped
-        # i.e. GRA contains GR for B
-        # kernel["SwapGlobalReadOrder"] = True
         syncCode = [
                     SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA/B3 to complete"),
-                    SWaitCnt(dscnt=12, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
-                    SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
+                    SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA/B0 to complete"),
                     SBarrier(comment=""),
                     SWaitCnt(dscnt=-1, vlcnt=14, vscnt=-1, comment="Wait for previous GRs"),
                     SBarrier(comment="")
                     ]
         optSchedule = {
-            'SYNC'  : [[-1,5,34,35, 107,107]],
+            'SYNC'  : [[-1, 34,35, 107,107]],
             'GRIncA': [[0,0,0,2,2,2,3,3,3]],
             'GRIncB': [[4,4,4,
             6,7,8,9,10,11]],#ok
@@ -2990,8 +2985,10 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
             'LWSA': [[107]],
             'LWSB': [[107]],
             'LCC': [[143, 143]],
-            'LRA3': [[108,110,112,114,116,118]],
-            'LRB3': [[120,122,124,126,128,130,132,134]],
+            'LRA3': [[108,108,110,110,112,112],
+                     [109,109,111,111,113,113]],
+            'LRB3': [[118,118,120,120,124,124,127,127],
+                     [119,119,121,121,125,125,128,128]],
             'PackA3' : [[-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                             2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
                             5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
