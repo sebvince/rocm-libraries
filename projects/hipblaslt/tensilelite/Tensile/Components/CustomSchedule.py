@@ -2940,16 +2940,19 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         # Note: A/B Global read orders are swapped
         # i.e. GRA contains GR for B
         # kernel["SwapGlobalReadOrder"] = True
-        syncCode = [SWaitCnt(dscnt=12, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
+        syncCode = [
+                    SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA/B3 to complete"),
+                    SWaitCnt(dscnt=12, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
                     SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
                     SBarrier(comment=""),
                     SWaitCnt(dscnt=-1, vlcnt=14, vscnt=-1, comment="Wait for previous GRs"),
-                    SBarrier(comment=""),
-                    SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB0 to complete")]
+                    SBarrier(comment="")
+                    ]
         optSchedule = {
-            'SYNC'  : [[5,34,35, 107,107,133]],
+            'SYNC'  : [[-1,5,34,35, 107,107]],
             'GRIncA': [[0,0,0,2,2,2,3,3,3]],
-            'GRIncB': [[4,4,4,5,5,5,6,6,7]],
+            'GRIncB': [[4,4,4,
+            6,7,8,9,10,11]],#ok
             # LDS reads into first 4 vgprs of Valu!_X!_I!+offset, then next four into Valu!_T!_I!+offset
             #  in order to avoid copies in the cvt code
             'LRA0': [[1,1, 2,2, 3,3]],
@@ -2986,8 +2989,8 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
             'LWSA': [[107]],
             'LWSB': [[107]],
             'LCC': [[143, 143]],
-            'LRA3': [[108,109,110,111,112,113]],
-            'LRB3': [[114,117,118,119,120,121,122,123]],
+            'LRA3': [[108,110,112,114,116,118]],
+            'LRB3': [[120,122,124,126,128,130,132,134]],
             'PackA3' : [[-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                             2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
                             5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
