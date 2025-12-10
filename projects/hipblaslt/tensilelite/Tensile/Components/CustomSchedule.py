@@ -2949,8 +2949,8 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
                     SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB0 to complete")]
         optSchedule = {
             'SYNC'  : [[5,34,35, 107,107,133]],
-            'GRIncA': [[1,1,1,2,2,2,3,3,3]],
-            'GRIncB': [[4,4,4,5,5,5,6,6,6]],
+            'GRIncA': [[0,0,0,2,2,2,3,3,3]],
+            'GRIncB': [[4,4,4,5,5,5,6,6,7]],
             # LDS reads into first 4 vgprs of Valu!_X!_I!+offset, then next four into Valu!_T!_I!+offset
             #  in order to avoid copies in the cvt code
             'LRA0': [[1,1, 2,2, 3,3]],
@@ -2980,8 +2980,8 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
                             # *duplicate_range(106-12,106,1,2),
                             ]],
             
-            'GRA': [[36,36, 37,37, 38,38, 39,39, 40,40, 71,71]],
-            'GRB': [[72,72, 73,73, 74,74, 102,102, 103,103, 104,104, 105,105, 106,106]],
+            'GRA': [[36,36, 37,37, 38,38, 39,39, 40,40, 41,41]],
+            'GRB': [[72,72, 73,73, 74,74, 75,75, 101,101, 102,102, 103,103, 104,104]],
             'LRSA': [[35]],
             'LRSB': [[35]],
             'LWSA': [[107]],
@@ -2996,7 +2996,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
             'PackB3' : [[-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                             2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
                             5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-                            8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+                            6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
                             ]],
         }
         nglshift = nllshift = 14 # vmcnt shift for ngl and nll
