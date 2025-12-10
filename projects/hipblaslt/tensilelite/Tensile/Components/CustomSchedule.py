@@ -46,21 +46,21 @@ from copy import deepcopy
 from collections import Counter, defaultdict
 from typing import Callable, Dict, List, Tuple
 
-def duplicate_range(min_val: int, max_val: int, step: int = 1, repeat: int = 2) -> list[int]:
+def create_range(min_val: int, num: int, step: int = 1, repeat: int = 2) -> list[int]:
     """
-    Generate a list where each value in range(min_val, max_val, step) is repeated 'repeat' times.
+    Generate a list where each value in range(min_val, min_val+num, step) is repeated 'repeat' times.
     
     Args:
         min_val: Starting value (inclusive)
-        max_val: Ending value (exclusive)
+        num: Number of values
         step: Step between values
         repeat: Number of times to repeat each value
     
     Example:
-        duplicate_range(100, 105, 1, 2) => [100, 100, 101, 101, 102, 102, 103, 103, 104, 104]
-        duplicate_range(0, 10, 2, 3) => [0, 0, 0, 2, 2, 2, 4, 4, 4, 6, 6, 6, 8, 8, 8]
+        create_range(100, 5, 1, 2) => [100, 100, 101, 101, 102, 102, 103, 103, 104, 104]
+        create_range(0, 5, 2, 3) => [0, 0, 0, 2, 2, 2, 4, 4, 4, 6, 6, 6, 8, 8, 8]
     """
-    return [val for val in range(min_val, max_val, step) for _ in range(repeat)]
+    return [val for val in range(min_val, min_val+num, step) for _ in range(repeat)]
 
 def get_most_recent_local_reads(
     vmfmas: List[int],
@@ -1069,7 +1069,7 @@ class ScheduleInfo:
         # The set of validation rules to run inside `isValid`.
         self.rules: list[Callable[[ScheduleInfo, dict], [bool, str]]] = [
             verify_correct_number_of_instructions,
-            # verify_ascending_order,
+            verify_ascending_order,
             verify_global_reads_not_too_early,
             verify_lrs_and_grs,
             verify_scc_overlap,
@@ -2946,36 +2946,17 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         optSchedule = {
             'SYNC'  : [[-1, 34,35, 107,107]],
             'GRIncA': [[0,0,0,2,2,2,3,3,3]],
-            'GRIncB': [[4,4,4,
-            6,7,8,9,10,11]],#ok
-            # LDS reads into first 4 vgprs of Valu!_X!_I!+offset, then next four into Valu!_T!_I!+offset
-            #  in order to avoid copies in the cvt code
+            'GRIncB': [[4,4,4,6,7,8,9,10,11]],
             'LRA0': [[1,1, 2,2, 3,3]],
             'LRB0': [[13,14,15,16,17,18,19,20]],
-            # we can do this just after LRA0 
             'PackA0' : [
-                            [
-                                # 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35, 35,
-                                *duplicate_range(13,13+12,1,2),
-                                *duplicate_range(13+12,13+2*12,1,2),
-                                # *duplicate_range(13+2*12,13+3*12,1,2),
-                                # 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38, 38,
-                                # Can't be after 41. Re-order Pack ?
+                            [   
+                                *create_range(13,24,1,2), # 24 indices repeated twice from index 13.
                                 38, 38, 39, 39, 40, 40, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-                            # *duplicate_range(70-12,70,1,2)
                             ]],
             'PackB0' : [[
-                            *duplicate_range(51,51+12,1,2),
-                            *duplicate_range(51+12,51+2*12,1,2),
-                            *duplicate_range(51+2*12,51+3*12,1,2),
-                            *duplicate_range(51+3*12,51+4*12,1,2), #99 needs 56
-                            # 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71, 71,
-                            # 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80,
-                            # 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89, 89,
-                            # 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98, 98
-
-                            # *duplicate_range(106-12,106,1,2),
-                            ]],
+                            *create_range(51,48,1,2)
+                        ]],
             
             'GRA': [[36,36, 37,37, 38,38, 39,39, 40,40, 41,41]],
             'GRB': [[72,72, 73,73, 74,74, 75,75, 101,101, 102,102, 103,103, 104,104]],
@@ -2990,7 +2971,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
                      [119,119,121,121,125,125,128,128]],
             'PackA3' : [[-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                             2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-                            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+                            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6,
                             ]],
             'PackB3' : [[-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                             2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
