@@ -2936,26 +2936,36 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
     syncCode = []
     nglshift = nllshift = 0 # vmcnt shift for ngl and nll
     if isTN(kernel) and not useLDSTr and TLDS==1:
+        kernel["UsePLRPack"] = True
         syncCode = [
-                    SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA/B3 to complete"),
-                    SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA/B0 to complete"),
+                    
+                    SWaitCnt(dscnt=4, vlcnt=-1, vscnt=-1, comment="Wait for 2/6 LRA0 to complete"),
+                    SWaitCnt(dscnt=6, vlcnt=-1, vscnt=-1, comment="Wait for 6/6 LRA0 to complete"),
+                    SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB0 to complete"),
                     SBarrier(comment=""),
-                    SWaitCnt(dscnt=-1, vlcnt=14, vscnt=-1, comment="Wait for previous GRs"),
-                    SBarrier(comment="")
+                    SWaitCnt(dscnt=-1, vlcnt=14, vscnt=-1, comment="Wait for previous GRA"),
+                    SBarrier(comment=""),
+                    SWaitCnt(dscnt=-1, vlcnt=14, vscnt=-1, comment="Wait for previous GRB"),
+                    SBarrier(comment=""),
+                    SWaitCnt(dscnt=4, vlcnt=-1, vscnt=-1, comment="Wait for 2/6 LRA3 to complete"),
+                    SWaitCnt(dscnt=4, vlcnt=-1, vscnt=-1, comment="Wait for LRA3 to complete"),
+                    SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA/B3 to complete")
                     ]
         optSchedule = {
-            'SYNC'  : [[-1, 34,35, 107,107]],
-            'GRIncA': [[0,0,0,2,2,2,3,3,3]],
-            'GRIncB': [[4,4,4,6,7,8,9,10,11]],
-            'LRA0': [[1,1, 2,2, 3,3]],
-            'LRB0': [[13,14,15,16,17,18,19,20]],
+            'SYNC'  : [[5,17,34,35, 71,71, 
+                        107,107, #Wait for previous GRB
+                        108, # Wait for 2 LRA3
+                        121, 139]],
+            'GRIncA': [[8,9,10,11,12,13,14,15,16]],
+            'GRIncB': [[17,18,19,20,21,22,23,24,25]],
+            'LRA0': [[0,0, 1,1, 4,4]],
+            'LRB0': [[6,6,10,10,14,14,18,18]],
             'PackA0' : [
                             [   
-                                *create_range(13,24,1,2), # 24 indices repeated twice from index 13.
-                                38, 38, 39, 39, 40, 40, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
+                                *create_range(5,3*12,1,2),# 5 -> 41 (can't be after 41)
                             ]],
             'PackB0' : [[
-                            *create_range(51,48,1,2)
+                            *create_range(42,48,1,2)# 41 -> 90
                         ]],
             
             'GRA': [[38,38, 40,40, 42,42, 44,44, 46,46, 48,48],
@@ -2966,19 +2976,20 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
             'LWSA': [[107]],
             'LWSB': [[107]],
             'LCC': [[143, 143]],
-            'LRA3': [[108,108,110,110,112,112],
-                     [109,109,111,111,113,113]],
-            'LRB3': [[118,118,120,120,124,124,127,127],
-                     [119,119,121,121,125,125,128,128]],
-            'PackA3' : [[-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-                            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-                            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6,
+            'LRA3': [[101,102,103,104,105,106]], # Can't go before 100 ! FIX THIS !
+                    #[[109,109,111,111,113,113]],
+            'LRB3': [[118,118,120,120,124,124,127,127]],
+                     #[119,119,121,121,125,125,128,128]],
+            'PackB3' : [[143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143,
+                            143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143,
+                            143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143,
+                            143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143, 143,
                             ]],
-            'PackB3' : [[-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-                            2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-                            5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-                            6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+
+            'PackA3' : [[*create_range(109,24,1,2),
+                            134, 134, 135, 135, 136, 136, 137, 137, 138, 138, 139, 139, 140, 140, 141, 141, 142, 142, 143, 143, 143, 143, 143, 143,
                             ]],
+
         }
         nglshift = nllshift = 14 # vmcnt shift for ngl and nll
     elif isNN(kernel) and useLDSTr and TLDS==1:
