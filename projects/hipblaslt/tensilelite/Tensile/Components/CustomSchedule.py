@@ -49,19 +49,21 @@ from typing import Callable, Dict, List, Tuple
 def create_range(min_val: int, num: int, max_val: int, step: int = 1, repeat: int = 2) -> list[int]:
     """
     Generate a list where each value in range(min_val, min_val+num, step) is repeated 'repeat' times.
+    Value is clamped to max_val
     
     Args:
         min_val: Starting value (inclusive)
         num: Number of values
         step: Step between values
+        max_val: Maximum value (clamp)
         repeat: Number of times to repeat each value
     
     Example:
-        create_range(100, 5, 1, 2) => [100, 100, 101, 101, 102, 102, 103, 103, 104, 104]
-        create_range(0, 5, 2, 3) => [0, 0, 0, 2, 2, 2, 4, 4, 4, 6, 6, 6, 8, 8, 8]
+        create_range(100, 5,200, 1, 2) => [100, 100, 101, 101, 102, 102, 103, 103, 104, 104]
+        create_range(0, 5, 10, 2, 3) => [0, 0, 0, 2, 2, 2, 4, 4, 4, 6, 6, 6, 8, 8, 8]
+        create_range(0, 5, 6, 2, 3) => [0, 0, 0, 2, 2, 2, 4, 4, 4, 6, 6, 6, 6, 6, 6]
     """
     return [min(val, max_val) for val in range(min_val, min_val + num, step) for _ in range(repeat)]
-
 
 
 def get_most_recent_local_reads(
@@ -2933,6 +2935,7 @@ def _get_schedule_128x224x64_16bit(kernel, useLDSTr, TLDS):
 
 @cmsRegistry.register(CMSKey(192, 256, 32, 2, 0, True, 0, 0, "tf32"))
 def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
+    numMfma = 144
     kernel["MfmaInitCVgprs"] = True
     optSchedule = dict()
     syncCode = []
@@ -2940,56 +2943,59 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
     kernel["UsePLRPack"] = True
     if isTN(kernel) and not useLDSTr and TLDS==1:
         kernel["UsePLRPack"] = True
-        numMfma = 144
-        print("**********************************")
-        #1st Half - prepare LRA0 & LRB0
+        numPackInstr = 24 
+        numPackIndices = numPackInstr // 2 # We put 2 pack instructions per index
+
+        # Used the following constrains to create schedule
+        #  - LRA0 + PACKA0 needs to be done before 1/4 MFMAs
+        #  - LBR0 + PACKB0 needs to be done before 2/4 MFMAs
+        #  - LRB3 + PACKB3 needs to start after 2/4 MFMAs
+        #  - LRA3 + PACKA3 needs to start after 3/4 MFMAs
+        
+        # LRA0 + PACKA0
         lra0 = [0,0, 1,1, 4,4]
-        lrb0 = [8,8,12,12,16,16,20,20]
-        waitLRA0 = 6
+        waitLRA0 = max(lra0)+2
         startPACKA0 = waitLRA0
-        packA0 = create_range(startPACKA0,3*12,36-1) # cant be after 1/4 MFMAs
-        print("packA0:",packA0)
+        packA0 = create_range(startPACKA0,3*numPackIndices,numMfma//4-1)
+        # LBR0 + PACKB0
+        lrb0 = [8,8,12,12,16,16,20,20]
         waitLRB0 = max(lrb0)+2
-        startPACKB0 = max(waitLRB0,max(packA0)) #starts after waitLRB0 and packA0
-        packB0 = create_range(startPACKB0,4*12,72-1) # cant be after 2/4 MFMAs
-        print("packB0:",packB0)
-        #2nd Half   
-        halfMFMA = numMfma//2 #72
+        startPACKB0 = max(waitLRB0,max(packA0)) # Starts after waitLRB0 and packA0
+        packB0 = create_range(startPACKB0,4*numPackIndices,numMfma//2-1)
+        
+        # LBR3 + PACKB3  
+        halfMFMA = numMfma//2
         startLRB3 = halfMFMA
-        lrb3 = create_range(startLRB3,2,143)
-        lrb3 += create_range(max(lrb3)+6,2,143)
-        print("lrb3:",lrb3)
-
+        lrb3 = create_range(startLRB3,2,numMfma-1)
+        lrb3 += create_range(max(lrb3)+6,2,numMfma-1)
         waitLRB3 = startLRB3 + 6
-        packB3 = create_range(waitLRB3,4*12,143)
-        print("packB3:",packB3)
-
+        packB3 = create_range(waitLRB3,4*numPackIndices,numMfma-1)
+        
+        # LRA3 + PACKA3
         startLRA3 = (3*numMfma)//4 #can't start before 3/4 MFMAs
-        lra3 = create_range(startLRA3,3,143)
-        print("lra3:",lra3)
-
+        lra3 = create_range(startLRA3,3,numMfma-1)
         waitLRA3 = startLRA3 + 5
-        packA3 = create_range(waitLRA3,3*12,143)
-        print("packA3:",packA3)
-
+        packA3 = create_range(waitLRA3,3*numPackIndices,numMfma-1)
+        
+        # Return number of inflight loads in the list at given index
         def inflight(lst, index):
             return sum(val < (index) for val in lst)
 
         syncTable = [                    
                     waitLRA0, SWaitCnt(dscnt=inflight(lra0,waitLRA0)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRA0 to complete"),
-                    waitLRA0+12, SWaitCnt(dscnt=inflight(lrb0, waitLRA0+12), vlcnt=-1, vscnt=-1, comment="Wait for all LRA0 to complete"),
+                    waitLRA0+numPackIndices, SWaitCnt(dscnt=inflight(lrb0, waitLRA0+numPackIndices), vlcnt=-1, vscnt=-1, comment="Wait for all LRA0 to complete"),
                     waitLRB0, SWaitCnt(dscnt=inflight(lrb0,waitLRB0)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRB0 to complete"),
-                    waitLRB0+12, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRB0 to complete"),
-                    waitLRB0+12, SBarrier(comment="Barrier before GRA&GRB"),
+                    waitLRB0+numPackIndices, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRB0 to complete"),
+                    waitLRB0+numPackIndices, SBarrier(comment="Barrier before GRA&GRB"),
 
                     startLRB3-1,SWaitCnt(dscnt=-1, vlcnt=6, vscnt=-1, comment="Wait for previous GRA&B"),
                     startLRB3-1,SBarrier(comment=""),
                     
                     waitLRB3,SWaitCnt(dscnt=inflight(lrb3, waitLRB3)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRB3 to complete"),
-                    waitLRB3+12,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRB3 to complete"),
+                    waitLRB3+numPackIndices,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRB3 to complete"),
                     
                     waitLRA3, SWaitCnt(dscnt=inflight(lra3,waitLRA3)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRA3 to complete"),
-                    waitLRA3+12, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRA3 to complete")#after 24 PACK instructions
+                    waitLRA3+numPackIndices, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRA3 to complete")
                     ]
 
         syncCode = syncTable[1::2]
@@ -3138,7 +3144,6 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
     else:
         return False, None
 
-    numMfma = 144
     opt1 = ScheduleInfo(2, numMfma, optSchedule, syncCode, nglshift, nllshift)
     return True, opt1
 
