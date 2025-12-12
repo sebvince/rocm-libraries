@@ -2956,7 +2956,8 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         #2nd Half   
         halfMFMA = numMfma//2 #72
         startLRB3 = halfMFMA
-        lrb3 = create_range(startLRB3,4,143)
+        lrb3 = create_range(startLRB3,3,143)
+        lrb3 += create_range(max(lrb3)+3,1,143)
         print("lrb3:",lrb3)
 
         waitLRB3 = startLRB3 + 4
@@ -2971,20 +2972,23 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         packA3 = create_range(waitLRA3,3*12,143)
         print("packA3:",packA3)
 
+        def inflight(lst, index):
+            return sum(val < (index) for val in lst)
+
         syncTable = [                    
-                    waitLRA0, SWaitCnt(dscnt=len(lra0)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRA0 to complete"),
-                    waitLRA0+12, SWaitCnt(dscnt=sum(val < (waitLRA0+12) for val in lrb0), vlcnt=-1, vscnt=-1, comment="Wait for all LRA0 to complete"),
-                    waitLRB0, SWaitCnt(dscnt=len(lrb0)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRB0 to complete"),
+                    waitLRA0, SWaitCnt(dscnt=inflight(lra0,waitLRA0)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRA0 to complete"),
+                    waitLRA0+12, SWaitCnt(dscnt=inflight(lrb0, waitLRA0+12), vlcnt=-1, vscnt=-1, comment="Wait for all LRA0 to complete"),
+                    waitLRB0, SWaitCnt(dscnt=inflight(lrb0,waitLRB0)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRB0 to complete"),
                     waitLRB0+12, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRB0 to complete"),
                     waitLRB0+12, SBarrier(comment="Barrier before GRA&GRB"),
 
                     startLRB3-1,SWaitCnt(dscnt=-1, vlcnt=6, vscnt=-1, comment="Wait for previous GRA&B"),
                     startLRB3-1,SBarrier(comment=""),
                     
-                    waitLRB3,SWaitCnt(dscnt=len(lrb3)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRB3 to complete"),
+                    waitLRB3,SWaitCnt(dscnt=inflight(lrb3, waitLRB3)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRB3 to complete"),
                     waitLRB3+12,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRB3 to complete"),
                     
-                    waitLRA3, SWaitCnt(dscnt=len(lra3)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRA3 to complete"),
+                    waitLRA3, SWaitCnt(dscnt=inflight(lra3,waitLRA3)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRA3 to complete"),
                     waitLRA3+12, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRA3 to complete")#after 24 PACK instructions
                     ]
 
