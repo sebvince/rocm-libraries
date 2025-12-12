@@ -2944,12 +2944,12 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         print("**********************************")
         #1st Half - prepare LRA0 & LRB0
         lra0 = [0,0, 1,1, 4,4]
-        lrb0 = [6,6,10,10,14,14,18,18]
-        waitLRA0 = 5
+        lrb0 = [8,8,12,12,16,16,20,20]
+        waitLRA0 = 6
         startPACKA0 = waitLRA0
         packA0 = create_range(startPACKA0,3*12,36-1) # cant be after 1/4 MFMAs
         print("packA0:",packA0)
-        waitLRB0 = 20
+        waitLRB0 = max(lrb0)+2
         startPACKB0 = max(waitLRB0,max(packA0)) #starts after waitLRB0 and packA0
         packB0 = create_range(startPACKB0,4*12,72-1) # cant be after 2/4 MFMAs
         print("packB0:",packB0)
@@ -2997,7 +2997,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
 
             'SYNC': [syncTable[::2]],
 
-            'GRIncA': [[8,9,10,11,12,13,14,15,16]],
+            'GRIncA': [[0,2,2,2,3,3,3,4,16]],
             'GRIncB': [[17,18,19,20,21,22,23,24,25]],
             'LRA0': [lra0],
             'LRB0': [lrb0],
