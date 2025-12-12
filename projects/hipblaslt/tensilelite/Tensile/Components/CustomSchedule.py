@@ -2956,15 +2956,25 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         lrb3 = create_range(startLRB3,4,143)
         print("lrb3:",lrb3)
 
-        
-
         waitLRB3 = startLRB3 + 5
-        startPACKB3 = waitLRB3
+        packB3 = create_range(waitLRB3,4*12,143)
+        print("packB3:",packB3)
 
-        startLRA3 = (numMfma*3)//4 - 1
-        print("startLRA3:",startLRA3)
+        startLRA3 = (3*numMfma)//4 #can't start before 3/4 MFMAs
+        lra3 = create_range(startLRA3,3,143)
+        print("lra3:",lra3)
+
         waitLRA3 = startLRA3 + 5
-        startPACKA3 = waitLRA3
+        packA3 = create_range(waitLRA3,3*12,143)
+        print("packA3:",packA3)
+
+        # waitLRB3 = startLRB3 + 5
+        # startPACKB3 = waitLRB3
+
+        # startLRA3 = (numMfma*3)//4 - 1
+        # print("startLRA3:",startLRA3)
+        # waitLRA3 = startLRA3 + 5
+        # startPACKA3 = waitLRA3
 
 
         syncTable = [                    
@@ -2972,11 +2982,13 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
                     waitLRB0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB0 to complete"),
                     waitLRB0, SBarrier(comment="Barrier before GRA&GRB"),
 
-                    71,SWaitCnt(dscnt=-1, vlcnt=6, vscnt=-1, comment="Wait for previous GRA&B"),
-                    71,SBarrier(comment=""),
+                    startLRB3-1,SWaitCnt(dscnt=-1, vlcnt=6, vscnt=-1, comment="Wait for previous GRA&B"),
+                    startLRB3-1,SBarrier(comment=""),
+                    
+                    waitLRB3,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB3 to complete"),
                     # SWaitCnt(dscnt=-1, vlcnt=14, vscnt=-1, comment="Wait for previous GRB"),
                     # SBarrier(comment=""),
-                    139,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA/B3 to complete")
+                    waitLRA3,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA3 to complete")
                     ]
 
         syncCode = syncTable[1::2]
@@ -2998,14 +3010,10 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
             'LWSA': [[107]],
             'LWSB': [[107]],
             'LCC': [[143, 143]],
-            'LRA3': [[101,102,103,104,105,106]], # Can't go before 100 ! FIX THIS !
-                    #[[109,109,111,111,113,113]],
+            'LRA3': [lra3],
             'LRB3': [lrb3],
-                     #[119,119,121,121,125,125,128,128]],
-
-
-            'PackB3' : [[*([140]*4*24)]],
-            'PackA3' : [[*([140]*3*24)]],
+            'PackB3' : [packB3],
+            'PackA3' : [packA3],
 
         }
         nglshift = nllshift = 14 # vmcnt shift for ngl and nll
