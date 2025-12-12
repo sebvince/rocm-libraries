@@ -2955,11 +2955,11 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         #2nd Half   
         halfMFMA = numMfma//2 #72
         startLRB3 = halfMFMA
-        lrb3 = create_range(startLRB3,3,143)
-        lrb3 += create_range(max(lrb3)+3,1,143)
+        lrb3 = create_range(startLRB3,2,143)
+        lrb3 += create_range(max(lrb3)+6,2,143)
         print("lrb3:",lrb3)
 
-        waitLRB3 = startLRB3 + 4
+        waitLRB3 = startLRB3 + 6
         packB3 = create_range(waitLRB3,4*12,143)
         print("packB3:",packB3)
 
@@ -3003,8 +3003,10 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
             'PackA0' : [packA0],
             'PackB0' : [packB0],
             
-            'GRA': [[38,38, 40,40, 42,42, 44,44, 46,46, 48,48]],
-            'GRB': [[72,72, 73,73, 74,74, 75,75, 101,101, 102,102, 103,103, 104,104]],
+            'GRA': [[38,38, 40,40, 42,42, 44,44, 46,46, 48,48],
+                    [39,39, 41,41, 43,43, 45,45, 47,47, 49,49]],
+            'GRB': [[72,72, 74,74, 76,76, 100,100, 102,102, 104,104, 106,106, 108,108],
+                    [73,73, 75,75, 77,77, 101,101, 103,103, 105,105, 107,107, 109,109]],
             'LRSA': [[35]],
             'LRSB': [[35]],
             'LWSA': [[107]],
