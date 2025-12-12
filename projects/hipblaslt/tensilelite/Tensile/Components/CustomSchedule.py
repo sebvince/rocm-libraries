@@ -2987,9 +2987,9 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
                     startLRB3-1,SBarrier(comment=""),
                     
                     waitLRB3,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB3 to complete"),
-                    # SWaitCnt(dscnt=-1, vlcnt=14, vscnt=-1, comment="Wait for previous GRB"),
-                    # SBarrier(comment=""),
-                    waitLRA3,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA3 to complete")
+                    
+                    waitLRA3, SWaitCnt(dscnt=len(lra3)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRA3 to complete"),
+                    waitLRA3+12, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRA3 to complete")#after 24 PACK instructions
                     ]
 
         syncCode = syncTable[1::2]
