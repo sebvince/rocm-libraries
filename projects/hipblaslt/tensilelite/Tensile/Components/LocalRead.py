@@ -407,20 +407,15 @@ class LocalReadMFMA(LocalRead):
                                     vHi0 = vgpr("Valu%s_X%u_I%u+%u"%(tc, bufferIdx, iui, (valuiIdx-baseValuiIdx)/2 + baseValuiIdx))
                                     vHi1 = vgpr("Valu%s_X%u_I%u+%u+1"%(tc, bufferIdx, iui, (valuiIdx-baseValuiIdx)/2 + baseValuiIdx))
 
-                                    if kernel["UseMFMAF32XEmulation"] and False:
+                                    if kernel["UseMFMAF32XEmulation"]:
                                         vTBase = str(v0t.regName)
                                         vHiBase = str(vHi0.regName)
                                         idMat = vgpr(writer.states.startVgprIdentityMatrix,2)
                                         tmpDelay = writer.vgprPool.checkOut(1)
-                                        packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
-                                        packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
-                                        packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
+                                        
                                         packCodeT.add(MFMAInstruction(instType=InstType.INST_BF16, accType=InstType.INST_F32, variant=[4,4,4,16], mfma1k=False,acc=vgpr(vTBase,4), a=idMat, b=vgpr(vHiBase,2), acc2=vgpr(vTBase,4), comment="sebvince reg %s"%(v0t.regName)))
-                                        packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
-                                        packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
-                                        packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
                                         writer.vgprPool.checkIn(tmpDelay)
-                                        packCodeT.add(SNop(waitState=3))
+                                        # packCodeT.add(SNop(waitState=3))
                                     else: 
                                         # Compute low bits = fp32(highBF16(A/B)) - fp32(A/B)
                                         if kernel["UseDot2F32XEmulation"]:
@@ -469,6 +464,15 @@ class LocalReadMFMA(LocalRead):
                                         v5 = vgpr("Valu%s_X%u_I%u+%u+5"%(tc, bufferIdx, iui, baseValuiIdx))
                                         v6 = vgpr("Valu%s_X%u_I%u+%u+6"%(tc, bufferIdx, iui, baseValuiIdx))
                                         v7 = vgpr("Valu%s_X%u_I%u+%u+7"%(tc, bufferIdx, iui, baseValuiIdx))
+                                        if kernel["UseMFMAF32XEmulation"]:
+                                            packCodeT.add(SNop(waitState = 4))
+                                            # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
+                                            # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
+                                            # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
+                                            # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
+                                            # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
+                                            # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
+
                                         packCodeT.add(VCvtPkF32toBF16(dst=v7, src0=v6, src1=v7, comment="pack final begin"))
                                         packCodeT.add(VCvtPkF32toBF16(dst=v6, src0=v4, src1=v5))
                                         packCodeT.add(VCvtPkF32toBF16(dst=v5, src0=v2, src1=v3))
