@@ -413,7 +413,8 @@ class LocalReadMFMA(LocalRead):
                                         idMat = vgpr(writer.states.startVgprIdentityMatrix,2)
                                         tmpDelay = writer.vgprPool.checkOut(1)
                                         
-                                        packCodeT.add(MFMAInstruction(instType=InstType.INST_BF16, accType=InstType.INST_F32, variant=[4,4,4,16], mfma1k=False,acc=vgpr(vTBase,4), a=idMat, b=vgpr(vHiBase,2), acc2=vgpr(vTBase,4), comment="sebvince reg %s"%(v0t.regName)))
+                                        packCodeT.add(MFMAInstruction(instType=InstType.INST_BF16, accType=InstType.INST_F32, variant=[4,4,4,16], mfma1k=False,acc=vgpr(vTBase,4), a=idMat, b=vgpr(vHiBase,2), acc2=vgpr(vTBase,4), 
+                                        comment="sebvince reg vIdx=%s eIdx=%s rIdx=%s numVectorsPerTile=%s numReadsPerVector=%s totalLoads=%s"%(vIdx, eIdx, rIdx, numVectorsPerTile,numReadsPerVector,  totalLoads)))
                                         writer.vgprPool.checkIn(tmpDelay)
                                         # packCodeT.add(SNop(waitState=3))
                                     else: 
@@ -468,8 +469,8 @@ class LocalReadMFMA(LocalRead):
                                             # we need 5 wait States
                                             packCodeT.add(SNop(waitState = 4))
                                             # 2 mov + 1 MFMA for CMS
-                                            packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
-                                            packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
+                                            # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
+                                            # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
                                             # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
                                             # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
                                             # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
