@@ -45,7 +45,7 @@ from abc import ABC, abstractmethod
 from copy import deepcopy
 from collections import Counter, defaultdict
 from typing import Callable, Dict, List, Tuple
-
+import pprint
 def create_range(min_val: int, num: int, max_val: int, step: int = 1, repeat: int = 2) -> list[int]:
     """
     Generate a list where each value in range(min_val, min_val+num, step) is repeated 'repeat' times.
@@ -2943,7 +2943,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
     kernel["UsePLRPack"] = True
     if isTN(kernel) and not useLDSTr and TLDS==1:
         kernel["UsePLRPack"] = True
-        numPackInstr = 24 
+        numPackInstr = 12
         numPackIndices = numPackInstr // 2 # We put 2 pack instructions per index
 
         # Used the following constrains to create schedule
@@ -2951,17 +2951,18 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         #  - LBR0 + PACKB0 needs to be done before 2/4 MFMAs
         #  - LRB3 + PACKB3 needs to start after 2/4 MFMAs
         #  - LRA3 + PACKA3 needs to start after 3/4 MFMAs
-        
+        N = numPackInstr# 22
         # LRA0 + PACKA0
         lra0 = [0,0, 1,1, 4,4]
         waitLRA0 = max(lra0)+2
         startPACKA0 = waitLRA0
-        packA0 = create_range(startPACKA0,3*numPackIndices,numMfma//4-1)
+        packA0 = create_range(startPACKA0,3*numPackIndices,numMfma//4-1);#[startPACKA0]*N*3#
+        # packA0 = [startPACKA0, startPACKA0+1, startPACKA0+2,startPACKA0+3]*numPackIndices
         # LBR0 + PACKB0
         lrb0 = [8,8,12,12,16,16,20,20]
         waitLRB0 = max(lrb0)+2
         startPACKB0 = max(waitLRB0,max(packA0)) # Starts after waitLRB0 and packA0
-        packB0 = create_range(startPACKB0,4*numPackIndices,numMfma//2-1)
+        packB0 = create_range(startPACKB0,4*numPackIndices,numMfma//2-1)##[startPACKB0]*N*4#create_range(startPACKB0,4*numPackIndices,numMfma//2-1)
         
         # LBR3 + PACKB3  
         halfMFMA = numMfma//2
@@ -2969,13 +2970,13 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         lrb3 = create_range(startLRB3,2,numMfma-1)
         lrb3 += create_range(max(lrb3)+6,2,numMfma-1)
         waitLRB3 = startLRB3 + 6
-        packB3 = create_range(waitLRB3,4*numPackIndices,numMfma-1)
+        packB3 = create_range(waitLRB3,4*numPackIndices,numMfma-1)#[waitLRB3]*N*4#
         
         # LRA3 + PACKA3
         startLRA3 = (3*numMfma)//4 #can't start before 3/4 MFMAs
         lra3 = create_range(startLRA3,3,numMfma-1)
         waitLRA3 = startLRA3 + 5
-        packA3 = create_range(waitLRA3,3*numPackIndices,numMfma-1)
+        packA3 = create_range(waitLRA3,3*numPackIndices,numMfma-1)#[waitLRA3]*N*3#
         
         # Return number of inflight loads in the list at given index
         def inflight(lst, index):
@@ -2992,7 +2993,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
                     startLRB3-1,SBarrier(comment=""),
                     
                     waitLRB3,SWaitCnt(dscnt=inflight(lrb3, waitLRB3)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRB3 to complete"),
-                    waitLRB3+numPackIndices,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRB3 to complete"),
+                    waitLRB3+numPackIndices,SWaitCnt(dscnt=4, vlcnt=-1, vscnt=-1, comment="Wait for all LRB3 to complete"),
                     
                     waitLRA3, SWaitCnt(dscnt=inflight(lra3,waitLRA3)-2, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRA3 to complete"),
                     waitLRA3+numPackIndices, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRA3 to complete")
@@ -3003,15 +3004,16 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
 
             'SYNC': [syncTable[::2]],
 
-            'GRIncA': [[0,2,2,2,3,3,3,4,16]],
-            'GRIncB': [[17,18,19,20,21,22,23,24,25]],
+            'GRIncA': [[0,0,0,0,0,0,0,0,0]],
+            'GRIncB': [[0,0,0,0,0,0,0,0,0]],
+            # 'GRIncA': [[0,2,2,2,3,3,3,4,16]],
+            # 'GRIncB': [[17,18,19,20,21,22,23,24,25]],
             'LRA0': [lra0],
             'LRB0': [lrb0],
             'PackA0' : [packA0],
             'PackB0' : [packB0],
             
-            'GRA': [[38,38, 40,40, 42,42, 44,44, 46,46, 48,48],
-                    [39,39, 41,41, 43,43, 45,45, 47,47, 49,49]],
+            'GRA': [[46,46,46,46, 46,46, 46,46, 46,46, 48,48]],
             'GRB': [[72,72, 74,74, 76,76, 100,100, 102,102, 104,104, 106,106, 108,108],
                     [73,73, 75,75, 77,77, 101,101, 103,103, 105,105, 107,107, 109,109]],
             'LRSA': [[35]],
@@ -3025,6 +3027,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
             'PackA3' : [packA3],
 
         }
+        pprint.pprint(optSchedule)
         nglshift = nllshift = 14 # vmcnt shift for ngl and nll
     elif isNN(kernel) and useLDSTr and TLDS==1 and kernel["UsePLRPack"]:
         optSchedule = {
