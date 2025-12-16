@@ -2866,6 +2866,44 @@ class KernelWriter(metaclass=abc.ABCMeta):
       module.add(self.closeLoop(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx, finalLoop, oddLabel=oddLabel))
     return module
 
+  ####################################
+  # Creates a negative identity matrix used by TF32 MFMA emulation.
+  def createNegIdentityMatrix(self, kernel):
+    module = Module("NegIdentityMatrix")
+    tmp = self.vgprPool.checkOut(1)
+    lane4 = self.vgprPool.checkOut(1)
+    mfmaHigh = vgpr(self.states.startVgprIdentityMatrix)
+    mfmaLow = vgpr(self.states.startVgprIdentityMatrix+1)
+
+    module.addComment0("Create a negative identity matrix used by TF32 MFMA emulation.")
+    module.add(VAndB32(dst=vgpr(lane4),src0=3, src1=vgpr("Serial"), comment="lane % 4"))
+    module.add(VMovB32(dst=mfmaHigh,src=0))
+    module.add(VMovB32(dst=mfmaLow,src=0))
+    module.add(VMovB32(dst=vgpr(tmp), src="0xbf80", comment=""))
+    
+    module.add(VCmpEQU32(dst=VCC(), src0=0, src1=vgpr(lane4), comment="Lane %4 == 0 ?"))
+    module.add(SNop(1, comment=""))
+    module.add(VCndMaskB32(dst=mfmaHigh, src0=mfmaHigh, src1=vgpr(tmp), src2= VCC(), comment=""))
+
+    module.add(VCmpEQU32(dst=VCC(), src0=2, src1=vgpr(lane4), comment="Lane %4 == 2 ?"))
+    module.add(SNop(1, comment=""))
+    module.add(VCndMaskB32(dst=mfmaLow, src0=mfmaLow, src1=vgpr(tmp), src2= VCC(), comment=""))
+
+    module.add(VMovB32(dst=vgpr(tmp), src="0xbf800000", comment=""))
+
+    module.add(VCmpEQU32(dst=VCC(), src0=1, src1=vgpr(lane4), comment="Lane %4 == 1 ?"))
+    module.add(SNop(1, comment=""))
+    module.add(VCndMaskB32(dst=mfmaHigh, src0=mfmaHigh, src1=vgpr(tmp), src2= VCC(), comment=""))
+
+    module.add(VCmpEQU32(dst=VCC(), src0=3, src1=vgpr(lane4), comment="Lane %4 == 3 ?"))
+    module.add(SNop(1, comment=""))
+    module.add(VCndMaskB32(dst=mfmaLow, src0=mfmaLow, src1=vgpr(tmp), src2= VCC(), comment=""))
+
+    self.vgprPool.checkIn(tmp)
+    self.vgprPool.checkIn(lane4)
+    return module
+
+
   ##############################################################################
   # Kernel Body
   ##############################################################################
@@ -3030,38 +3068,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
                 module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA and LRB to complete"))
                 module.add(pack[plrIdx])
               if kernel["UseMFMAF32XEmulation"]:
-
-                tmp = self.vgprPool.checkOut(1)
-                lane4 = self.vgprPool.checkOut(1)
-                mfmaHigh = vgpr(self.states.startVgprIdentityMatrix)
-                mfmaLow = vgpr(self.states.startVgprIdentityMatrix+1)
-
-                module.addComment0("Create a negative identity matrix used by TF32 MFMA emulation.")
-                module.add(VAndB32(dst=vgpr(lane4),src0=3, src1=vgpr("Serial"), comment="lane % 4"))
-                module.add(VMovB32(dst=mfmaHigh,src=0))
-                module.add(VMovB32(dst=mfmaLow,src=0))
-                module.add(VMovB32(dst=vgpr(tmp), src="0xbf80", comment=""))
+                module.add(self.createNegIdentityMatrix(kernel))
                 
-                module.add(VCmpEQU32(dst=VCC(), src0=0, src1=vgpr(lane4), comment="Lane %4 == 0 ?"))
-                module.add(SNop(1, comment=""))
-                module.add(VCndMaskB32(dst=mfmaHigh, src0=mfmaHigh, src1=vgpr(tmp), src2= VCC(), comment=""))
-
-                module.add(VCmpEQU32(dst=VCC(), src0=2, src1=vgpr(lane4), comment="Lane %4 == 2 ?"))
-                module.add(SNop(1, comment=""))
-                module.add(VCndMaskB32(dst=mfmaLow, src0=mfmaLow, src1=vgpr(tmp), src2= VCC(), comment=""))
-
-                module.add(VMovB32(dst=vgpr(tmp), src="0xbf800000", comment=""))
-
-                module.add(VCmpEQU32(dst=VCC(), src0=1, src1=vgpr(lane4), comment="Lane %4 == 1 ?"))
-                module.add(SNop(1, comment=""))
-                module.add(VCndMaskB32(dst=mfmaHigh, src0=mfmaHigh, src1=vgpr(tmp), src2= VCC(), comment=""))
-
-                module.add(VCmpEQU32(dst=VCC(), src0=3, src1=vgpr(lane4), comment="Lane %4 == 3 ?"))
-                module.add(SNop(1, comment=""))
-                module.add(VCndMaskB32(dst=mfmaLow, src0=mfmaLow, src1=vgpr(tmp), src2= VCC(), comment=""))
-
-                self.vgprPool.checkIn(tmp)
-                self.vgprPool.checkIn(lane4)
              
         self.states.SubTileIdx = (self.states.SubTileIdx + 1) % kernel["numSubTiles"]
       elif self.states.numItersPLR == 0 and kernel["UseCustomMainLoopSchedule"]:
