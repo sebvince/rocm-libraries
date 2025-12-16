@@ -465,9 +465,11 @@ class LocalReadMFMA(LocalRead):
                                         v6 = vgpr("Valu%s_X%u_I%u+%u+6"%(tc, bufferIdx, iui, baseValuiIdx))
                                         v7 = vgpr("Valu%s_X%u_I%u+%u+7"%(tc, bufferIdx, iui, baseValuiIdx))
                                         if kernel["UseMFMAF32XEmulation"]:
+                                            # we need 5 wait States
                                             packCodeT.add(SNop(waitState = 4))
-                                            # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
-                                            # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
+                                            # 2 mov + 1 MFMA for CMS
+                                            packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
+                                            packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
                                             # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
                                             # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
                                             # packCodeT.add(VMovB32(dst=vgpr(tmpDelay), src=0, comment = "Sebvince"))
