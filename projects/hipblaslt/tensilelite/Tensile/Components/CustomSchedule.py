@@ -3010,7 +3010,8 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         halfMFMA = numMfma//2
         assert max(packB0) < halfMFMA, "max(packB0) >= halfMFMA"
         
-        grA = create_range(max(packB0)+1, 12, 100,2,2) # 12 is confusing
+        grA = [create_range(max(packB0)+1, 12, 100,2,2), # 12 is confusing,
+                create_range(max(packB0)+3, 12, 100,2,2)]
 
         startLRB3 = halfMFMA #max(grA)+1 coudl be sooner
         lrb3 = create_range(startLRB3,2,numMfma-1)
@@ -3018,19 +3019,21 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         lrb3 += create_range(max(lrb3)+6,2,numMfma-1)
         grB = create_range(max(lrb3)+1,2*4,144,2,2)#[72,72, 74,74, 76,76, 100,100, 102,102, 104,104, 106,106, 108,108]
         waitLRB3 = max(grB)+1 #max(lrb3) + 6
-        grB+= create_range(max(grB)+40,2*4,144,2,2)
+        grB+= create_range(max(grB)+47,2*4,144,2,2)
 
         # packB3 = create_range(waitLRB3,4*numPackIndices,numMfma-1)#[waitLRB3]*N*4#
         packB3 = [x + waitLRB3 for x in packRefB]
         # LRA3 + PACKA3
         startLRA3 = (3*numMfma)//4 #can't start before 3/4 MFMAs
         # lra3 = create_range(startLRA3,3,numMfma-1)
-        lra3 = [startLRA3]*6
-        waitLRA3 = startLRA3 + 5
+        # lra3 = [startLRA3]*6
+        lra3 = create_range(startLRA3,6,numMfma-1,1,1)
+        waitLRA3 = max(lra3) + 8 #from TRACE
         # packA3 = create_range(waitLRA3,3*numPackIndices,numMfma-1)#[waitLRA3]*N*3#
         packA3 = [x + waitLRA3 for x in packRefA]
         print("packA3:", packA3)
         print("packB3:", packB3)
+        print("grB:", grB)
         # Return number of inflight loads in the list at given index
         def inflight(lst, index):
             return sum(val < (index) for val in lst)
@@ -3067,7 +3070,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
             'PackA0' : [packA0],
             'PackB0' : [packB0],
             
-            'GRA': [grA],
+            'GRA': [*grA],
             'GRB': [grB],
                 # [72,72, 74,74, 76,76, 100,100, 102,102, 104,104, 106,106, 108,108],
                 #     [73,73, 75,75, 77,77, 101,101, 103,103, 105,105, 107,107, 109,109]],
