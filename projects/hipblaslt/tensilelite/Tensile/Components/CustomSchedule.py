@@ -46,27 +46,9 @@ from copy import deepcopy
 from collections import Counter, defaultdict
 from typing import Callable, Dict, List, Tuple
 import pprint
-def create_range(min_val: int, num: int, max_val: int, step: int = 1, repeat: int = 2) -> list[int]:
-    """
-    Generate a list where each value in range(min_val, min_val+num, step) is repeated 'repeat' times.
-    Value is clamped to max_val
-    
-    Args:
-        min_val: Starting value (inclusive)
-        num: Number of values
-        step: Step between values
-        max_val: Maximum value (clamp)
-        repeat: Number of times to repeat each value
-    
-    Example:
-        create_range(100, 5,200, 1, 2) => [100, 100, 101, 101, 102, 102, 103, 103, 104, 104]
-        create_range(0, 5, 10, 2, 3) => [0, 0, 0, 2, 2, 2, 4, 4, 4, 6, 6, 6, 8, 8, 8]
-        create_range(0, 5, 6, 2, 3) => [0, 0, 0, 2, 2, 2, 4, 4, 4, 6, 6, 6, 6, 6, 6]
-    """
-    return [min(val, max_val) for val in range(min_val, min_val + num, step) for _ in range(repeat)]
 
 
-def create_range2(min_val: int, num: int, max_val: int = -1, step: int = 1, repeat: int = 2) -> list[int]:
+def create_range(min_val: int, num: int, max_val: int = -1, step: int = 1, repeat: int = 2) -> list[int]:
     """
     Generate a list where each value in range(min_val, min_val+num, step) is repeated 'repeat' times.
     Value is clamped to max_val
@@ -2973,8 +2955,8 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         #  - LRA3 + PACKA3 needs to start after 3/4 MFMAs
 
         # LRA0 + GRIncA
-        lra0 = create_range2(min_val = 0, num = 6, step = 1, repeat = 1)
-        grIncA = create_range2(min_val = max(lra0)+1, num = 3, step = 1, repeat = 3) #[6,6,6,7,7,7,8,8,8]
+        lra0 = create_range(min_val = 0, num = 6, step = 1, repeat = 1)
+        grIncA = create_range(min_val = max(lra0)+1, num = 3, step = 1, repeat = 3) #[6,6,6,7,7,7,8,8,8]
         # Hide LRA0 latency behind GRIncA
         waitLRA0 = max(grIncA)+5
         startPACKA0 = waitLRA0
@@ -3006,7 +2988,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         assert packA0Done < numMfma//4
         
         # LRB0 + GRIncB
-        lrb0 = create_range2(min_val = max(packA0)+1, num = 8, step = 1, repeat = 1)
+        lrb0 = create_range(min_val = max(packA0)+1, num = 8, step = 1, repeat = 1)
         grIncB = create_range(max(lrb0)+1,3,max(lrb0)+4,1,3)
         waitLRB0 = max(grIncB)+6
         startPACKB0 = waitLRB0
@@ -3031,28 +3013,28 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         packB0 = [x + startPACKB0 for x in packBOffset]
 
         # GRA                
-        grA = [create_range2(min_val = max(packB0)+1, num = 6, step = 2,repeat = 2),
-               create_range2(min_val = max(packB0)+2, num = 6, step = 2,repeat = 2)]
+        grA = [create_range(min_val = max(packB0)+1, num = 6, step = 2,repeat = 2),
+               create_range(min_val = max(packB0)+2, num = 6, step = 2,repeat = 2)]
         
         halfMFMA = numMfma//2
         assert max(packB0) < halfMFMA
 
         # LR3
         startLRB3 = halfMFMA
-        lrb3 = create_range2(min_val = startLRB3, num = 2, step = 1, repeat = 2)
-        lrb3 += create_range2(min_val = max(lrb3)+6,num = 2, step = 1, repeat = 2)
+        lrb3 = create_range(min_val = startLRB3, num = 2, step = 1, repeat = 2)
+        lrb3 += create_range(min_val = max(lrb3)+6,num = 2, step = 1, repeat = 2)
 
         # GRB (split in two blocks)
-        grB = create_range2(min_val = max(lrb3)+1,num = 4,step = 2, repeat = 2)
+        grB = create_range(min_val = max(lrb3)+1,num = 4,step = 2, repeat = 2)
         waitLRB3 = max(grB)+1 
-        grB += create_range2(min_val = max(grB)+47,num = 4,step = 2, repeat = 2)
+        grB += create_range(min_val = max(grB)+47,num = 4,step = 2, repeat = 2)
         
         # PackB3 (starts after 1st GRB block)
         packB3 = [x + waitLRB3 for x in packBOffset]
 
         # LRA3 + PACKA3
         startLRA3 = (3*numMfma)//4 # Can't start before 3/4 MFMAs
-        lra3 = create_range2(min_val = startLRA3,num=6,step=1,repeat=1)
+        lra3 = create_range(min_val = startLRA3,num=6,step=1,repeat=1)
         waitLRA3 = max(lra3) + 8 
         packA3 = [x + waitLRA3 for x in packAOffset]
         
