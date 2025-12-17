@@ -413,6 +413,7 @@ class Solution(collections.abc.Mapping):
       state["reorderGRInstForDTVB"] = False
 
     state["UsePLRPack"] = False
+    state["UseMFMAF32XEmulation"] = False
     state["SwapGlobalReadOrder"] = False
     state["MfmaInitCVgprs"] = False
 
@@ -930,7 +931,6 @@ class Solution(collections.abc.Mapping):
     state["EnableF32XdlMathOp"] = False
     state["UseF32XEmulation"] = False # enable emulation for missing hardware support
     state["UseDot2F32XEmulation"] = False
-    state["UseMFMAF32XEmulation"] = True
     state["UseDirect32XEmulation"] = False # directly local read into temporary vgpr
     #ignore the F32 xDL MathOp by default.
     #enable F32 xDL MathOp only when the input type is f32.

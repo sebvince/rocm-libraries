@@ -2943,6 +2943,8 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
     kernel["UsePLRPack"] = True
     if isTN(kernel) and not useLDSTr and TLDS==1:
         kernel["UsePLRPack"] = True
+        kernel["UseMFMAF32XEmulation"] = True
+        
         numPackInstr = 10
         numPackIndices = numPackInstr // 2 # We put 2 pack instructions per index
 
