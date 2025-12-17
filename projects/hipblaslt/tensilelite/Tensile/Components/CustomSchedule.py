@@ -2953,9 +2953,9 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         #  - LRA3 + PACKA3 needs to start after 3/4 MFMAs
         N = numPackInstr# 22
         # LRA0 + PACKA0
-        lra0 = [0,0, 1,1, 2,2]
-        grIncA = [3,3,3,4,4,4,5,5,5]
-        waitLRA0 = max(grIncA)+1
+        lra0 = [0,1, 2,3, 4,5]
+        grIncA = [6,6,6,7,7,7,8,8,8]
+        waitLRA0 = max(grIncA)+5
         startPACKA0 = waitLRA0
         # packA0 = create_range(startPACKA0,3*numPackIndices,numMfma//4-1);#[startPACKA0]*N*3#
         packRefA = [ 
@@ -2977,12 +2977,13 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         packA0Done = max(packA0)
         
         assert packA0Done < numMfma//4, "xpackA0Done=%s< numMfma//4=%s" % (packA0Done, numMfma//4)
-        lrb0 = create_range(max(packA0)+1,4,max(packA0)+5) #[8,8,12,12,16,16,20,20]
+        # lrb0 = create_range(max(packA0)+1,4,max(packA0)+5) #[8,8,12,12,16,16,20,20]
+        lrb0 = create_range(max(packA0)+1,8,144,1,1) #[8,8,12,12,16,16,20,20]
 
         grIncB = create_range(max(lrb0)+1,3,max(lrb0)+4,1,3)
 
         # LBR0 + PACKB0
-        waitLRB0 = max(grIncB)+1
+        waitLRB0 = max(grIncB)+6
         # startPACKB0 = max(waitLRB0,max(packA0)) # Starts after waitLRB0 and packA0
         startPACKB0 = waitLRB0
         packRefB = [ 
@@ -3012,10 +3013,13 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         grA = create_range(max(packB0)+1, 12, 100,2,2) # 12 is confusing
 
         startLRB3 = halfMFMA #max(grA)+1 coudl be sooner
-        lrb3 = create_range(startLRB3,4,numMfma-1)
+        lrb3 = create_range(startLRB3,2,numMfma-1)
         # lrb3 = [startLRB3]*8
-        # lrb3 += create_range(max(lrb3)+6,2,numMfma-1)
-        waitLRB3 = max(lrb3) + 6
+        lrb3 += create_range(max(lrb3)+6,2,numMfma-1)
+        grB = create_range(max(lrb3)+1,2*4,144,2,2)#[72,72, 74,74, 76,76, 100,100, 102,102, 104,104, 106,106, 108,108]
+        grB+= create_range(max(grB)+40,2*4,144,2,2)
+
+        waitLRB3 = max(grB)+1 #max(lrb3) + 6
         # packB3 = create_range(waitLRB3,4*numPackIndices,numMfma-1)#[waitLRB3]*N*4#
         packB3 = [x + waitLRB3 for x in packRefB]
         # LRA3 + PACKA3
@@ -3037,7 +3041,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
                     waitLRB0+numPackIndices, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRB0 to complete"),
                     max(packB0)+1, SBarrier(comment="Barrier before GRA&GRB"),
 
-                    startLRB3-1,SWaitCnt(dscnt=-1, vlcnt=6, vscnt=-1, comment="Wait for previous GRA&B"),
+                    startLRB3-1,SWaitCnt(dscnt=-1, vlcnt=5, vscnt=-1, comment="Wait for previous GRA&B"),# replace HC 5
                     startLRB3-1,SBarrier(comment=""),
                     
                     waitLRB3,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for 1st 2 LRB3 to complete"),
@@ -3062,10 +3066,11 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
             'PackB0' : [packB0],
             
             'GRA': [grA],
-            'GRB': [[72,72, 74,74, 76,76, 100,100, 102,102, 104,104, 106,106, 108,108],
-                    [73,73, 75,75, 77,77, 101,101, 103,103, 105,105, 107,107, 109,109]],
-            'LRSA': [[35]],
-            'LRSB': [[35]],
+            'GRB': [grB],
+                # [72,72, 74,74, 76,76, 100,100, 102,102, 104,104, 106,106, 108,108],
+                #     [73,73, 75,75, 77,77, 101,101, 103,103, 105,105, 107,107, 109,109]],
+            'LRSA': [[startLRB3-2]],
+            'LRSB': [[startLRB3-2]],
             'LWSA': [[107]],
             'LWSB': [[107]],
             'LCC': [[143, 143]],
