@@ -66,6 +66,27 @@ def create_range(min_val: int, num: int, max_val: int, step: int = 1, repeat: in
     return [min(val, max_val) for val in range(min_val, min_val + num, step) for _ in range(repeat)]
 
 
+def create_range2(min_val: int, num: int, max_val: int = -1, step: int = 1, repeat: int = 2) -> list[int]:
+    """
+    Generate a list where each value in range(min_val, min_val+num, step) is repeated 'repeat' times.
+    Value is clamped to max_val
+    
+    Args:
+        min_val: Starting value (inclusive)
+        num: Number of values
+        step: Step between values
+        max_val: Maximum value (clamp)
+        repeat: Number of times to repeat each value
+    
+    Example:
+        create_range(100, 5,200, 1, 2) => [100, 100, 101, 101, 102, 102, 103, 103, 104, 104]
+        create_range(0, 5, 10, 2, 3) => [0, 0, 0, 2, 2, 2, 4, 4, 4, 6, 6, 6, 8, 8, 8]
+        create_range(0, 5, 6, 2, 3) => [0, 0, 0, 2, 2, 2, 4, 4, 4, 6, 6, 6, 6, 6, 6]
+    """
+    if max_val == -1:
+        max_val = min_val + step*num
+    return [min(val, max_val) for val in range(min_val, min_val + step*num, step) for _ in range(repeat)]
+
 def get_most_recent_local_reads(
     vmfmas: List[int],
     counts: List[int],
@@ -2945,22 +2966,25 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         kernel["UsePLRPack"] = True
         kernel["UseMFMAF32XEmulation"] = True
         
-        numPackInstr = 10
-        numPackIndices = numPackInstr // 2 # We put 2 pack instructions per index
-
         # Used the following constrains to create schedule
         #  - LRA0 + PACKA0 needs to be done before 1/4 MFMAs
         #  - LBR0 + PACKB0 needs to be done before 2/4 MFMAs
         #  - LRB3 + PACKB3 needs to start after 2/4 MFMAs
         #  - LRA3 + PACKA3 needs to start after 3/4 MFMAs
-        N = numPackInstr# 22
-        # LRA0 + PACKA0
-        lra0 = [0,1, 2,3, 4,5]
-        grIncA = [6,6,6,7,7,7,8,8,8]
+
+        # LRA0 + GRIncA
+        lra0 = create_range2(min_val = 0, num = 6, step = 1, repeat = 1)
+        grIncA = create_range2(min_val = max(lra0)+1, num = 3, step = 1, repeat = 3) #[6,6,6,7,7,7,8,8,8]
+        # Hide LRA0 latency behind GRIncA
         waitLRA0 = max(grIncA)+5
         startPACKA0 = waitLRA0
-        # packA0 = create_range(startPACKA0,3*numPackIndices,numMfma//4-1);#[startPACKA0]*N*3#
-        packRefA = [ 
+
+        # Reordering of packA instructions.
+        # 4 CVT + 2 4x4x4_16B MFMAs + 4 CVTs
+        # we interleave the 3 blocks together to avoid :
+        # - having a 5 state wait after each 4x4x4_16B MFMA
+        # - having extra latency when switching between MFMA types
+        packAOffset = [ 
                    0, 0, 1, 1, 
                    6, 6,
                    7, 7, 8, 8,
@@ -2975,20 +2999,18 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
                    ]
 
   
-        packA0 = [x + startPACKA0 for x in packRefA]
+        packA0 = [x + startPACKA0 for x in packAOffset]
         packA0Done = max(packA0)
+
+        # Sanity check
+        assert packA0Done < numMfma//4
         
-        assert packA0Done < numMfma//4, "xpackA0Done=%s< numMfma//4=%s" % (packA0Done, numMfma//4)
-        # lrb0 = create_range(max(packA0)+1,4,max(packA0)+5) #[8,8,12,12,16,16,20,20]
-        lrb0 = create_range(max(packA0)+1,8,144,1,1) #[8,8,12,12,16,16,20,20]
-
+        # LRB0 + GRIncB
+        lrb0 = create_range2(min_val = max(packA0)+1, num = 8, step = 1, repeat = 1)
         grIncB = create_range(max(lrb0)+1,3,max(lrb0)+4,1,3)
-
-        # LBR0 + PACKB0
         waitLRB0 = max(grIncB)+6
-        # startPACKB0 = max(waitLRB0,max(packA0)) # Starts after waitLRB0 and packA0
         startPACKB0 = waitLRB0
-        packRefB = [ 
+        packBOffset = [ 
             0, 0, 1, 1, 
             8, 8,
             9, 9, 10, 11,
@@ -3006,40 +3028,34 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
             16, 16, 17, 17,
             ]
 
-        # packB0 = create_range(startPACKB0,4*numPackIndices,numMfma//2-1)##[startPACKB0]*N*4#create_range(startPACKB0,4*numPackIndices,numMfma//2-1)
-        packB0 = [x + startPACKB0 for x in packRefB]
-        # LBR3 + PACKB3  
-        halfMFMA = numMfma//2
-        assert max(packB0) < halfMFMA, "max(packB0) >= halfMFMA"
+        packB0 = [x + startPACKB0 for x in packBOffset]
+
+        # GRA                
+        grA = [create_range2(min_val = max(packB0)+1, num = 6, step = 2,repeat = 2),
+               create_range2(min_val = max(packB0)+2, num = 6, step = 2,repeat = 2)]
         
-        grA = [create_range(max(packB0)+1, 12, 100,2,2), # 12 is confusing,
-                create_range(max(packB0)+2, 12, 100,2,2)]
+        halfMFMA = numMfma//2
+        assert max(packB0) < halfMFMA
 
-        startLRB3 = halfMFMA #max(grA)+1 coudl be sooner
-        lrb3 = create_range(startLRB3,2,numMfma-1)
-        # lrb3 = [startLRB3]*8
-        lrb3 += create_range(max(lrb3)+6,2,numMfma-1)
-        grB = create_range(max(lrb3)+1,2*4,144,2,2)#[72,72, 74,74, 76,76, 100,100, 102,102, 104,104, 106,106, 108,108]
-        waitLRB3 = max(grB)+1 #max(lrb3) + 6
-        grB+= create_range(max(grB)+47,2*4,144,2,2)
+        # LR3
+        startLRB3 = halfMFMA
+        lrb3 = create_range2(min_val = startLRB3, num = 2, step = 1, repeat = 2)
+        lrb3 += create_range2(min_val = max(lrb3)+6,num = 2, step = 1, repeat = 2)
 
-        # packB3 = create_range(waitLRB3,4*numPackIndices,numMfma-1)#[waitLRB3]*N*4#
-        packB3 = [x + waitLRB3 for x in packRefB]
+        # GRB (split in two blocks)
+        grB = create_range2(min_val = max(lrb3)+1,num = 4,step = 2, repeat = 2)
+        waitLRB3 = max(grB)+1 
+        grB += create_range2(min_val = max(grB)+47,num = 4,step = 2, repeat = 2)
+        
+        # PackB3 (starts after 1st GRB block)
+        packB3 = [x + waitLRB3 for x in packBOffset]
+
         # LRA3 + PACKA3
-        startLRA3 = (3*numMfma)//4 #can't start before 3/4 MFMAs
-        # lra3 = create_range(startLRA3,3,numMfma-1)
-        # lra3 = [startLRA3]*6
-        lra3 = create_range(startLRA3,6,numMfma-1,1,1)
-        waitLRA3 = max(lra3) + 8 #from TRACE
-        # packA3 = create_range(waitLRA3,3*numPackIndices,numMfma-1)#[waitLRA3]*N*3#
-        packA3 = [x + waitLRA3 for x in packRefA]
-        print("packA3:", packA3)
-        print("packB3:", packB3)
-        print("grB:", grB)
-        # Return number of inflight loads in the list at given index
-        def inflight(lst, index):
-            return sum(val < (index) for val in lst)
-
+        startLRA3 = (3*numMfma)//4 # Can't start before 3/4 MFMAs
+        lra3 = create_range2(min_val = startLRA3,num=6,step=1,repeat=1)
+        waitLRA3 = max(lra3) + 8 
+        packA3 = [x + waitLRA3 for x in packAOffset]
+        
         syncTable = [                    
                     waitLRA0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
                     waitLRB0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB0 to complete"),
@@ -3060,17 +3076,13 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
 
             'GRIncA': [grIncA],
             'GRIncB': [grIncB],
-            # 'GRIncA': [[0,2,2,2,3,3,3,4,16]],
-            # 'GRIncB': [[17,18,19,20,21,22,23,24,25]],
             'LRA0': [lra0],
             'LRB0': [lrb0],
             'PackA0' : [packA0],
             'PackB0' : [packB0],
             
             'GRA': [*grA],
-            'GRB': [grB],
-                # [72,72, 74,74, 76,76, 100,100, 102,102, 104,104, 106,106, 108,108],
-                #     [73,73, 75,75, 77,77, 101,101, 103,103, 105,105, 107,107, 109,109]],
+            'GRB': [grB],              
             'LRSA': [[max(grIncB)+1]],
             'LRSB': [[max(grIncB)+2]],
             'LWSA': [[142]],
@@ -3082,7 +3094,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
             'PackA3' : [packA3],
 
         }
-        # pprint.pprint(optSchedule)
+
         nglshift = nllshift = 14 # vmcnt shift for ngl and nll
     elif isNN(kernel) and useLDSTr and TLDS==1 and kernel["UsePLRPack"]:
         optSchedule = {
