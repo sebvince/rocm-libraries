@@ -3011,7 +3011,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         assert max(packB0) < halfMFMA, "max(packB0) >= halfMFMA"
         
         grA = [create_range(max(packB0)+1, 12, 100,2,2), # 12 is confusing,
-                create_range(max(packB0)+3, 12, 100,2,2)]
+                create_range(max(packB0)+2, 12, 100,2,2)]
 
         startLRB3 = halfMFMA #max(grA)+1 coudl be sooner
         lrb3 = create_range(startLRB3,2,numMfma-1)
