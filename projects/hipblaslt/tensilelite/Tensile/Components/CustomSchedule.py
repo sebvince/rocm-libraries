@@ -3017,9 +3017,9 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         # lrb3 = [startLRB3]*8
         lrb3 += create_range(max(lrb3)+6,2,numMfma-1)
         grB = create_range(max(lrb3)+1,2*4,144,2,2)#[72,72, 74,74, 76,76, 100,100, 102,102, 104,104, 106,106, 108,108]
+        waitLRB3 = max(grB)+1 #max(lrb3) + 6
         grB+= create_range(max(grB)+40,2*4,144,2,2)
 
-        waitLRB3 = max(grB)+1 #max(lrb3) + 6
         # packB3 = create_range(waitLRB3,4*numPackIndices,numMfma-1)#[waitLRB3]*N*4#
         packB3 = [x + waitLRB3 for x in packRefB]
         # LRA3 + PACKA3
@@ -3029,6 +3029,8 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         waitLRA3 = startLRA3 + 5
         # packA3 = create_range(waitLRA3,3*numPackIndices,numMfma-1)#[waitLRA3]*N*3#
         packA3 = [x + waitLRA3 for x in packRefA]
+        print("packA3:", packA3)
+        print("packB3:", packB3)
         # Return number of inflight loads in the list at given index
         def inflight(lst, index):
             return sum(val < (index) for val in lst)
@@ -3071,8 +3073,8 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
                 #     [73,73, 75,75, 77,77, 101,101, 103,103, 105,105, 107,107, 109,109]],
             'LRSA': [[startLRB3-2]],
             'LRSB': [[startLRB3-2]],
-            'LWSA': [[107]],
-            'LWSB': [[107]],
+            'LWSA': [[142]],
+            'LWSB': [[142]],
             'LCC': [[143, 143]],
             'LRA3': [lra3],
             'LRB3': [lrb3],
