@@ -2324,29 +2324,30 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
     if isNN(kernel) and TLDS==1:
         kernel["UsePLRPack"] = True
         kernel["UseMFMAF32XEmulation"] = True
+        # kernel["SwapGlobalReadOrder"] = True
 
         numLrReadB = 8
         # LRB0 + GRIncB
         lrb0 = create_range(min_val = 0, num = 8, step = 1, repeat = 1)
         grIncB = create_range(max(lrb0)+1,3,max(lrb0)+4,1,3)
-        waitLRB0 = max(grIncB)+6
+        waitLRB0 = max(grIncB)+7
         startPACKB0 = waitLRB0
         packBOffset = [ 
             0, 0, 1, 1, 
             8, 8,
-            9, 9, 10, 11,
+            9, 9, 10, 10,
 
             2, 2, 3, 3, 
             8, 8,
-            12, 12, 13, 13,
+            11, 11, 12, 12,
 
             4, 4, 5, 5, 
             8, 8,
-            14, 14, 15, 15,
+            13, 13, 14, 14,
 
             6, 6, 7, 7, 
             8, 8,
-            16, 16, 17, 17,
+            15, 15, 16, 16,
             ]
 
         packB0 = [x + startPACKB0 for x in packBOffset]
@@ -2356,11 +2357,13 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
 
         numLrReadA = 24
         # LRA0 + GRIncA
-        lra0 = create_range(min_val = max(packB0)+1, num = numLrReadA // 2, step = 2, repeat = 2)
-        # lra0 += create_range(min_val = max(lra0)+2, num = numLrReadA // 4, step = 1, repeat = 2)
-        grIncA = create_range(min_val = max(lra0)+1, num = 3, step = 1, repeat = 3) #[6,6,6,7,7,7,8,8,8]
+        lra0 = [create_range(min_val = max(packB0)+1, num = numLrReadA // 2, step = 2, repeat = 2),
+                create_range(min_val = max(packB0)+2, num = numLrReadA // 2, step = 2, repeat = 2)]
+        # lra0 = create_range(min_val = max(grIncB)+1, num = numLrReadA, step = 1, repeat = 1)
+        
+        grIncA = create_range(min_val = max(lra0[1])+1, num = 3, step = 1, repeat = 3) #[6,6,6,7,7,7,8,8,8]
         # Hide LRA0 latency behind GRIncA
-        waitLRA0 = max(lra0)+2
+        waitLRA0 = max(lra0[1])+2
         startPACKA0 = waitLRA0
 
         # Reordering of packA instructions.
@@ -2375,11 +2378,11 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
 
                    2, 2, 3, 3, 
                    6, 6,
-                   9, 9, 10, 11,
+                   9, 9, 10, 10,
 
                    4, 4, 5, 5, 
                    6, 6,
-                   12, 12, 13, 13,
+                   11, 11, 12, 12,
                    ]
 
 
@@ -2400,19 +2403,21 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         # GRB (split in two blocks)
         grB = create_range(min_val = max(lra3)+1,num = 4,step = 2, repeat = 2)
         waitLRA3 = max(grB)+1 
-        grB += create_range(min_val = max(grB)+44,num = 4,step = 2, repeat = 2)
+        grB += create_range(min_val = max(grB)+45,num = 4,step = 2, repeat = 2)
 
         # PackA3 (starts after 1st GRB block)
         packA3 = [x + waitLRA3 for x in packAOffset]
 
         # LRA3 + PACKA3
         startLRB3 = (3*numMfma)//4 # Can't start before 3/4 MFMAs
-        lrb3 = create_range(min_val = startLRB3,num=numLrReadB//2,step=1,repeat=2)
-        waitLRB3 = max(lrb3) + 8 
+        lrb3 = create_range(min_val = startLRB3-3,num=numLrReadB,step=1,repeat=1)
+        # lrb3 += create_range(min_val = max(lrb3)+2,num=numLrReadB//4,step=1,repeat=2)
+        waitLRB3 = max(lrb3) + 10 
         packB3 = [x + waitLRB3 for x in packBOffset]
 
         syncTable = [                    
                     waitLRB0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB0 to complete"),
+                    # waitLRB0+1, SBarrier(comment="Barrier before GRB"),
                     waitLRA0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
 
                     max(packA0)+1, SBarrier(comment="Barrier before GRA&GRB"),
@@ -2431,7 +2436,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
 
             'GRIncA': [grIncA],
             'GRIncB': [grIncB],
-            'LRA0': [lra0],
+            'LRA0': [*lra0],
             'LRB0': [lrb0],
             'PackA0' : [packA0],
             'PackB0' : [packB0],
