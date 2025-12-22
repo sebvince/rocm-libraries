@@ -2326,6 +2326,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         kernel["UseMFMAF32XEmulation"] = True
         # kernel["SwapGlobalReadOrder"] = True
 
+        
         numLrReadB = 8
         # LRB0 + GRIncB
         lrb0 = create_range(min_val = 0, num = 8, step = 1, repeat = 1)
@@ -2424,11 +2425,13 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         packB3 = [x + waitLRB3 for x in packBOffset]
         grA += create_range(min_val = max(packB3)+1, num = 2, step = 1,repeat = 2)
 
-        syncTable = [                    
-                    waitLRB0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB0 to complete"),
+        syncTable = [                                      
+                    waitLRB0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRB0 to complete"),
                     waitLRB0, SBarrier(comment="Barrier before GRB"),
 
-                    waitLRA0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
+                    waitLRA0, SWaitCnt(dscnt=numLrReadA-4, vlcnt=-1, vscnt=-1, comment="Wait for 2 LRA0 to complete"),
+                    waitLRA0+1, SWaitCnt(dscnt=numLrReadA-8, vlcnt=-1, vscnt=-1, comment="Wait for 2 LRA0 to complete"),
+                    waitLRA0+2, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
 
                     # max(packA0)+1, SBarrier(comment="Barrier before GRA&GRB"),
 
