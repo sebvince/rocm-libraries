@@ -2355,7 +2355,8 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         packB0 = [x + startPACKB0 for x in packBOffset]
         packB0Done = max(packB0)
         # GRB (split in two blocks)
-        grB = create_range(min_val = packB0Done+1,num = 8,step = 2, repeat = 2)
+        # grB = create_range(min_val = packB0Done+1,num = 8,step = 2, repeat = 2)
+        grB = create_range(min_val = packB0Done+1,num = 4,step = 2, repeat = 2)
         # Sanity check
         assert packB0Done < numMfma//4
 
@@ -2401,7 +2402,8 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         startLRA3 = halfMFMA
         lra3 = create_range(min_val = startLRA3, num = numLrReadA // 2, step = 1, repeat = 2)
         waitLRA3 = max(lra3)+8 
-
+        grB += create_range(min_val = startLRA3+1,num = 4,step = 2, repeat = 2)
+        # grA = create_range(min_val = max(grB)+1, num = 2, step = 2,repeat = 2)
         # GRA                
         # grA = create_range(min_val = max(packA0)+1, num = 6, step = 2,repeat = 2)
         
@@ -2413,11 +2415,12 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         startLRB3 = (3*numMfma)//4 # Can't start before 3/4 MFMAs
         lrb3 = create_range(min_val = startLRB3-3,num=numLrReadB,step=1,repeat=1)
 
-        grA = create_range(min_val = max(lrb3)+1, num = 6, step = 2,repeat = 2)
+        grA = create_range(min_val = max(lrb3)+1, num = 4, step = 2,repeat = 2)
 
         # lrb3 += create_range(min_val = max(lrb3)+2,num=numLrReadB//4,step=1,repeat=2)
         waitLRB3 = max(lrb3) + 10 
         packB3 = [x + waitLRB3 for x in packBOffset]
+        grA += create_range(min_val = max(packB3)+1, num = 2, step = 2,repeat = 2)
 
         syncTable = [                    
                     waitLRB0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB0 to complete"),
@@ -2427,7 +2430,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
 
                     max(packA0)+1, SBarrier(comment="Barrier before GRA&GRB"),
 
-                    startLRA3-1,SWaitCnt(dscnt=-1, vlcnt=8, vscnt=-1, comment="Wait for previous GRA&B"),
+                    startLRA3-1,SWaitCnt(dscnt=-1, vlcnt=4, vscnt=-1, comment="Wait for previous GRA&B"),
                     startLRA3-1,SBarrier(comment="Sync before GRA, LRA3 & LRB3"),
 
                     waitLRA3, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA3 to complete"),                    
