@@ -2424,8 +2424,8 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
 
                     max(packA0)+1, SBarrier(comment="Barrier before GRA&GRB"),
 
-                    startLRA3-1,SWaitCnt(dscnt=-1, vlcnt=8, vscnt=-1, comment="Wait for previous GRA&B"),# replace HC 5
-                    startLRA3-1,SBarrier(comment=""),
+                    startLRA3-1,SWaitCnt(dscnt=-1, vlcnt=8, vscnt=-1, comment="Wait for previous GRA&B"),
+                    startLRA3-1,SBarrier(comment="Sync before GRA, LRA3 & LRB3"),
 
                     waitLRA3, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA3 to complete"),                    
                     waitLRB3,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB3 to complete"),
