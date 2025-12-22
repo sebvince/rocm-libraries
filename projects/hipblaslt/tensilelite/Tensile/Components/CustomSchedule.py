@@ -2400,10 +2400,10 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         # LR3
         startLRA3 = halfMFMA
         lra3 = create_range(min_val = startLRA3, num = numLrReadA // 2, step = 1, repeat = 2)
+        waitLRA3 = max(lra3)+8 
 
         # GRA                
-        grA = create_range(min_val = max(packA0)+1, num = 6, step = 2,repeat = 2)
-        waitLRA3 = max(lra3)+8 
+        # grA = create_range(min_val = max(packA0)+1, num = 6, step = 2,repeat = 2)
         
 
         # PackA3 (starts after 1st GRB block)
@@ -2412,6 +2412,9 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         # LRA3 + PACKA3
         startLRB3 = (3*numMfma)//4 # Can't start before 3/4 MFMAs
         lrb3 = create_range(min_val = startLRB3-3,num=numLrReadB,step=1,repeat=1)
+
+        grA = create_range(min_val = max(lrb3)+1, num = 6, step = 2,repeat = 2)
+
         # lrb3 += create_range(min_val = max(lrb3)+2,num=numLrReadB//4,step=1,repeat=2)
         waitLRB3 = max(lrb3) + 10 
         packB3 = [x + waitLRB3 for x in packBOffset]
