@@ -2185,6 +2185,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
     kernel["MfmaInitCVgprs"] = True
     optSchedule = dict()
     syncCode = []
+    mfmaReorder = []
     nglshift = nllshift = 0 # vmcnt shift for ngl and nll
     if isTN(kernel) and not useLDSTr and TLDS==1:
         kernel["UsePLRPack"] = True
@@ -2320,9 +2321,146 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         }
 
         nglshift = nllshift = 14 # vmcnt shift for ngl and nll
+    if isNN(kernel) and TLDS==1:
+        kernel["UsePLRPack"] = True
+        kernel["UseMFMAF32XEmulation"] = True
+
+        numLrReadB = 8
+        # LRB0 + GRIncB
+        lrb0 = create_range(min_val = 0, num = 8, step = 1, repeat = 1)
+        grIncB = create_range(max(lrb0)+1,3,max(lrb0)+4,1,3)
+        waitLRB0 = max(grIncB)+6
+        startPACKB0 = waitLRB0
+        packBOffset = [ 
+            0, 0, 1, 1, 
+            8, 8,
+            9, 9, 10, 11,
+
+            2, 2, 3, 3, 
+            8, 8,
+            12, 12, 13, 13,
+
+            4, 4, 5, 5, 
+            8, 8,
+            14, 14, 15, 15,
+
+            6, 6, 7, 7, 
+            8, 8,
+            16, 16, 17, 17,
+            ]
+
+        packB0 = [x + startPACKB0 for x in packBOffset]
+        packB0Done = max(packB0)
+        # Sanity check
+        assert packB0Done < numMfma//4
+
+        numLrReadA = 24
+        # LRA0 + GRIncA
+        lra0 = create_range(min_val = max(packB0)+1, num = numLrReadA // 2, step = 2, repeat = 2)
+        # lra0 += create_range(min_val = max(lra0)+2, num = numLrReadA // 4, step = 1, repeat = 2)
+        grIncA = create_range(min_val = max(lra0)+1, num = 3, step = 1, repeat = 3) #[6,6,6,7,7,7,8,8,8]
+        # Hide LRA0 latency behind GRIncA
+        waitLRA0 = max(lra0)+2
+        startPACKA0 = waitLRA0
+
+        # Reordering of packA instructions.
+        # 4 CVT + 2 4x4x4_16B MFMAs + 4 CVTs
+        # we interleave the 3 blocks together to avoid :
+        # - having a 5 state wait after each 4x4x4_16B MFMA
+        # - having extra latency when switching between MFMA types
+        packAOffset = [ 
+                   0, 0, 1, 1, 
+                   6, 6,
+                   7, 7, 8, 8,
+
+                   2, 2, 3, 3, 
+                   6, 6,
+                   9, 9, 10, 11,
+
+                   4, 4, 5, 5, 
+                   6, 6,
+                   12, 12, 13, 13,
+                   ]
+
+
+        packA0 = [x + startPACKA0 for x in packAOffset]
+        
+
+        # GRA                
+        grA = [create_range(min_val = max(packA0)+1, num = 6, step = 2,repeat = 2),
+               create_range(min_val = max(packA0)+2, num = 6, step = 2,repeat = 2)]
+
+        halfMFMA = numMfma//2
+        assert max(packA0) < halfMFMA
+
+        # LR3
+        startLRA3 = halfMFMA
+        lra3 = create_range(min_val = startLRA3, num = numLrReadA // 2, step = 1, repeat = 2)
+
+        # GRB (split in two blocks)
+        grB = create_range(min_val = max(lra3)+1,num = 4,step = 2, repeat = 2)
+        waitLRA3 = max(grB)+1 
+        grB += create_range(min_val = max(grB)+44,num = 4,step = 2, repeat = 2)
+
+        # PackA3 (starts after 1st GRB block)
+        packA3 = [x + waitLRA3 for x in packAOffset]
+
+        # LRA3 + PACKA3
+        startLRB3 = (3*numMfma)//4 # Can't start before 3/4 MFMAs
+        lrb3 = create_range(min_val = startLRB3,num=numLrReadB//2,step=1,repeat=2)
+        waitLRB3 = max(lrb3) + 8 
+        packB3 = [x + waitLRB3 for x in packBOffset]
+
+        syncTable = [                    
+                    waitLRB0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB0 to complete"),
+                    waitLRA0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
+
+                    max(packA0)+1, SBarrier(comment="Barrier before GRA&GRB"),
+
+                    startLRA3-1,SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for previous GRA&B"),# replace HC 5
+                    startLRA3-1,SBarrier(comment=""),
+
+                    waitLRA3, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA3 to complete"),                    
+                    waitLRB3,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB3 to complete"),
+                    ]
+
+        syncCode = syncTable[1::2]
+        optSchedule = {
+
+            'SYNC': [syncTable[::2]],
+
+            'GRIncA': [grIncA],
+            'GRIncB': [grIncB],
+            'LRA0': [lra0],
+            'LRB0': [lrb0],
+            'PackA0' : [packA0],
+            'PackB0' : [packB0],
+
+            'GRA': [*grA],
+            'GRB': [grB],              
+            'LRSA': [[max(grIncA)+1]],
+            'LRSB': [[max(grIncA)+2]],
+            'LWSA': [[142]],
+            'LWSB': [[142]],
+            'LCC': [[143, 143]],
+            'LRA3': [lra3],
+            'LRB3': [lrb3],
+            'PackB3' : [packB3],
+            'PackA3' : [packA3],
+
+        }
+        print(optSchedule)
+        nglshift = nllshift = 14 # vmcnt shift for ngl and nll
+        mfmaReorder = [i for i in range(0,numMfma//4)] + [i for i in range(numMfma//2,3*numMfma//4)]+                      [i for i in range(numMfma//4,numMfma//2)]+[i for i in range(3*numMfma//4,numMfma)]
+        print("MFMA Reorder:", mfmaReorder)
+        # opt1 = ScheduleInfo(2, numMfma, optSchedule, syncCode, nglshift, nllshift, mfmaReorder)
+        # opt1.mfmaReorder = mfmaReorder
+        # opt1.disableValidation() # Disable validation as this schedule re-order pack instructions (Non-descending-order validator to be updated to allow this)
+        # return True, opt1
+
     else:
         return False, None
 
-    opt1 = ScheduleInfo(2, numMfma, optSchedule, syncCode, nglshift, nllshift)
-    opt1.disableValidation() # Disable validation as this schedule re-order pack instructions (Non-descending-order validator to be updated to allow this)
+    opt1 = ScheduleInfo(2, numMfma, optSchedule, syncCode, nglshift, nllshift, mfmaReorder=mfmaReorder)
+    # opt1.disableValidation() # Disable validation as this schedule re-order pack instructions (Non-descending-order validator to be updated to allow this)
     return True, opt1
