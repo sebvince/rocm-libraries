@@ -2403,7 +2403,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
 
         # LR3
         startLRA3 = halfMFMA
-        lra3 = create_range(min_val = startLRA3, num = numLrReadA // 2, step = 1, repeat = 2)
+        lra3 = create_range(min_val = startLRA3, num = numLrReadA // 2, step = 2, repeat = 2)
         waitLRA3 = max(lra3)+8 
         grB[0] += create_range(min_val = startLRA3+1,num = 4,step = 2, repeat = 2)
         grB[1] += create_range(min_val = startLRA3+1,num = 4,step = 2, repeat = 2)
@@ -2412,8 +2412,22 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         # grA = create_range(min_val = max(packA0)+1, num = 6, step = 2,repeat = 2)
         
 
+        packA3Offset = [ 
+                   0, 0, 1, 1, 
+                   6, 6,
+                   142, 142, 142, 142,
+
+                   2, 2, 3, 3, 
+                   6, 6,
+                   142, 142, 142, 142,
+
+                   4, 4, 5, 5, 
+                   6, 6,
+                   142, 142, 142, 142,
+                   ]
+
         # PackA3 (starts after 1st GRB block)
-        packA3 = [x + waitLRA3 for x in packAOffset]
+        packA3 = [x + waitLRA3 for x in packA3Offset]
 
         # LRA3 + PACKA3
         startLRB3 = (3*numMfma)//4 # Can't start before 3/4 MFMAs
@@ -2424,14 +2438,17 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         # lrb3 += create_range(min_val = max(lrb3)+2,num=numLrReadB//4,step=1,repeat=2)
         waitLRB3 = max(lrb3) + 10 
         packB3 = [x + waitLRB3 for x in packBOffset]
+
         grA += create_range(min_val = max(packB3)+1, num = 2, step = 1,repeat = 2)
 
         syncTable = [                                      
                     waitLRB0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRB0 to complete"),
                     waitLRB0, SBarrier(comment="Barrier before GRB"),
 
+                    # will be clampled to dscnt=15 but it's fine
                     waitLRA0, SWaitCnt(dscnt=numLrReadA-4, vlcnt=-1, vscnt=-1, comment="Wait for 2 LRA0 to complete"),
                     waitLRA0+1, SWaitCnt(dscnt=numLrReadA-8, vlcnt=-1, vscnt=-1, comment="Wait for 2 LRA0 to complete"),
+
                     waitLRA0+2, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
 
                     # max(packA0)+1, SBarrier(comment="Barrier before GRA&GRB"),
