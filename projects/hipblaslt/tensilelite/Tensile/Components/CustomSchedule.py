@@ -2357,8 +2357,9 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         packB0Done = max(packB0)
         # GRB (split in two blocks)
         # grB = create_range(min_val = packB0Done+1,num = 8,step = 2, repeat = 2)
-        grB = [create_range(min_val = packB0Done+2,num = 4,step = 2, repeat = 2),
-               create_range(min_val = packB0Done+1,num = 4,step = 2, repeat = 2)]
+        grB = [create_range(min_val = packB0Done+2,num = 4,step = 4, repeat = 2),
+               create_range(min_val = packB0Done+1,num = 4,step = 4, repeat = 2)]
+
         # Sanity check
         assert packB0Done < numMfma//4
 
