@@ -2403,10 +2403,11 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
 
         # LR3
         startLRA3 = halfMFMA
-        lra3 = create_range(min_val = startLRA3, num = numLrReadA // 2, step = 2, repeat = 2)
-        waitLRA3 = max(lra3)+8 
+        lra3 = [create_range(min_val = startLRA3, num = numLrReadA // 2, step = 2, repeat = 2),
+                create_range(min_val = startLRA3+1, num = numLrReadA // 2, step = 2, repeat = 2)]
+        waitLRA3 = max(lra3[0])+8 
         grB[0] += create_range(min_val = startLRA3+1,num = 4,step = 2, repeat = 2)
-        grB[1] += create_range(min_val = startLRA3+1,num = 4,step = 2, repeat = 2)
+        grB[1] += create_range(min_val = startLRA3,num = 4,step = 2, repeat = 2)
         # grA = create_range(min_val = max(grB)+1, num = 2, step = 2,repeat = 2)
         # GRA                
         # grA = create_range(min_val = max(packA0)+1, num = 6, step = 2,repeat = 2)
@@ -2479,7 +2480,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
             'LWSA': [[142]],
             'LWSB': [[142]],
             'LCC': [[143, 143]],
-            'LRA3': [lra3],
+            'LRA3': [*lra3],
             'LRB3': [lrb3],
             'PackB3' : [packB3],
             'PackA3' : [packA3],
