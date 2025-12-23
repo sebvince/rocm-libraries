@@ -2329,10 +2329,11 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         
         numLrReadB = 8
         # LRB0 + GRIncB
-        lrb0 = create_range(min_val = 0, num = 8, step = 1, repeat = 1)
- 
+        lrb0 = create_range(min_val = 0, num = 6, step = 1, repeat = 1)
         grIncB = create_range(min_val = max(lrb0)+1, num = 3, step = 1, repeat = 3)
-        grIncA = create_range(min_val = max(grIncB)+1, num = 3, step = 1, repeat = 3)
+        lrb0 += create_range(min_val = max(grIncB)+1, num = 2, step = 1, repeat = 1)
+ 
+        grIncA = create_range(min_val = max(lrb0)+1, num = 3, step = 1, repeat = 3)
         waitLRB0 = max(grIncA)+4
         startPACKB0 = waitLRB0
         packBOffset = [ 
@@ -2443,8 +2444,10 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         grA += create_range(min_val = max(packB3)+1, num = 2, step = 1,repeat = 2)
 
         syncTable = [                                      
-                    waitLRB0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRB0 to complete"),
-                    waitLRB0, SBarrier(comment="Barrier before GRB"),
+                    waitLRB0, SWaitCnt(dscnt=4, vlcnt=-1, vscnt=-1, comment="Wait for 4/8 LRB0 to complete"),
+                    waitLRB0+4, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRB0 to complete"),
+
+                    waitLRB0+4, SBarrier(comment="Barrier before GRB"), #Barrier can be after CVT
 
                     # will be clampled to dscnt=15 but it's fine
                     waitLRA0, SWaitCnt(dscnt=numLrReadA-4, vlcnt=-1, vscnt=-1, comment="Wait for 2 LRA0 to complete"),
