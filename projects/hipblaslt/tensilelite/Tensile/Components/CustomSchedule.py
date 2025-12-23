@@ -2327,7 +2327,7 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
         }
 
         nglshift = nllshift = 14 # vmcnt shift for ngl and nll
-    if isNN(kernel) and TLDS==1:
+    elif isNN(kernel) and TLDS==1:
         kernel["UsePLRPack"] = True
         kernel["UseMFMAF32XEmulation"] = True
         
@@ -2503,15 +2503,12 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
             'PackA3' : [packA3],
 
         }
-        
-        ref = {'SYNC': [[17, 21, 21, 59, 60, 61, 71, 71, 98, 99, 100, 101, 119, 120, 121, 122, 123]], 'GRIncA': [[11, 11, 11, 12, 12, 12, 13, 13, 13]], 'GRIncB': [[6, 6, 6, 7, 7, 7, 8, 8, 8]], 'LRA0': [[34, 34, 36, 36, 38, 38, 40, 40, 42, 42, 44, 44, 46, 46, 48, 48, 50, 50, 52, 52, 54, 54, 56, 56], [35, 35, 37, 37, 39, 39, 41, 41, 43, 43, 45, 45, 47, 47, 49, 49, 51, 51, 53, 53, 55, 55, 57, 57]], 'LRB0': [[0, 1, 2, 3, 4, 5, 9, 10]], 'PackA0': [[59, 59, 60, 60, 65, 65, 66, 66, 67, 67, 61, 61, 62, 62, 65, 65, 68, 68, 69, 69, 63, 63, 64, 64, 65, 65, 70, 70, 71, 71]], 'PackB0': [[17, 17, 18, 18, 25, 25, 26, 26, 27, 27, 19, 19, 20, 20, 25, 25, 28, 28, 29, 29, 21, 21, 22, 22, 25, 25, 30, 30, 31, 31, 23, 23, 24, 24, 25, 25, 32, 32, 33, 33]], 'GRA': [[105, 106, 107, 108, 109, 110, 111, 112, 136, 136, 137, 137], [107, 108, 109, 110, 111, 112, 113, 114, 136, 136, 137, 137]], 'GRB': [[35, 35, 39, 39, 43, 43, 47, 47, 73, 73, 75, 75, 77, 77, 79, 79], [34, 34, 38, 38, 42, 42, 46, 46, 72, 72, 74, 74, 76, 76, 78, 78]], 'LRSA': [[58]], 'LRSB': [[58]], 'LWSA': [[142]], 'LWSB': [[142]], 'LCC': [[143, 143]], 'LRA3': [[72, 72, 74, 74, 76, 76, 78, 78, 80, 80, 82, 82, 84, 84, 86, 86, 88, 88, 90, 90, 92, 92, 94, 94], [73, 73, 75, 75, 77, 77, 79, 79, 81, 81, 83, 83, 85, 85, 87, 87, 89, 89, 91, 91, 93, 93, 95, 95]], 'LRB3': [[104, 105, 106, 107, 108, 109, 112, 113]], 'PackB3': [[119, 119, 120, 120, 127, 127, 128, 128, 129, 129, 121, 121, 122, 122, 127, 127, 130, 130, 131, 131, 123, 123, 124, 124, 127, 127, 132, 132, 133, 133, 125, 125, 126, 126, 127, 127, 134, 134, 135, 135]], 'PackA3': [[98, 98, 99, 99, 127, 127, 136, 136, 137, 137, 100, 100, 101, 101, 127, 127, 138, 138, 139, 139, 102, 102, 103, 103, 127, 127, 140, 140, 141, 141]]}
-        compare_values(optSchedule, ref)
-        print(optSchedule)
+
         nglshift = nllshift = 14
         
     else:
         return False, None
 
     opt1 = ScheduleInfo(2, numMfma, optSchedule, syncCode, nglshift, nllshift, mfmaReorder=mfmaReorder)
-    # opt1.disableValidation() # Disable validation as this schedule re-order pack instructions (Non-descending-order validator to be updated to allow this)
+    opt1.disableValidation() # Disable validation as this schedule re-order pack instructions (Non-descending-order validator to be updated to allow this)
     return True, opt1
