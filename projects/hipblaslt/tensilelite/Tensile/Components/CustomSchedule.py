@@ -2450,8 +2450,8 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
                     waitLRB0+4, SBarrier(comment="Barrier before GRB"), #Barrier can be after CVT
 
                     # will be clampled to dscnt=15 but it's fine
-                    waitLRA0, SWaitCnt(dscnt=numLrReadA-4, vlcnt=-1, vscnt=-1, comment="Wait for 2 LRA0 to complete"),
-                    waitLRA0+1, SWaitCnt(dscnt=numLrReadA-8, vlcnt=-1, vscnt=-1, comment="Wait for 2 LRA0 to complete"),
+                    waitLRA0, SWaitCnt(dscnt=numLrReadA-4, vlcnt=-1, vscnt=-1, comment="Wait for 4 LRA0 to complete"),
+                    waitLRA0+1, SWaitCnt(dscnt=numLrReadA-8, vlcnt=-1, vscnt=-1, comment="Wait for 8 LRA0 to complete"),
 
                     waitLRA0+2, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
 
@@ -2460,8 +2460,14 @@ def _get_schedule_192x256x32_TF32(kernel, useLDSTr, TLDS):
                     startLRA3-1,SWaitCnt(dscnt=-1, vlcnt=4, vscnt=-1, comment="Wait for previous GRA&B"),
                     startLRA3-1,SBarrier(comment="Sync before GRA, LRA3 & LRB3"),
 
-                    waitLRA3, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA3 to complete"),                    
-                    waitLRB3,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB3 to complete"),
+                    waitLRA3, SWaitCnt(dscnt=numLrReadA-4, vlcnt=-1, vscnt=-1, comment="Wait for 4 LRA3 to complete"),                    
+                    waitLRA3+1, SWaitCnt(dscnt=numLrReadA-8, vlcnt=-1, vscnt=-1, comment="Wait for 8 LRA3 to complete"), 
+                    waitLRA3+2, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA3 to complete"),                    
+
+                    waitLRB3, SWaitCnt(dscnt=7, vlcnt=-1, vscnt=-1, comment="Wait for 1st LRB3 to complete"),
+                    waitLRB3+1, SWaitCnt(dscnt=6, vlcnt=-1, vscnt=-1, comment="Wait for 2nd LRB3 to complete"),
+                    waitLRB3+2, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRB3 to complete"),
+
                     ]
 
         syncCode = syncTable[1::2]
