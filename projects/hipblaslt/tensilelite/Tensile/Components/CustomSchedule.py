@@ -2487,7 +2487,7 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
         lra0 = create_range(min_val = 0, num = 4, step = 1, repeat = 1)
         grIncA = create_range(min_val = max(lra0)+1, num = 3, step = 1, repeat = 3)
 
-        waitLRA0 = max(grIncA)+3
+        waitLRA0 = max(grIncA)+2
         startPACKA0 = waitLRA0
 
         # Use a common packOffset re-ordering for both A and B
@@ -2569,8 +2569,11 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
         # GRB - 2nd half (4 reads) 
         # grB += create_range(min_val = max(packA3)+1,num = 4,step = 2, repeat = 2)
 
-        syncTable = [                    
-                    waitLRA0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA0 to complete"),
+        syncTable = [     -1, SBarrier(comment="TMP"),
+                    waitLRA0, SWaitCnt(dscnt=3, vlcnt=-1, vscnt=-1, comment="Wait for 1st LRA0 to complete"),
+                    waitLRA0+1, SWaitCnt(dscnt=2, vlcnt=-1, vscnt=-1, comment="Wait for 2nd LRA0 to complete"),
+                    waitLRA0+2, SWaitCnt(dscnt=1, vlcnt=-1, vscnt=-1, comment="Wait for 3rd LRA0 to complete"),
+                    waitLRA0+3, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRA0 to complete"),
                     waitLRB0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB0 to complete"),
 
                     max(packB0)+1, SBarrier(comment="Barrier before GRA&GRB"),
