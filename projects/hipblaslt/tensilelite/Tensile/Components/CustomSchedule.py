@@ -2538,6 +2538,7 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
 
 
         halfMFMA = numMfma//2
+
         assert max(packB0) < halfMFMA, f"max(packB0) {max(packB0)} >= halfMFMA {halfMFMA}"
 
         # LR3
@@ -2566,15 +2567,16 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
         # PackB3
         packB3 = [x + waitLRB3 for x in packBOffset]
 
-        # GRB - 1st half (4 reads) 
-        grB[0] += create_range(min_val = max(packB3)+6,num = 6,step = 1, repeat = 2)
-        grB[1] += create_range(min_val = max(packB3)+6,num = 6,step = 1, repeat = 2)
 
         # LRA3 + PACKA3
         startLRA3 = (3*numMfma)//4 
-        lra3 = create_range(min_val = startLRA3,num=4,step=1,repeat=1)
+        # GRB 
+        grB[0] += create_range(min_val = startLRA3,num = 6,step = 1, repeat = 2)
+        grB[1] += create_range(min_val = startLRA3,num = 6,step = 1, repeat = 2)
+
+        lra3 = create_range(min_val = max(grB[1]),num=4,step=1,repeat=1)
         
-        waitLRA3 = max(lra3) 
+        waitLRA3 = max(lra3) + 1 
         packA3 = [x + waitLRA3 for x in packAOffset]
 
         # GRB - 2nd half (4 reads) 
@@ -2603,9 +2605,13 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
                     waitLRB3,SWaitCnt(dscnt=7, vlcnt=-1, vscnt=-1, comment="Wait for 1/8 LRB3 to complete"),
                     waitLRB3+1,SWaitCnt(dscnt=6, vlcnt=-1, vscnt=-1, comment="Wait for 2/8 LRB3 to complete"),
                     waitLRB3+2,SWaitCnt(dscnt=5, vlcnt=-1, vscnt=-1, comment="Wait for 3/8 LRB3 to complete"),
-                    waitLRB3+3,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for 8/8 LRB3 to complete"),
-                    
-                    waitLRA3, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA3 to complete"),                    
+                    waitLRB3+3,SWaitCnt(dscnt=4, vlcnt=-1, vscnt=-1, comment="Wait for 4/8 LRB3 to complete"),
+                    waitLRB3+4,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for 8/8 LRB3 to complete"),
+
+                    waitLRA3, SWaitCnt(dscnt=3, vlcnt=-1, vscnt=-1, comment="Wait for 1/4 LRA3 to complete"),                    
+                    waitLRA3+1, SWaitCnt(dscnt=2, vlcnt=-1, vscnt=-1, comment="Wait for 2/4 LRA3 to complete"),                    
+                    waitLRA3+2, SWaitCnt(dscnt=1, vlcnt=-1, vscnt=-1, comment="Wait for 3/4 LRA3 to complete"),                    
+                    waitLRA3+3, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for 4/4 LRA3 to complete"),                    
                     ]
 
         syncCode = syncTable[1::2]
