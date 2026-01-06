@@ -2542,21 +2542,33 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
 
         # LR3
         startLRB3 = halfMFMA
-        # GRA - 1st half (4 reads)                
-        grA = create_range(min_val = startLRB3+1, num = 4, step = 2,repeat = 2)
-        grB = create_range(min_val = max(grA)+1,num = 2,step = 2, repeat = 2)
+        # GRA - Split M0/Buffer load for 1st load             
+        grA = [[startLRB3, startLRB3+1],
+               [startLRB3, startLRB3+2]]
 
-        lrb3 = create_range(min_val = startLRB3, num = 8, step = 1, repeat = 1)
+        # Interleave GRA and LBR3
+        grA[0] += create_range(min_val = max(grA[0])+2, num = 3, step = 2,repeat = 2)
+        grA[1] += create_range(min_val = max(grA[1])+2, num = 3, step = 2,repeat = 2)
 
+
+        lrb3 = [create_range(min_val = startLRB3, num = 3, step = 2, repeat = 2),
+                create_range(min_val = startLRB3+1, num = 3, step = 2, repeat = 2)]
+
+        lrb3[0]+= create_range(min_val = max(lrb3[0])+5, num = 1, step = 2, repeat = 2)
+        lrb3[1]+= create_range(min_val = max(lrb3[1])+5, num = 1, step = 2, repeat = 2)
+
+        grB = [create_range(min_val = max(grA[0])+3,num = 2,step = 2, repeat = 2),
+               create_range(min_val = max(grA[1])+3,num = 2,step = 2, repeat = 2)]
         # GRA - 2nd half (4 reads)   
         # grA += create_range(min_val = max(lrb3)+1, num = 4, step = 2,repeat = 2)
-        waitLRB3 = max(lrb3)+1 
+        waitLRB3 = max(grB[1])+1 
 
         # PackB3
         packB3 = [x + waitLRB3 for x in packBOffset]
 
         # GRB - 1st half (4 reads) 
-        grB += create_range(min_val = max(packB3)+1,num = 6,step = 2, repeat = 2)
+        grB[0] += create_range(min_val = max(packB3)+6,num = 6,step = 1, repeat = 2)
+        grB[1] += create_range(min_val = max(packB3)+6,num = 6,step = 1, repeat = 2)
 
         # LRA3 + PACKA3
         startLRA3 = (3*numMfma)//4 
@@ -2588,7 +2600,11 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
                     startLRB3-1,SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for previous GRA&B"),
                     startLRB3-1,SBarrier(comment=""),
 
-                    waitLRB3,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB3 to complete"),
+                    waitLRB3,SWaitCnt(dscnt=7, vlcnt=-1, vscnt=-1, comment="Wait for 1/8 LRB3 to complete"),
+                    waitLRB3+1,SWaitCnt(dscnt=6, vlcnt=-1, vscnt=-1, comment="Wait for 2/8 LRB3 to complete"),
+                    waitLRB3+2,SWaitCnt(dscnt=5, vlcnt=-1, vscnt=-1, comment="Wait for 3/8 LRB3 to complete"),
+                    waitLRB3+3,SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for 8/8 LRB3 to complete"),
+                    
                     waitLRA3, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA3 to complete"),                    
                     ]
 
@@ -2604,15 +2620,15 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
             'PackA0' : [packA0],
             'PackB0' : [packB0],
 
-            'GRA': [grA],
-            'GRB': [grB],              
+            'GRA': [*grA],
+            'GRB': [*grB],              
             'LRSA': [[max(lrb0)+1]],
             'LRSB': [[max(lrb0)+1]],
             'LWSA': [[numMfma-2]],
             'LWSB': [[numMfma-2]],
             'LCC': [[numMfma-1, numMfma-1]],
             'LRA3': [lra3],
-            'LRB3': [lrb3],
+            'LRB3': [*lrb3],
             'PackB3' : [packB3],
             'PackA3' : [packA3],
 
