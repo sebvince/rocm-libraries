@@ -2507,19 +2507,17 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
         # Sanity check
         assert packA0Done < numMfma//4 , f"packA0Done {packA0Done} >= {numMfma//4}"
 
-        # LRB0 + GRIncB
+        # 1st part of LRB0 + GRIncB
         lrb0 = create_range(min_val = max(packA0)+1, num = 6, step = 1, repeat = 1)
         grIncB = create_range(min_val = max(packA0)+1, num = 4, step = 1, repeat= 2)
         grIncB += [max(grIncB)+1]
 
+        # GRA  + 2nd part of LBR0
         grA = create_range(min_val = max(lrb0)+1, num = 4, step = 2,repeat = 2)
-        
-
         lrb0 += create_range(min_val = max(lrb0)+4, num = 2, step = 1, repeat = 1)
+
         waitLRB0 = max(lrb0)+2
         startPACKB0 = waitLRB0
-
-
 
         packBOffset = [ 
             0, 0, 1, 1, 
@@ -2538,38 +2536,30 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
             8, 8,
             15, 15, 16, 16,
             ]   
-
-
         
         packB0 = [x + startPACKB0 for x in packBOffset]
 
-
         halfMFMA = numMfma//2
-
         assert max(packB0) < halfMFMA, f"max(packB0) {max(packB0)} >= halfMFMA {halfMFMA}"
 
         # LR3
         startLRB3 = halfMFMA
-        # GRA - Split M0/Buffer load for 1st load             
-        # grA = [[startLRB3, startLRB3+1],
-        #        [startLRB3, startLRB3+2]]
-
         # Interleave GRA and LBR3
-
-
-
         lrb3 = [create_range(min_val = startLRB3, num = 3, step = 2, repeat = 2),
                 create_range(min_val = startLRB3+1, num = 3, step = 2, repeat = 2)]
 
+        # Splitting LRB3 to avoid LDS Issue latency
         lrb3[0]+= create_range(min_val = max(lrb3[0])+5, num = 1, step = 2, repeat = 2)
         lrb3[1]+= create_range(min_val = max(lrb3[1])+5, num = 1, step = 2, repeat = 2)
 
+
         grB = [create_range(min_val = startLRB3+1,num = 4,step = 2, repeat = 2),
                create_range(min_val = startLRB3,num = 4,step = 2, repeat = 2)]
-        # GRA - 2nd half (4 reads)   
-        # grA += create_range(min_val = max(lrb3)+1, num = 4, step = 2,repeat = 2)
+        
+        
         waitLRB3 = max(lrb3[1])+2 
 
+        # Use different PackBOffset to shift last 5 CVTs iterations after GRB/LRA3
         packB3Offset = [ 
             0, 0, 1, 1, 
             8, 8,
@@ -2591,11 +2581,8 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
         # PackB3
         packB3 = [x + waitLRB3 for x in packB3Offset]
 
-
-
-        # LRA3 + PACKA3
         startLRA3 = (3*numMfma)//4 
-        # GRB 
+        # GRB + LRA3 (interleaved)
         grB[0] += create_range(min_val = startLRA3,num = 4,step = 2, repeat = 2)
         grB[1] += create_range(min_val = startLRA3+1,num = 4,step = 2, repeat = 2)
 
@@ -2605,10 +2592,7 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
         waitLRA3 = max(lra3[0]) + 6 
         packA3 = [x + waitLRA3 for x in packAOffset]
 
-        # GRB - 2nd half (4 reads) 
-        # grB += create_range(min_val = max(packA3)+1,num = 4,step = 2, repeat = 2)
-
-        syncTable = [     -1, SBarrier(comment="TMP"),
+        syncTable = [     -1, SBarrier(comment="Sync codepath"),
                     waitLRA0, SWaitCnt(dscnt=3, vlcnt=-1, vscnt=-1, comment="Wait for 1st LRA0 to complete"),
                     waitLRA0+1, SWaitCnt(dscnt=2, vlcnt=-1, vscnt=-1, comment="Wait for 2nd LRA0 to complete"),
                     waitLRA0+2, SWaitCnt(dscnt=1, vlcnt=-1, vscnt=-1, comment="Wait for 3rd LRA0 to complete"),
@@ -2623,8 +2607,6 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
                     waitLRB0+5, SWaitCnt(dscnt=2, vlcnt=-1, vscnt=-1, comment="Wait for 6/8 LRB0 to complete"),
                     waitLRB0+6, SWaitCnt(dscnt=1, vlcnt=-1, vscnt=-1, comment="Wait for 7/8 LRB0 to complete"),
                     waitLRB0+7, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for 8/8 LRB0 to complete"),
-
-                    # max(packB0)+1, SBarrier(comment="Barrier before GRB"),
 
                     startLRB3-1,SWaitCnt(dscnt=-1, vlcnt=4, vscnt=-1, comment="Wait for previous GRA&B"),
                     startLRB3-1,SBarrier(comment="Barrier before GRB and before LRBA3/LBRB3"),
