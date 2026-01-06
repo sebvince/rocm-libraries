@@ -2567,7 +2567,7 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
                create_range(min_val = startLRB3,num = 4,step = 2, repeat = 2)]
         # GRA - 2nd half (4 reads)   
         # grA += create_range(min_val = max(lrb3)+1, num = 4, step = 2,repeat = 2)
-        waitLRB3 = max(lrb3[1])+1 
+        waitLRB3 = max(lrb3[1])+2 
 
         # PackB3
         packB3 = [x + waitLRB3 for x in packBOffset]
@@ -2579,9 +2579,9 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
         grB[0] += create_range(min_val = startLRA3,num = 4,step = 1, repeat = 2)
         grB[1] += create_range(min_val = startLRA3,num = 4,step = 1, repeat = 2)
 
-        lra3 = create_range(min_val = max(grB[1]),num=4,step=1,repeat=1)
+        lra3 = create_range(min_val = max(grB[1])+2,num=4,step=1,repeat=1)
         
-        waitLRA3 = max(lra3) + 1 
+        waitLRA3 = max(lra3) + 4 
         packA3 = [x + waitLRA3 for x in packAOffset]
 
         # GRB - 2nd half (4 reads) 
@@ -2603,10 +2603,10 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
                     waitLRB0+6, SWaitCnt(dscnt=1, vlcnt=-1, vscnt=-1, comment="Wait for 7/8 LRB0 to complete"),
                     waitLRB0+7, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for 8/8 LRB0 to complete"),
 
-                    max(packB0)+1, SBarrier(comment="Barrier before GRB"),
+                    # max(packB0)+1, SBarrier(comment="Barrier before GRB"),
 
                     startLRB3-1,SWaitCnt(dscnt=-1, vlcnt=4, vscnt=-1, comment="Wait for previous GRA&B"),
-                    startLRB3-1,SBarrier(comment=""),
+                    startLRB3-1,SBarrier(comment="Barrier before GRB and before LRBA3/LBRB3"),
 
                     waitLRB3,SWaitCnt(dscnt=7, vlcnt=-1, vscnt=-1, comment="Wait for 1/8 LRB3 to complete"),
                     waitLRB3+1,SWaitCnt(dscnt=6, vlcnt=-1, vscnt=-1, comment="Wait for 2/8 LRB3 to complete"),
