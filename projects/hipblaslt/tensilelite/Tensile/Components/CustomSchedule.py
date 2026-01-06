@@ -2509,12 +2509,13 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
 
         # LRB0 + GRIncB
         lrb0 = create_range(min_val = max(packA0)+1, num = 6, step = 1, repeat = 1)
-        grIncB = create_range(min_val = max(lrb0)+1, num = 3, step = 1, repeat= 3)
+        grIncB = create_range(min_val = max(packA0)+1, num = 4, step = 1, repeat= 2)
+        grIncB += [max(grIncB)+1]
 
         grA = create_range(min_val = max(lrb0)+1, num = 4, step = 2,repeat = 2)
         
 
-        lrb0 += create_range(min_val = max(grIncB)+1, num = 2, step = 1, repeat = 1)
+        lrb0 += create_range(min_val = max(lrb0)+4, num = 2, step = 1, repeat = 1)
         waitLRB0 = max(lrb0)+2
         startPACKB0 = waitLRB0
 
@@ -2569,19 +2570,39 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
         # grA += create_range(min_val = max(lrb3)+1, num = 4, step = 2,repeat = 2)
         waitLRB3 = max(lrb3[1])+2 
 
+        packB3Offset = [ 
+            0, 0, 1, 1, 
+            8, 8,
+            9, 9, 10, 10,
+
+            2, 2, 3, 3, 
+            8, 8,
+            11, 11, 19, 19,
+
+            4, 4, 5, 5, 
+            8, 8,
+            20, 20, 21, 21,
+
+            6, 6, 7, 7, 
+            8, 8,
+            22, 22, 23, 23,
+            ]   
+
         # PackB3
-        packB3 = [x + waitLRB3 for x in packBOffset]
+        packB3 = [x + waitLRB3 for x in packB3Offset]
+
 
 
         # LRA3 + PACKA3
         startLRA3 = (3*numMfma)//4 
         # GRB 
-        grB[0] += create_range(min_val = startLRA3,num = 4,step = 1, repeat = 2)
-        grB[1] += create_range(min_val = startLRA3,num = 4,step = 1, repeat = 2)
+        grB[0] += create_range(min_val = startLRA3,num = 4,step = 2, repeat = 2)
+        grB[1] += create_range(min_val = startLRA3+1,num = 4,step = 2, repeat = 2)
 
-        lra3 = create_range(min_val = max(grB[1])+2,num=4,step=1,repeat=1)
+        lra3 = [create_range(min_val = startLRA3+1,num=4,step=2,repeat=1),
+                create_range(min_val = startLRA3,num=4,step=2,repeat=1)]
         
-        waitLRA3 = max(lra3) + 4 
+        waitLRA3 = max(lra3[0]) + 6 
         packA3 = [x + waitLRA3 for x in packAOffset]
 
         # GRB - 2nd half (4 reads) 
@@ -2643,7 +2664,7 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
             'LWSA': [[numMfma-2]],
             'LWSB': [[numMfma-2]],
             'LCC': [[numMfma-1, numMfma-1]],
-            'LRA3': [lra3],
+            'LRA3': [*lra3],
             'LRB3': [*lrb3],
             'PackB3' : [packB3],
             'PackA3' : [packA3],
