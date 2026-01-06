@@ -2490,7 +2490,6 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
         waitLRA0 = max(grIncA)+2
         startPACKA0 = waitLRA0
 
-        # Use a common packOffset re-ordering for both A and B
         packAOffset = [ 
             0, 0, 1, 1, 
             4, 4,
@@ -2508,29 +2507,29 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
         # Sanity check
         assert packA0Done < numMfma//4 , f"packA0Done {packA0Done} >= {numMfma//4}"
 
-        # LRB0 + GRIncB (Split LRB0 into two halves to hide latency)
-        lrb0 = create_range(min_val = max(packA0)+1, num = 8, step = 1, repeat = 1)
-        # lrb0 += create_range(min_val = max(lrb0)+4, num = 4, step = 1, repeat = 1)
-        grIncB = create_range(max(lrb0)+1,3,max(lrb0)+4,1,3)
-        waitLRB0 = max(grIncB)+1
+        # LRB0 + GRIncB
+        lrb0 = create_range(min_val = max(packA0)+1, num = 6, step = 1, repeat = 1)
+        grIncB = create_range(min_val = max(lrb0)+1, num = 3, step = 1, repeat= 3)
+        lrb0 += create_range(min_val = max(grIncB)+1, num = 2, step = 1, repeat = 1)
+        waitLRB0 = max(lrb0)+2
         startPACKB0 = waitLRB0
 
         packBOffset = [ 
             0, 0, 1, 1, 
             8, 8,
-            9, 9, 10, 11,
+            9, 9, 10, 10,
 
             2, 2, 3, 3, 
             8, 8,
-            12, 12, 13, 13,
+            11, 11, 12, 12,
 
             4, 4, 5, 5, 
             8, 8,
-            14, 14, 15, 15,
+            13, 13, 14, 14,
 
             6, 6, 7, 7, 
             8, 8,
-            16, 16, 17, 17,
+            15, 15, 16, 16,
             ]   
 
 
@@ -2574,7 +2573,15 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
                     waitLRA0+1, SWaitCnt(dscnt=2, vlcnt=-1, vscnt=-1, comment="Wait for 2nd LRA0 to complete"),
                     waitLRA0+2, SWaitCnt(dscnt=1, vlcnt=-1, vscnt=-1, comment="Wait for 3rd LRA0 to complete"),
                     waitLRA0+3, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all LRA0 to complete"),
-                    waitLRB0, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRB0 to complete"),
+
+                    waitLRB0, SWaitCnt(dscnt=7, vlcnt=-1, vscnt=-1, comment="Wait for 1/8 LRB0 to complete"),
+                    waitLRB0+1, SWaitCnt(dscnt=6, vlcnt=-1, vscnt=-1, comment="Wait for 2/8 LRB0 to complete"),
+                    waitLRB0+2, SWaitCnt(dscnt=5, vlcnt=-1, vscnt=-1, comment="Wait for 3/8 LRB0 to complete"),
+                    waitLRB0+3, SWaitCnt(dscnt=4, vlcnt=-1, vscnt=-1, comment="Wait for 4/8 LRB0 to complete"),
+                    waitLRB0+4, SWaitCnt(dscnt=3, vlcnt=-1, vscnt=-1, comment="Wait for 5/8 LRB0 to complete"),
+                    waitLRB0+5, SWaitCnt(dscnt=2, vlcnt=-1, vscnt=-1, comment="Wait for 6/8 LRB0 to complete"),
+                    waitLRB0+6, SWaitCnt(dscnt=1, vlcnt=-1, vscnt=-1, comment="Wait for 7/8 LRB0 to complete"),
+                    waitLRB0+7, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for 8/8 LRB0 to complete"),
 
                     max(packB0)+1, SBarrier(comment="Barrier before GRA&GRB"),
 
@@ -2599,8 +2606,8 @@ def _get_schedule_128x256x32_TF32(kernel, useLDSTr, TLDS):
 
             'GRA': [grA],
             'GRB': [grB],              
-            'LRSA': [[max(grIncB)+1]],
-            'LRSB': [[max(grIncB)+2]],
+            'LRSA': [[max(lrb0)+1]],
+            'LRSB': [[max(lrb0)+1]],
             'LWSA': [[numMfma-2]],
             'LWSB': [[numMfma-2]],
             'LCC': [[numMfma-1, numMfma-1]],
