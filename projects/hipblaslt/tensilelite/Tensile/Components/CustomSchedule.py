@@ -2167,7 +2167,7 @@ def _get_schedule_128x224x64_16bit(kernel, useLDSTr, TLDS):
 
 
 
-
+#not valid
 @RegisterSchedule(
     tile_config=TileConfig(128, 128, 64, 2, 1, True, 0, 0),
     dtype_predicate=is16bit,
@@ -2183,36 +2183,62 @@ def _get_schedule_128x128x64_16bit(kernel, useLDSTr, TLDS):
     syncCode = []
     nglshift = nllshift = 0
     if isNN(kernel) and useLDSTr and TLDS == 1:
+        kernel["SwapGlobalReadOrder"] = True
+
+        lrb0 = create_range(min_val = 0, num = 4, step = 1, repeat = 1)
+
+        GRIncB = create_range(min_val = 0, num = 3, step = 1, repeat = 1)
+        GRIncB += create_range(min_val = max(lrb0)+1, num = 1, step = 1, repeat = 3)
+        lra0 = create_range(min_val = max(GRIncB)+1, num = 1, step = 2, repeat = 2)
+        GRIncB += create_range(min_val = max(lra0)+1, num = 1, step = 1, repeat = 3)
+        lra0 += create_range(min_val = max(GRIncB)+1, num = 3, step = 2, repeat = 2)
+        waitLRB0 = max(lrb0)+6
+
+
+        grb = create_range(min_val = waitLRB0, num = 4, step = 1, repeat = 2)
+
+        syncTable = [
+            -1, SWaitCnt(dscnt=3, vlcnt=-1, vscnt=-1, comment="wait for prior LRA1/LRB1"),
+            # -1, SBarrier(comment=""),
+            # SWaitCnt(dscnt=5, vlcnt=-1, vscnt=-1, comment="wait for prior LRA1/LRB1"),
+            waitLRB0, SWaitCnt(dscnt=4, vlcnt=-1, vscnt=-1, comment="wait for LRA0 before GRA"),
+            waitLRB0, SBarrier(comment="barrier: all waves finish LRA0 before GRA DirectToLds"),
+
+            15, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="wait for LRB0 before GRB"),
+            15, SBarrier(comment=""),
+
+            20, SWaitCnt(dscnt=-1, vlcnt=10, vscnt=-1, comment="wait for LRB0 before GRB"),
+            20, SBarrier(comment="barrier: all waves finish LRB0 before GRB DirectToLds"),
+
+            26, SWaitCnt(dscnt=-1, vlcnt=12, vscnt=-1, comment="wait for LRB0 before GRB"),
+            26, SBarrier(comment="barrier: all waves finish LRB0 before GRB DirectToLds"),
+            
+            # 27, SWaitCnt(dscnt=-1, vlcnt=8, vscnt=-1, comment="wait for GRA/GRB to complete"),
+            # 27, SBarrier(comment="barrier: GRA/GRB complete, LDS updated for LRA1/LRB1"),
+        ]
+
         optSchedule = {
-            'SYNC': [[-1,3, 8, 8,15, 18, 27,27]],
-            'GRIncA': [[0, 0, 1, 1, 2, 2, 3, 3, 4]],
-            'GRIncB': [[4, 5, 5, 6, 6, 7, 7, 12, 13]],
-            'LRA0': [[0, 1, 1, 2, 2, 3, 3, 4]],
-            'GRA': [[8, 8, 9, 10, 11, 12, 13, 14]],
-            'LRB0': [[8, 9, 10, 11]],
-            'GRB': [[18, 18,19, 20, 21, 22, 23, 25]],
+            # 'SYNC': [[-1,3, 8, 8,15, 18, 27,27]],
+            'SYNC': [syncTable[::2]],
+            'GRIncA': [GRIncB],
+            'GRIncB': [[7, 7, 7, 13, 13, 13, 14, 14, 14]],
+            'LRA0': [lra0],
+            'GRA': [grb],
+            'LRB0': [lrb0],
+            'GRB': [[15, 15, 29, 29, 30, 30, 31,31]],
             'LRA1': [[19, 20, 21, 22, 23, 24, 25, 25]],
             'LRB1': [[27, 28, 29, 30]],
             'LRSA': [[17]],
             'LRSB': [[17]],
-            'LWSA': [[30]],
-            'LWSB': [[30]],
+            'LWSA': [[300]],
+            'LWSB': [[300]],
             'LCC': [[31, 31]],
         }
-        syncCode = [
-            SWaitCnt(dscnt=3, vlcnt=-1, vscnt=-1, comment="wait for prior LRA1/LRB1"),
-            SWaitCnt(dscnt=3, vlcnt=-1, vscnt=-1, comment="wait for prior LRA1/LRB1"),
-            SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="wait for LRA0 before GRA"),
-            SBarrier(comment="barrier: all waves finish LRA0 before GRA DirectToLds"),
-            SWaitCnt(dscnt=0, vlcnt=8, vscnt=-1, comment="wait for LRB0 before GRB"),
-            SBarrier(comment="barrier: all waves finish LRB0 before GRB DirectToLds"),
-            #SWaitCnt(dscnt=-1, vlcnt=8, vscnt=-1, comment="wait for GRA/GRB to complete"),
-            #SBarrier(comment="barrier: GRA/GRB complete, LDS updated for LRA1/LRB1"),
-            SWaitCnt(dscnt=-1, vlcnt=8, vscnt=-1, comment="wait for GRA/GRB to complete"),
-            SBarrier(comment="barrier: GRA/GRB complete, LDS updated for LRA1/LRB1"),
-        ]
+
+        syncCode = syncTable[1::2]
         nglshift = nllshift = 8  # 4 GRA + 4 GRB = 8 global reads
         opt1 = ScheduleInfo(2, numMfma, optSchedule, syncCode, nglshift, nllshift)
+        opt1.disableValidation()
         return True, opt1
     elif isNT(kernel) and useLDSTr and TLDS == 0:
         optSchedule = {
@@ -2340,6 +2366,86 @@ def _get_schedule_128x256x64_16bit(kernel, useLDSTr, TLDS):
         nglshift = nllshift = 12 
         opt1 = ScheduleInfo(2, numMfma, optSchedule, syncCode, nglshift, nllshift)
         # opt1.disableValidation()
+        return True, opt1
+   
+    # No matching variant found
+    return False, None
+
+
+#Not valid
+@RegisterSchedule(
+    tile_config=TileConfig(256, 128, 64, 2, 1, True, 0, 0),
+    dtype_predicate=is16bit,
+    vector_widths=[8, 8, 8],
+    matrix_inst=[16, 16, 32, 1],
+    mfma_wave_group=[4, 1]
+)
+def _get_schedule_256x128x64_16bit(kernel, useLDSTr, TLDS):
+    kernel["MfmaInitCVgprs"] = True
+    
+    numMfma = 64
+    optSchedule = dict()
+    syncCode = []
+    nglshift = nllshift = 0
+    if isNN(kernel) and useLDSTr and TLDS == 1:
+        lra0 = [create_range(min_val = 1, num = 4, step = 2, repeat = 2),
+                create_range(min_val = 0, num = 4, step = 2, repeat = 2)]
+
+        GRIncA = [create_range(min_val = 0, num = 3, step = 2, repeat = 3),
+                  create_range(min_val = 1, num = 3, step = 2, repeat = 3)]
+
+        waitLRA0 = max(lra0[1])+5
+        gra = create_range(min_val = waitLRA0+1, num = 4, step = 2, repeat = 2)
+        lrb0 = create_range(min_val = max(gra)+1, num = 8, step = 1, repeat = 1)
+        GRIncB = create_range(min_val = max(gra)+1, num = 9, step = 1, repeat = 1)
+
+        assert max(lrb0) < numMfma // 2, "lrb0 max {} numMfma/2 {}".format(max(lrb0), numMfma//2)
+
+        startGRB = max(lrb0) + 5
+
+        assert startGRB < numMfma // 2, "startGRB {} numMfma/2 {}".format(startGRB, numMfma//2)
+        grb = create_range(min_val = startGRB, num = 4, step = 2, repeat = 2)
+        startLRA3 = max(grb) + 3
+        grb += create_range(min_val = 55, num = 4, step = 2, repeat = 2)
+
+        lra1 = create_range(min_val = startLRA3, num = 8, step = 1, repeat = 1)
+        lrb1 = create_range(min_val = max(lra1)+1, num = 8, step = 1, repeat = 1)
+
+        syncTable = [
+            -1, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="wait for prior local read local write old=0, new=7 newLW=0 newLR=7 for iteration == 0"),
+            # -1, SBarrier(comment="TMP"),
+            waitLRA0,  SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA0"),
+            waitLRA0, SBarrier(comment=""),
+
+            # 15, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment=""),
+            startGRB-1, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="wait for prior local read local write old=0, new=0 newLW=0 newLR=0"),
+            startGRB-1, SBarrier(comment=""),
+            startLRA3-1, SWaitCnt(dscnt=-1, vlcnt=8, vscnt=-1, comment="wait for previous set of global reads"),
+            startLRA3-1, SBarrier(comment="")
+        ]
+
+        optSchedule = {
+            'GRA': [grb],
+            'GRB': [gra],
+            'GRIncA': [GRIncB],
+            'GRIncB': [*GRIncA],
+            'LCC': [[numMfma-1,numMfma-1]],
+            'LRA0': [*lra0],
+            'LRA1': [lra1],
+            'LRB0': [lrb0],
+            'LRB1': [lrb1],
+            'LRSA': [[startGRB-1]],
+            'LRSB': [[startGRB-1]],
+            'LWSA': [[numMfma-2]],
+            'LWSB': [[numMfma-2]],
+            'SYNC': [syncTable[::2]],
+        }
+
+
+        syncCode = syncTable[1::2]
+        nglshift = nllshift = 12 
+        opt1 = ScheduleInfo(2, numMfma, optSchedule, syncCode, nglshift, nllshift)
+        opt1.disableValidation()
         return True, opt1
    
     # No matching variant found
