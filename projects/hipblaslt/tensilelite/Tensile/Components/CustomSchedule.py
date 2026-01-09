@@ -111,6 +111,26 @@ def count_items(input_list: list[int], sv:int|None = None, ev:int|None = None):
             count += 1
     return count
 
+def create_range(min_val: int, num: int, max_val: int = -1, step: int = 1, repeat: int = 2) -> list[int]:
+    """
+    Generate a list where each value in range(min_val, min_val+num, step) is repeated 'repeat' times.
+    Value is clamped to max_val
+    
+    Args:
+        min_val: Starting value (inclusive)
+        num: Number of values
+        step: Step between values
+        max_val: Maximum value (clamp)
+        repeat: Number of times to repeat each value
+    
+    Example:
+        create_range(100, 5,200, 1, 2) => [100, 100, 101, 101, 102, 102, 103, 103, 104, 104]
+        create_range(0, 5, 10, 2, 3) => [0, 0, 0, 2, 2, 2, 4, 4, 4, 6, 6, 6, 8, 8, 8]
+        create_range(0, 5, 6, 2, 3) => [0, 0, 0, 2, 2, 2, 4, 4, 4, 6, 6, 6, 6, 6, 6]
+    """
+    if max_val == -1:
+        max_val = min_val + step*num
+    return [min(val, max_val) for val in range(min_val, min_val + step*num, step) for _ in range(repeat)]
 
 class ScheduleInfo:
     numCodePaths: int
@@ -2242,5 +2262,85 @@ def _get_schedule_128x128x64_16bit(kernel, useLDSTr, TLDS):
         nglshift = nllshift = 8  # 8 GRA + 8 GRB = 16 global reads
         opt1 = ScheduleInfo(2, numMfma, optSchedule, syncCode, nglshift, nllshift)
         return True, opt1
+    # No matching variant found
+    return False, None
+
+
+    
+@RegisterSchedule(
+    tile_config=TileConfig(128, 256, 64, 2, 1, True, 0, 0),
+    dtype_predicate=is16bit,
+    vector_widths=[8, 8, 8],
+    matrix_inst=[16, 16, 32, 1],
+    mfma_wave_group=[2, 2]
+)
+def _get_schedule_128x256x64_16bit(kernel, useLDSTr, TLDS):
+    kernel["MfmaInitCVgprs"] = True
+    
+    numMfma = 64
+    optSchedule = dict()
+    syncCode = []
+    nglshift = nllshift = 0
+    if isNN(kernel) and useLDSTr and TLDS == 1:
+        lra0 = [create_range(min_val = 1, num = 4, step = 2, repeat = 2),
+                create_range(min_val = 0, num = 4, step = 2, repeat = 2)]
+
+        GRIncA = [create_range(min_val = 0, num = 3, step = 2, repeat = 3),
+                  create_range(min_val = 1, num = 3, step = 2, repeat = 3)]
+
+        waitLRA0 = max(lra0[1])+5
+        gra = create_range(min_val = waitLRA0+1, num = 4, step = 2, repeat = 2)
+        lrb0 = create_range(min_val = max(gra)+1, num = 8, step = 1, repeat = 1)
+        GRIncB = create_range(min_val = max(gra)+1, num = 9, step = 1, repeat = 1)
+
+        assert max(lrb0) < numMfma // 2, "lrb0 max {} numMfma/2 {}".format(max(lrb0), numMfma//2)
+
+        startGRB = max(lrb0) + 5
+
+        assert startGRB < numMfma // 2, "startGRB {} numMfma/2 {}".format(startGRB, numMfma//2)
+        grb = create_range(min_val = startGRB, num = 4, step = 2, repeat = 2)
+        startLRA3 = max(grb) + 3
+        grb += create_range(min_val = 55, num = 4, step = 2, repeat = 2)
+
+        lra1 = create_range(min_val = startLRA3, num = 8, step = 1, repeat = 1)
+        lrb1 = create_range(min_val = max(lra1)+1, num = 8, step = 1, repeat = 1)
+
+        syncTable = [
+            -1, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="wait for prior local read local write old=0, new=7 newLW=0 newLR=7 for iteration == 0"),
+            # -1, SBarrier(comment="TMP"),
+            waitLRA0,  SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LRA0"),
+            waitLRA0, SBarrier(comment=""),
+
+            # 15, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment=""),
+            startGRB-1, SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="wait for prior local read local write old=0, new=0 newLW=0 newLR=0"),
+            startGRB-1, SBarrier(comment=""),
+            startLRA3-1, SWaitCnt(dscnt=-1, vlcnt=8, vscnt=-1, comment="wait for previous set of global reads"),
+            startLRA3-1, SBarrier(comment="")
+        ]
+
+        optSchedule = {
+            'GRA': [gra],
+            'GRB': [grb],
+            'GRIncA': [*GRIncA],
+            'GRIncB': [GRIncB],
+            'LCC': [[numMfma-1,numMfma-1]],
+            'LRA0': [*lra0],
+            'LRA1': [lra1],
+            'LRB0': [lrb0],
+            'LRB1': [lrb1],
+            'LRSA': [[startGRB-1]],
+            'LRSB': [[startGRB-1]],
+            'LWSA': [[numMfma-2]],
+            'LWSB': [[numMfma-2]],
+            'SYNC': [syncTable[::2]],
+        }
+
+
+        syncCode = syncTable[1::2]
+        nglshift = nllshift = 12 
+        opt1 = ScheduleInfo(2, numMfma, optSchedule, syncCode, nglshift, nllshift)
+        # opt1.disableValidation()
+        return True, opt1
+   
     # No matching variant found
     return False, None
