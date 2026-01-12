@@ -1,3 +1,13 @@
+// Custom kernel using LDS triple buffer
+// LDS A : 128*(128+4) = 16896 bytes
+// LDS B : 128*(128+4) = 16896 bytes
+// Total : 33792 bytes
+// Triple buffering : 33792*3=101376
+.set LDSSize, 101376
+.set LDSBufferSize, 33792 
+.set LDSBufferOffsetB, 16896
+.set TotalLDSBufferSize, 2*LDSBufferSize 
+
 
 /******************************************/
 /* Begin Kernel                           */
@@ -14,8 +24,8 @@
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
   .amdhsa_accum_offset 256 // accvgpr offset
   .amdhsa_next_free_vgpr 320 // vgprs
-  .amdhsa_next_free_sgpr 88 // sgprs
-  .amdhsa_group_segment_fixed_size 99328 // lds bytes
+  .amdhsa_next_free_sgpr 90 // sgprs
+  .amdhsa_group_segment_fixed_size LDSSize // lds bytes
   .amdhsa_private_segment_fixed_size 0
   .amdhsa_system_sgpr_workgroup_id_x 1
   .amdhsa_system_sgpr_workgroup_id_y 1
@@ -30,7 +40,7 @@
 .text
 /* Num VGPR   =256 */
 /* Num AccVGPR=64 */
-/* Num SGPR   =88 */
+/* Num SGPR   =90 */
 
 /******************************************/
 /* Optimizations and Config:              */
@@ -242,12 +252,12 @@ amdhsa.kernels:
         .offset:          168
         .value_kind:      by_value
         .value_type:      u32
-    .group_segment_fixed_size:   99328
+    .group_segment_fixed_size:   101376
     .kernarg_segment_align:      8
     .kernarg_segment_size:       176
     .max_flat_workgroup_size:    256
     .private_segment_fixed_size: 0
-    .sgpr_count:                 88
+    .sgpr_count:                 90
     .sgpr_spill_count:           0
     .vgpr_count:                 256
     .vgpr_spill_count:           0
@@ -288,7 +298,7 @@ label_ASM_Start:  /// Main body of the asm kernel
 .set vgprValuB_X1_I0, vgprValuB_X0_I0_BASE+16
 .set vgprValuA_X0_I0_D1, vgprValuA_X0_I0_D0_PACK+0
 .set vgprValuA_X1_I0_D1, vgprValuA_X0_I0_D0_PACK+16
-
+.set vgprTmp0, 100 // CHECK
 /******************************************/
 /* SGPR Assignments                       */
 /******************************************/
@@ -334,6 +344,8 @@ label_ASM_Start:  /// Main body of the asm kernel
 .set sgprStreamKLocalStart, 58
 .set sgprStreamKLocalEnd, 59
 .set sgprSrdWS, 60
+.set sgprTmp0, 88
+.set sgprTmp1, 89
 
 /* StreamK Parallel Reduction Assignments */
 .set sgprSkSplit, sgprskTiles+0
@@ -519,7 +531,7 @@ s_mov_b32 s[sgprWorkGroup0+2], s15                 // restore workgroup id
 s_and_b32 s[sgprStaggerU], s18, 0xffff0000         // Restore StaggerU related vars
 s_lshr_b32 s[sgprStaggerU], s[sgprStaggerU], 0x10
 s_mov_b32 s[sgprArgType], s17
-s_mov_b32 m0, 0x18400                              // LDS clamp at 99328 bytes
+s_mov_b32 m0, LDSSize                              // LDS clamp at 99328 bytes
 v_mov_b32 v[vgprSerial], v0                        // thread serial id
 
 /* remap workgroup to XCCs */
@@ -1714,10 +1726,20 @@ s_barrier                                          // For stream-k / persistent 
 /* local write b */
 
 /* local write swap a */
-s_xor_b32 s[sgprLocalWriteAddrA], 0x10000, s[sgprLocalWriteAddrA] // swap Red Blk SGPR
-
 /* local write swap b */
-s_xor_b32 s[sgprLocalWriteAddrB], 0x10000, s[sgprLocalWriteAddrB] // swap Red Blk SGPR
+//SVI
+s_add_u32 s[sgprLocalWriteAddrA], s[sgprLocalWriteAddrA], LDSBufferSize
+s_add_u32 s[sgprLocalWriteAddrB], s[sgprLocalWriteAddrB], LDSBufferSize
+s_sub_u32 s[sgprTmp0], s[sgprLocalWriteAddrA], TotalLDSBufferSize
+s_sub_u32 s[sgprTmp1], s[sgprLocalWriteAddrB], TotalLDSBufferSize
+s_cmp_ge_u32 s[sgprLocalWriteAddrA], TotalLDSBufferSize
+s_cselect_b32 s[sgprLocalWriteAddrA], s[sgprTmp0], s[sgprLocalWriteAddrA]
+s_cselect_b32 s[sgprLocalWriteAddrB], s[sgprTmp1], s[sgprLocalWriteAddrB]
+
+//s_xor_b32 s[sgprLocalWriteAddrA], 0x10000, s[sgprLocalWriteAddrA] // swap Red Blk SGPR
+//s_xor_b32 s[sgprLocalWriteAddrB], 0x10000, s[sgprLocalWriteAddrB] // swap Red Blk SGPR
+
+
 s_cmp_eq_u32 s[sgprLoopCounterL], 0x1              // PGR=2 but only 1 loop
 s_cbranch_scc1 label_skipPGR2                      // PGR=2 but only 1 loop
 s_mov_b32 m0, s[sgprLocalWriteAddrA]               // m0 <- LDS write address
@@ -1744,10 +1766,19 @@ s_add_u32 m0, m0, 4224                             // Move LDS write address to 
 buffer_load_dwordx4 v[vgprGlobalReadOffsetB+3], s[sgprSrdB:sgprSrdB+3], 0 offen offset:0 lds // G -> Reg 0_0_3_0
 
 /* local write swap a */
-s_xor_b32 s[sgprLocalWriteAddrA], 0x10000, s[sgprLocalWriteAddrA] // swap Red Blk SGPR
-
 /* local write swap b */
-s_xor_b32 s[sgprLocalWriteAddrB], 0x10000, s[sgprLocalWriteAddrB] // swap Red Blk SGPR
+//SVI
+//s_xor_b32 s[sgprLocalWriteAddrA], 0x10000, s[sgprLocalWriteAddrA] // swap Red Blk SGPR
+//s_xor_b32 s[sgprLocalWriteAddrB], 0x10000, s[sgprLocalWriteAddrB] // swap Red Blk SGPR
+
+s_add_u32 s[sgprLocalWriteAddrA], s[sgprLocalWriteAddrA], LDSBufferSize
+s_add_u32 s[sgprLocalWriteAddrB], s[sgprLocalWriteAddrB], LDSBufferSize
+s_sub_u32 s[sgprTmp0], s[sgprLocalWriteAddrA], TotalLDSBufferSize
+s_sub_u32 s[sgprTmp1], s[sgprLocalWriteAddrB], TotalLDSBufferSize
+s_cmp_ge_u32 s[sgprLocalWriteAddrA], TotalLDSBufferSize
+s_cselect_b32 s[sgprLocalWriteAddrA], s[sgprTmp0], s[sgprLocalWriteAddrA]
+s_cselect_b32 s[sgprLocalWriteAddrB], s[sgprTmp1], s[sgprLocalWriteAddrB]
+
 label_skipPGR2:
 // Skip force waitcnt0
 s_barrier
@@ -1850,9 +1881,22 @@ v_mfma_f32_16x16x32_bf16 acc[52:55], v[vgprValuB_X0_I0+12+0+0:vgprValuB_X0_I0+12
 v_mfma_f32_16x16x32_bf16 acc[56:59], v[vgprValuB_X0_I0+12+0+0:vgprValuB_X0_I0+12+0+0+3], v[vgprValuA_X0_I0+8+0+0:vgprValuA_X0_I0+8+0+0+3], acc[56:59] // left value = acc[56+0:59+0]
 v_mfma_f32_16x16x32_bf16 acc[60:63], v[vgprValuB_X0_I0+12+0+0:vgprValuB_X0_I0+12+0+0+3], v[vgprValuA_X0_I0+12+0+0:vgprValuA_X0_I0+12+0+0+3], acc[60:63] // left value = acc[60+0:63+0]
 
-// SWAP LDS offset
-v_xor_b32 v[vgprLocalReadAddrA], 0x10000, v[vgprLocalReadAddrA] // swap Red Blk
-v_xor_b32 v[vgprLocalReadAddrB], 0x10000, v[vgprLocalReadAddrB] // swap Red Blk
+// SVI - SWAP LDS offset
+// v_xor_b32 v[vgprLocalReadAddrA], 0x10000, v[vgprLocalReadAddrA] // swap Red Blk
+// v_xor_b32 v[vgprLocalReadAddrB], 0x10000, v[vgprLocalReadAddrB] // swap Red Blk
+
+v_add_u32 v[vgprLocalReadAddrA], LDSBufferSize, v[vgprLocalReadAddrA]
+v_subrev_u32 v[vgprTmp0], TotalLDSBufferSize, v[vgprLocalReadAddrA]
+v_cmp_le_u32_e32 vcc, TotalLDSBufferSize, v[vgprLocalReadAddrA]
+s_nop 1
+v_cndmask_b32_e32 v[vgprLocalReadAddrA], v[vgprLocalReadAddrA], v[vgprTmp0], vcc
+
+v_add_u32 v[vgprLocalReadAddrB], LDSBufferSize, v[vgprLocalReadAddrB]
+v_subrev_u32 v[vgprTmp0], TotalLDSBufferSize, v[vgprLocalReadAddrB]
+v_cmp_le_u32_e32 vcc, TotalLDSBufferSize, v[vgprLocalReadAddrB]
+s_nop 1
+v_cndmask_b32_e32 v[vgprLocalReadAddrB], v[vgprLocalReadAddrB], v[vgprTmp0], vcc
+
 
 // Wait LRA0 & LRB0
 s_waitcnt lgkmcnt(0)
@@ -1879,8 +1923,17 @@ buffer_load_dwordx4 v[vgprGlobalReadOffsetB+3], s[sgprSrdB:sgprSrdB+3], 0 offen 
 
 
 // SWAP GR offset
-s_xor_b32 s[sgprLocalWriteAddrA], 0x10000, s[sgprLocalWriteAddrA] // swap Red Blk SGPR
-s_xor_b32 s[sgprLocalWriteAddrB], 0x10000, s[sgprLocalWriteAddrB] // swap Red Blk SGPR
+//s_xor_b32 s[sgprLocalWriteAddrA], 0x10000, s[sgprLocalWriteAddrA] // swap Red Blk SGPR
+//s_xor_b32 s[sgprLocalWriteAddrB], 0x10000, s[sgprLocalWriteAddrB] // swap Red Blk SGPR
+
+s_add_u32 s[sgprLocalWriteAddrA], s[sgprLocalWriteAddrA], LDSBufferSize
+s_add_u32 s[sgprLocalWriteAddrB], s[sgprLocalWriteAddrB], LDSBufferSize
+s_sub_u32 s[sgprTmp0], s[sgprLocalWriteAddrA], TotalLDSBufferSize
+s_sub_u32 s[sgprTmp1], s[sgprLocalWriteAddrB], TotalLDSBufferSize
+s_cmp_ge_u32 s[sgprLocalWriteAddrA], TotalLDSBufferSize
+s_cselect_b32 s[sgprLocalWriteAddrA], s[sgprTmp0], s[sgprLocalWriteAddrA]
+s_cselect_b32 s[sgprLocalWriteAddrB], s[sgprTmp1], s[sgprLocalWriteAddrB]
+
 
 s_waitcnt vmcnt(8)                                 // wait for previous set of global reads
 // Skip force waitcnt0
@@ -1939,7 +1992,7 @@ label_LoopEndL:
 /*  grEndMfmaIndex:6, lwStartMfmaIndex:14, lwEndMfmaIndex:19  */
 /*  numMfmaForLR:10, syncPlrMfmaIndex:21  */
 /*  mfmaIndex:0  */
-s_waitcnt lgkmcnt(3)                               // wait for prior local read local write old=0, new=3 newLW=0 newLR=3 for iteration == 0
+s_waitcnt lgkmcnt(0)                               // wait for prior local read local write old=0, new=3 newLW=0 newLR=3 for iteration == 0
 v_mfma_f32_16x16x32_bf16 acc[0:3], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+0+0+0:vgprValuA_X0_I0+0+0+0+3], acc[0:3] // left value = acc[0+0:3+0]
 /*  mfmaIndex:1  */
 ds_read_b64_tr_b16 v[vgprValuA_X1_I0+0+0:vgprValuA_X1_I0+0+0+1], v[vgprLocalReadAddrA+0] offset:8448 // LDS Transpose
@@ -2015,10 +2068,22 @@ v_mfma_f32_16x16x32_bf16 acc[56:59], v[vgprValuB_X0_I0+12+0+0:vgprValuB_X0_I0+12
 /* localReadsVacancy: latencyLeft 5 */
 
 /* local read swap offsets a */
-v_xor_b32 v[vgprLocalReadAddrA], 0x10000, v[vgprLocalReadAddrA] // swap Red Blk
+// SVI
+//v_xor_b32 v[vgprLocalReadAddrA], 0x10000, v[vgprLocalReadAddrA] // swap Red Blk
+//v_xor_b32 v[vgprLocalReadAddrB], 0x10000, v[vgprLocalReadAddrB] // swap Red Blk
 
-/* local read swap offsets b */
-v_xor_b32 v[vgprLocalReadAddrB], 0x10000, v[vgprLocalReadAddrB] // swap Red Blk
+v_add_u32 v[vgprLocalReadAddrA], LDSBufferSize, v[vgprLocalReadAddrA]
+v_subrev_u32 v[vgprTmp0], TotalLDSBufferSize, v[vgprLocalReadAddrA]
+v_cmp_le_u32_e32 vcc, TotalLDSBufferSize, v[vgprLocalReadAddrA]
+s_nop 1
+v_cndmask_b32_e32 v[vgprLocalReadAddrA], v[vgprLocalReadAddrA], v[vgprTmp0], vcc
+
+v_add_u32 v[vgprLocalReadAddrB], LDSBufferSize, v[vgprLocalReadAddrB]
+v_subrev_u32 v[vgprTmp0], TotalLDSBufferSize, v[vgprLocalReadAddrB]
+v_cmp_le_u32_e32 vcc, TotalLDSBufferSize, v[vgprLocalReadAddrB]
+s_nop 1
+v_cndmask_b32_e32 v[vgprLocalReadAddrB], v[vgprLocalReadAddrB], v[vgprTmp0], vcc
+
 
 /* local read init pointers a */
 
@@ -2045,10 +2110,18 @@ v_mfma_f32_16x16x32_bf16 acc[8:11], v[vgprValuB_X1_I0+0+0+0:vgprValuB_X1_I0+0+0+
 /*  mfmaIndex:19  */
 
 /* local write swap offsets a */
-s_xor_b32 s[sgprLocalWriteAddrA], 0x10000, s[sgprLocalWriteAddrA] // swap Red Blk SGPR
+// SVI
+s_add_u32 s[sgprLocalWriteAddrA], s[sgprLocalWriteAddrA], LDSBufferSize
+s_add_u32 s[sgprLocalWriteAddrB], s[sgprLocalWriteAddrB], LDSBufferSize
+s_sub_u32 s[sgprTmp0], s[sgprLocalWriteAddrA], TotalLDSBufferSize
+s_sub_u32 s[sgprTmp1], s[sgprLocalWriteAddrB], TotalLDSBufferSize
+s_cmp_ge_u32 s[sgprLocalWriteAddrA], TotalLDSBufferSize
+s_cselect_b32 s[sgprLocalWriteAddrA], s[sgprTmp0], s[sgprLocalWriteAddrA]
+s_cselect_b32 s[sgprLocalWriteAddrB], s[sgprTmp1], s[sgprLocalWriteAddrB]
 
-/* local write swap offsets b */
-s_xor_b32 s[sgprLocalWriteAddrB], 0x10000, s[sgprLocalWriteAddrB] // swap Red Blk SGPR
+//s_xor_b32 s[sgprLocalWriteAddrA], 0x10000, s[sgprLocalWriteAddrA] // swap Red Blk SGPR
+//s_xor_b32 s[sgprLocalWriteAddrB], 0x10000, s[sgprLocalWriteAddrB] // swap Red Blk SGPR
+
 v_mfma_f32_16x16x32_bf16 acc[12:15], v[vgprValuB_X1_I0+0+0+0:vgprValuB_X1_I0+0+0+0+3], v[vgprValuA_X1_I0+12+0+0:vgprValuA_X1_I0+12+0+0+3], acc[12:15] // left value = acc[12+0:15+0]
 /*  mfmaIndex:20  */
 v_mfma_f32_16x16x32_bf16 acc[16:19], v[vgprValuB_X1_I0+4+0+0:vgprValuB_X1_I0+4+0+0+3], v[vgprValuA_X1_I0+0+0+0:vgprValuA_X1_I0+0+0+0+3], acc[16:19] // left value = acc[16+0:19+0]
@@ -2102,7 +2175,7 @@ label_toPGR1:
 /*  grEndMfmaIndex:0, lwStartMfmaIndex:15, lwEndMfmaIndex:15  */
 /*  numMfmaForLR:10, syncPlrMfmaIndex:21  */
 /*  mfmaIndex:0  */
-s_waitcnt lgkmcnt(3)                               // wait for prior local read local write old=0, new=3 newLW=0 newLR=3 for iteration == 0
+s_waitcnt lgkmcnt(0)                               // wait for prior local read local write old=0, new=3 newLW=0 newLR=3 for iteration == 0
 v_mfma_f32_16x16x32_bf16 acc[0:3], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+0+0+0:vgprValuA_X0_I0+0+0+0+3], acc[0:3] // left value = acc[0+0:3+0]
 /*  mfmaIndex:1  */
 ds_read_b64_tr_b16 v[vgprValuA_X1_I0+0+0:vgprValuA_X1_I0+0+0+1], v[vgprLocalReadAddrA+0] offset:8448 // LDS Transpose
