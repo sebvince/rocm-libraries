@@ -1936,8 +1936,15 @@ v_mfma_f32_16x16x32_bf16 acc[0:3], v[vgprValuB_X1_I0+0+0+0:vgprValuB_X1_I0+0+0+0
     s_mov_b32 m0, s[sgprLocalWriteAddrB]               // m0 <- LDS write address
     buffer_load_dwordx4 v[vgprGlobalReadOffsetB+0], s[sgprSrdB:sgprSrdB+3], 0 offen offset:0 lds // G -> Reg 0_0_0_0
 v_mfma_f32_16x16x32_bf16 acc[4:7], v[vgprValuB_X1_I0+0+0+0:vgprValuB_X1_I0+0+0+0+3], v[vgprValuA_X1_I0+4+0+0:vgprValuA_X1_I0+4+0+0+3], acc[4:7] // left value = acc[4+0:7+0]
+    s_add_u32 s[sgprLocalWriteAddrA], s[sgprLocalWriteAddrA], LDSBufferSize
+    s_add_u32 s[sgprLocalWriteAddrB], s[sgprLocalWriteAddrB], LDSBufferSize
+    s_sub_u32 s[sgprTmp0], s[sgprLocalWriteAddrA], TotalLDSBufferSize
 v_mfma_f32_16x16x32_bf16 acc[8:11], v[vgprValuB_X1_I0+0+0+0:vgprValuB_X1_I0+0+0+0+3], v[vgprValuA_X1_I0+8+0+0:vgprValuA_X1_I0+8+0+0+3], acc[8:11] // left value = acc[8+0:11+0]
+    s_sub_u32 s[sgprTmp1], s[sgprLocalWriteAddrB], TotalLDSBufferSize
+    s_cmp_ge_u32 s[sgprLocalWriteAddrA], TotalLDSBufferSize
+    s_cselect_b32 s[sgprLocalWriteAddrA], s[sgprTmp0], s[sgprLocalWriteAddrA]
 v_mfma_f32_16x16x32_bf16 acc[12:15], v[vgprValuB_X1_I0+0+0+0:vgprValuB_X1_I0+0+0+0+3], v[vgprValuA_X1_I0+12+0+0:vgprValuA_X1_I0+12+0+0+3], acc[12:15] // left value = acc[12+0:15+0]
+    s_cselect_b32 s[sgprLocalWriteAddrB], s[sgprTmp1], s[sgprLocalWriteAddrB]
     s_waitcnt lgkmcnt(0)
     ds_read_b64_tr_b16 v[vgprValuA_X0_I0+0+0:vgprValuA_X0_I0+0+0+1], v[vgprLocalReadAddrA+0] offset:0 // LDS Transpose
 v_mfma_f32_16x16x32_bf16 acc[16:19], v[vgprValuB_X1_I0+4+0+0:vgprValuB_X1_I0+4+0+0+3], v[vgprValuA_X1_I0+0+0+0:vgprValuA_X1_I0+0+0+0+3], acc[16:19] // left value = acc[16+0:19+0]
@@ -1957,32 +1964,27 @@ v_mfma_f32_16x16x32_bf16 acc[28:31], v[vgprValuB_X1_I0+4+0+0:vgprValuB_X1_I0+4+0
 v_mfma_f32_16x16x32_bf16 acc[32:35], v[vgprValuB_X1_I0+8+0+0:vgprValuB_X1_I0+8+0+0+3], v[vgprValuA_X1_I0+0+0+0:vgprValuA_X1_I0+0+0+0+3], acc[32:35] // left value = acc[32+0:35+0]
     ds_read_b64_tr_b16 v[vgprValuA_X0_I0+8+2:vgprValuA_X0_I0+8+2+1], v[vgprLocalReadAddrA+0] offset:384 // LDS Transpose
     // SWAP GR addresses
-    s_add_u32 s[sgprLocalWriteAddrA], s[sgprLocalWriteAddrA], LDSBufferSize
     s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
     buffer_load_dwordx4 v[vgprGlobalReadOffsetB+2], s[sgprSrdB:sgprSrdB+3], 0 offen offset:0 lds // G -> Reg 0_0_2_0
 
 v_mfma_f32_16x16x32_bf16 acc[36:39], v[vgprValuB_X1_I0+8+0+0:vgprValuB_X1_I0+8+0+0+3], v[vgprValuA_X1_I0+4+0+0:vgprValuA_X1_I0+4+0+0+3], acc[36:39] // left value = acc[36+0:39+0]
     ds_read_b64_tr_b16 v[vgprValuA_X0_I0+12+0:vgprValuA_X0_I0+12+0+1], v[vgprLocalReadAddrA+0] offset:192 // LDS Transpose
-    s_add_u32 s[sgprLocalWriteAddrB], s[sgprLocalWriteAddrB], LDSBufferSize
 v_mfma_f32_16x16x32_bf16 acc[40:43], v[vgprValuB_X1_I0+8+0+0:vgprValuB_X1_I0+8+0+0+3], v[vgprValuA_X1_I0+8+0+0:vgprValuA_X1_I0+8+0+0+3], acc[40:43] // left value = acc[40+0:43+0]
     ds_read_b64_tr_b16 v[vgprValuA_X0_I0+12+2:vgprValuA_X0_I0+12+2+1], v[vgprLocalReadAddrA+0] offset:448 // LDS Transpose
-    s_sub_u32 s[sgprTmp0], s[sgprLocalWriteAddrA], TotalLDSBufferSize
+    
 v_mfma_f32_16x16x32_bf16 acc[44:47], v[vgprValuB_X1_I0+8+0+0:vgprValuB_X1_I0+8+0+0+3], v[vgprValuA_X1_I0+12+0+0:vgprValuA_X1_I0+12+0+0+3], acc[44:47] // left value = acc[44+0:47+0]
     ds_read_b128 v[vgprValuB_X0_I0+0:vgprValuB_X0_I0+0+3], v[vgprLocalReadAddrB] offset:0 // L -> Reg lro=0 swapByteOffset=0 ti=128 vIdx=0 eIdx=0 rIdx=0 oIdx=0 buffer=0 iui=0
-    s_sub_u32 s[sgprTmp1], s[sgprLocalWriteAddrB], TotalLDSBufferSize
 
 v_mfma_f32_16x16x32_bf16 acc[48:51], v[vgprValuB_X1_I0+12+0+0:vgprValuB_X1_I0+12+0+0+3], v[vgprValuA_X1_I0+0+0+0:vgprValuA_X1_I0+0+0+0+3], acc[48:51] // left value = acc[48+0:51+0]
     ds_read_b128 v[vgprValuB_X0_I0+4:vgprValuB_X0_I0+4+3], v[vgprLocalReadAddrB] offset:128 // L -> Reg lro=0 swapByteOffset=0 ti=128 vIdx=0 eIdx=1 rIdx=0 oIdx=0 buffer=0 iui=0
-    s_cmp_ge_u32 s[sgprLocalWriteAddrA], TotalLDSBufferSize
+    
     s_add_u32 m0, m0, 4224                             // Move LDS write address to next line
     buffer_load_dwordx4 v[vgprGlobalReadOffsetB+3], s[sgprSrdB:sgprSrdB+3], 0 offen offset:0 lds // G -> Reg 0_0_3_0
 
 v_mfma_f32_16x16x32_bf16 acc[52:55], v[vgprValuB_X1_I0+12+0+0:vgprValuB_X1_I0+12+0+0+3], v[vgprValuA_X1_I0+4+0+0:vgprValuA_X1_I0+4+0+0+3], acc[52:55] // left value = acc[52+0:55+0]
     ds_read_b128 v[vgprValuB_X0_I0+8:vgprValuB_X0_I0+8+3], v[vgprLocalReadAddrB] offset:256 // L -> Reg lro=0 swapByteOffset=0 ti=128 vIdx=0 eIdx=2 rIdx=0 oIdx=0 buffer=0 iui=0
-    s_cselect_b32 s[sgprLocalWriteAddrA], s[sgprTmp0], s[sgprLocalWriteAddrA]
 v_mfma_f32_16x16x32_bf16 acc[56:59], v[vgprValuB_X1_I0+12+0+0:vgprValuB_X1_I0+12+0+0+3], v[vgprValuA_X1_I0+8+0+0:vgprValuA_X1_I0+8+0+0+3], acc[56:59] // left value = acc[56+0:59+0]
     ds_read_b128 v[vgprValuB_X0_I0+12:vgprValuB_X0_I0+12+3], v[vgprLocalReadAddrB] offset:384 // L -> Reg lro=0 swapByteOffset=0 ti=128 vIdx=0 eIdx=3 rIdx=0 oIdx=0 buffer=0 iui=0
-    s_cselect_b32 s[sgprLocalWriteAddrB], s[sgprTmp1], s[sgprLocalWriteAddrB]
 v_mfma_f32_16x16x32_bf16 acc[60:63], v[vgprValuB_X1_I0+12+0+0:vgprValuB_X1_I0+12+0+0+3], v[vgprValuA_X1_I0+12+0+0:vgprValuA_X1_I0+12+0+0+3], acc[60:63] // left value = acc[60+0:63+0]
 
 
