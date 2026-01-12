@@ -6,7 +6,7 @@
 .set LDSSize, 101376
 .set LDSBufferSize, 33792 
 .set LDSBufferOffsetB, 16896
-.set TotalLDSBufferSize, 2*LDSBufferSize 
+.set TotalLDSBufferSize, 3*LDSBufferSize 
 
 
 /******************************************/
@@ -24,7 +24,7 @@
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
   .amdhsa_accum_offset 256 // accvgpr offset
   .amdhsa_next_free_vgpr 320 // vgprs
-  .amdhsa_next_free_sgpr 90 // sgprs
+  .amdhsa_next_free_sgpr 92 // sgprs
   .amdhsa_group_segment_fixed_size LDSSize // lds bytes
   .amdhsa_private_segment_fixed_size 0
   .amdhsa_system_sgpr_workgroup_id_x 1
@@ -40,7 +40,7 @@
 .text
 /* Num VGPR   =256 */
 /* Num AccVGPR=64 */
-/* Num SGPR   =90 */
+/* Num SGPR   =92 */
 
 /******************************************/
 /* Optimizations and Config:              */
@@ -257,7 +257,7 @@ amdhsa.kernels:
     .kernarg_segment_size:       176
     .max_flat_workgroup_size:    256
     .private_segment_fixed_size: 0
-    .sgpr_count:                 90
+    .sgpr_count:                 92
     .sgpr_spill_count:           0
     .vgpr_count:                 256
     .vgpr_spill_count:           0
@@ -299,6 +299,8 @@ label_ASM_Start:  /// Main body of the asm kernel
 .set vgprValuA_X0_I0_D1, vgprValuA_X0_I0_D0_PACK+0
 .set vgprValuA_X1_I0_D1, vgprValuA_X0_I0_D0_PACK+16
 .set vgprTmp0, 100 // CHECK
+.set vgprTmp1, 101 // CHECK
+.set vgprTmp2, 102 // CHECK
 /******************************************/
 /* SGPR Assignments                       */
 /******************************************/
@@ -346,6 +348,8 @@ label_ASM_Start:  /// Main body of the asm kernel
 .set sgprSrdWS, 60
 .set sgprTmp0, 88
 .set sgprTmp1, 89
+.set sgprTmpAddrA, 90
+.set sgprTmpAddrB, 91
 
 /* StreamK Parallel Reduction Assignments */
 .set sgprSkSplit, sgprskTiles+0
@@ -1153,6 +1157,11 @@ v_lshl_add_u32 v[vgprLocalReadAddrB], v12, 5, v[vgprLocalReadAddrB] // Final Off
 /* local read addresses: declare addresses b */
 v_add_co_u32 v[vgprLocalReadAddrB+0], vcc, 0x4200, v[vgprLocalReadAddrB+0] //  += LdsOffsetB (lower)
 
+// Save LDS local address
+v_mov_b32 v[vgprTmp1], v[vgprLocalReadAddrA]        
+v_mov_b32 v[vgprTmp2], v[vgprLocalReadAddrB]        
+
+
 /******************************************/
 /* Local Write Addresses                  */
 /******************************************/
@@ -1194,6 +1203,10 @@ s_nop 0                                            // 1 wait states required bef
 v_readfirstlane_b32 s[sgprLocalWriteAddrB], v17    // Copy lds write address VGPR to SGPR
 s_mul_i32 s[sgprLocalWriteAddrB], s[sgprLocalWriteAddrB], 1056
 s_add_u32 s[sgprLocalWriteAddrB], s[sgprLocalWriteAddrB], 16896
+
+// Save base LDS addresses
+s_mov_b32 s[sgprTmpAddrA], s[sgprLocalWriteAddrA]
+s_mov_b32 s[sgprTmpAddrB], s[sgprLocalWriteAddrB]
 
 /* global read addresses: tile offset assignment a */
 /* graTileAssignmentA = v10 */
@@ -2299,6 +2312,9 @@ label_PrefetchGlobalLastIterEnd:
 
 
 ;s_trap 1
+s_mov_b32 s[sgprLocalWriteAddrA], s[sgprTmpAddrA]
+s_mov_b32 s[sgprLocalWriteAddrB], s[sgprTmpAddrB]
+
 s_sub_u32 s[sgprTmp0], s[sgprLocalWriteAddrA], LDSBufferSize
 s_cmp_ge_u32 s[sgprLocalWriteAddrA], LDSBufferSize
 s_cselect_b32 s[sgprLocalWriteAddrA], s[sgprTmp0], s[sgprLocalWriteAddrA]
@@ -2614,14 +2630,16 @@ s_barrier
 ;s_nop 1
 ;v_cndmask_b32_e32 v[vgprLocalReadAddrB], v[vgprLocalReadAddrB], v[vgprTmp0], vcc
 
-v_subrev_u32 v[vgprTmp0], LDSBufferSize, v[vgprLocalReadAddrA]
-v_cmp_le_u32_e32 vcc, LDSBufferSize, v[vgprLocalReadAddrA]
-v_cndmask_b32_e32 v[vgprLocalReadAddrA], v[vgprLocalReadAddrA], v[vgprTmp0], vcc
 
-v_subrev_u32 v[vgprTmp0], LDSBufferSize, v[vgprLocalReadAddrB]
-v_cmp_le_u32_e32 vcc, LDSBufferSize, v[vgprLocalReadAddrB],
-v_cndmask_b32_e32 v[vgprLocalReadAddrB], v[vgprLocalReadAddrB], v[vgprTmp0], vcc
-
+;v_subrev_u32 v[vgprTmp0], LDSBufferSize, v[vgprLocalReadAddrA]
+;v_cmp_le_u32_e32 vcc, LDSBufferSize, v[vgprLocalReadAddrA]
+;v_cndmask_b32_e32 v[vgprLocalReadAddrA], v[vgprLocalReadAddrA], v[vgprTmp0], vcc
+;s_trap 1
+;v_subrev_u32 v[vgprTmp0], LDSBufferSize, v[vgprLocalReadAddrB]
+;v_cmp_le_u32_e32 vcc, LDSBufferSize, v[vgprLocalReadAddrB],
+;v_cndmask_b32_e32 v[vgprLocalReadAddrB], v[vgprLocalReadAddrB], v[vgprTmp0], vcc
+v_mov_b32 v[vgprLocalReadAddrA], v[vgprTmp1]
+v_mov_b32 v[vgprLocalReadAddrB], v[vgprTmp2]
 
 /* Tail: local read init pointers a */
 
