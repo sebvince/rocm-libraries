@@ -1865,10 +1865,10 @@ v_mfma_f32_16x16x32_bf16 acc[8:11], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+
     s_cmp_eq_u32 s[sgprShadowLimitA+1], 0              // are we within 2^32?
     s_cselect_b32 s[sgprSrdA+2], s[sgprShadowLimitA+0], BufferLimit // Move shadow to real if we are within 2^32
 v_mfma_f32_16x16x32_bf16 acc[12:15], v[vgprValuB_X0_I0+0+0+0:vgprValuB_X0_I0+0+0+0+3], v[vgprValuA_X0_I0+12+0+0:vgprValuA_X0_I0+12+0+0+3], acc[12:15] // left value = acc[12+0:15+0]
-    s_waitcnt lgkmcnt(0)
     // GRA
     s_mov_b32 m0, s[sgprLocalWriteAddrA]               // m0 <- LDS write address
     buffer_load_dwordx4 v[vgprGlobalReadOffsetA+0], s[sgprSrdA:sgprSrdA+3], 0 offen offset:0 lds // G -> Reg 0_0_0_0
+    s_waitcnt lgkmcnt(0)
 v_mfma_f32_16x16x32_bf16 acc[16:19], v[vgprValuB_X0_I0+4+0+0:vgprValuB_X0_I0+4+0+0+3], v[vgprValuA_X0_I0+0+0+0:vgprValuA_X0_I0+0+0+0+3], acc[16:19] // left value = acc[16+0:19+0]
     ds_read_b64_tr_b16 v[vgprValuA_X1_I0+0+0:vgprValuA_X1_I0+0+0+1], v[vgprLocalReadAddrA+0] offset:8448 // LDS Transpose
     ds_read_b64_tr_b16 v[vgprValuA_X1_I0+0+2:vgprValuA_X1_I0+0+2+1], v[vgprLocalReadAddrA+0] offset:8704 // LDS Transpose
