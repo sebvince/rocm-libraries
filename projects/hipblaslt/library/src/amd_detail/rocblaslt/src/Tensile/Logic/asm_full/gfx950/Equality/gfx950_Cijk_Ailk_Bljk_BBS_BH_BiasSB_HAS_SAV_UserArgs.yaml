@@ -132033,7 +132033,7 @@
     ClusterLocalRead: 0
     CodeObjectVersion: '4'
     ConvertAfterDS: false
-    CustomKernelName: ''
+    CustomKernelName: 'Custom_Cijk_Ailk_Bljk_BBS_BH_Bias_SAV_UserArgs_MT128x128x64_MI16x16x1_UserArgs_shortname1_gfx950'
     DebugStreamK: 0
     DepthU: 64
     DirectToLds: true
@@ -133381,7 +133381,7 @@
   - - [2048, 3584, 1, 8192]
     - [556, 0.0]
   - - [1024, 1024, 1, 8192, 1024, 1024, 1024, 8192]
-    - [557, 272.21]
+    - [557, 0.0]
   - - [2048, 2048, 1, 8192]
     - [558, 0]
 - null
