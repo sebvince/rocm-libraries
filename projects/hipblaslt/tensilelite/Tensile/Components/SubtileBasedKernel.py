@@ -406,6 +406,15 @@ def lraTileAssignment(writer, kernel):
   for i in range(8):
     module.addComment("")
 
+  tileInfoA = writer.states.a.tileInfo
+  tileInfoB = writer.states.b.tileInfo
+
+  module.add(VAndB32(dst=vgpr(tileInfoA.sharedVgprLROffset[0]), src0=vgpr("Serial"), src1=64-1, comment="laneId"))
+  module.add(VAndB32(dst=vgpr(tileInfoA.sharedVgprLROffset[1]), src0=vgpr("Serial"), src1=64-1, comment="laneId"))
+  module.add(VAndB32(dst=vgpr(tileInfoB.sharedVgprLROffset[0]), src0=vgpr("Serial"), src1=64-1, comment="laneId"))
+  module.add(VAndB32(dst=vgpr(tileInfoB.sharedVgprLROffset[1]), src0=vgpr("Serial"), src1=64-1, comment="laneId"))
+  # module.add(VMulLOU32(dst=vgpr(tmpVgpr), src0=sgpr(strideRef), src1=vgpr(row_id), comment="%s: row_id * stride"%tc))
+
   return module
 
 
