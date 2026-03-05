@@ -406,15 +406,44 @@ def lraTileAssignment(writer, kernel):
   for i in range(8):
     module.addComment("")
 
+  mi_m = 16 #TODO . MFMA M/N
+  loadWidth = 16 # TODO. Factorize
+
+  # Input Parameters.
+  depthU = kernel["DepthU"]
+  bpeA = kernel["ProblemType"]["DataTypeA"].numBytes()
+  bpeB = kernel["ProblemType"]["DataTypeB"].numBytes()
+  depthUBytes = depthU * bpeA
+  wavesize = kernel["WavefrontSize"]
+  
+  block_size = depthUBytes // loadWidth
+
   tileInfoA = writer.states.a.tileInfo
   tileInfoB = writer.states.b.tileInfo
 
-  module.add(VAndB32(dst=vgpr(tileInfoA.sharedVgprLROffset[0]), src0=vgpr("Serial"), src1=64-1, comment="laneId"))
+  tmpVgpr = writer.vgprPool.checkOut(3)                                                                                                                                                                                                                                           
+  lane16, lane16Group, splitOffset = range(tmpVgpr, tmpVgpr + 3)
+
+  # Calculate lane16 and lane16Group for current wave
+  module.add(VAndB32(dst=vgpr(lane16Group), src0=vgpr("Serial"), src1=wavesize-1, comment="laneId"))
+  module.add(VLShiftRightB32(dst=vgpr(lane16Group), shiftHex=hex(mi_m.bit_length()-1), src=vgpr(lane16Group), comment="lane16Group"))
+  module.add(VAndB32(dst=vgpr(lane16), src0=vgpr("Serial"), src1=mi_m-1, comment="laneId % 16"))
+
+  bytes_loaded = wavesize * loadWidth
+  numRowsPerWave = wavesize // block_size
+  # Compute needed offset to apply to LDS address because chunk of waves are interleaved (split wave load)
+  # lane16 is MFMA row id.
+  module.add(VLShiftRightB32(dst=vgpr(splitOffset), shiftHex=hex((numRowsPerWave//2).bit_length()-1), src=vgpr(lane16), comment=""))
+  module.add(VLShiftLeftB32(dst=vgpr(splitOffset), shiftHex=hex(bytes_loaded.bit_length()-1), src=vgpr(splitOffset), comment=""))
+
+
+  module.add(VAndB32(dst=vgpr(tileInfoB.sharedVgprLROffset[0]), src0=vgpr(splitOffset), src1=64-1, comment="laneId"))
+
   module.add(VAndB32(dst=vgpr(tileInfoA.sharedVgprLROffset[1]), src0=vgpr("Serial"), src1=64-1, comment="laneId"))
-  module.add(VAndB32(dst=vgpr(tileInfoB.sharedVgprLROffset[0]), src0=vgpr("Serial"), src1=64-1, comment="laneId"))
   module.add(VAndB32(dst=vgpr(tileInfoB.sharedVgprLROffset[1]), src0=vgpr("Serial"), src1=64-1, comment="laneId"))
   # module.add(VMulLOU32(dst=vgpr(tmpVgpr), src0=sgpr(strideRef), src1=vgpr(row_id), comment="%s: row_id * stride"%tc))
-
+  
+  writer.vgprPool.checkIn(tmpVgpr) 
   return module
 
 
