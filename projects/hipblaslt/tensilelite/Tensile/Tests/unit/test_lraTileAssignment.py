@@ -39,25 +39,55 @@ def generate_lra_asm(cfg):
 
 def compute_expected_lr_offset(thread_id, cfg, tileInfo):
     """Python reference implementation for LR (Local Read) offset computation.
-
-    Computes the LDS byte offset for each thread's ds_read_b128.
-    Unlike GR offsets (which use global stride), LR offsets use the
-    LDS row stride (depthU * bpe).
-
-    For MFMA 16x16x32 F16:
-      - Each thread reads 16 bytes (128 bits) from LDS per read
-      - Thread lane_id determines: row = lane_id % 16, k_group = lane_id / 16
-      - LDS layout matches GR write pattern (with optional swizzling)
-      - No inter-wave cooperation: each wave reads its own subtile
-
-    When use_swizzling=True, applies the same LDS bank-conflict avoidance
-    swizzle (quad_perm + rotation) as GR writes, since LR must read from
-    the same physical LDS locations where GR wrote the data.
     """
+    depthUBytes = cfg.depth_u * BPE
+    blockSize = depthUBytes // LOAD_WIDTH
+    numRowsPerLDSBanks = (WAVESIZE*4) // depthUBytes
 
+    waveReadSize = WAVESIZE*LOAD_WIDTH
+    numRowsPerHalfWave = WAVESIZE // blockSize // 2 # split wave load
+    numMFMACols = tileInfo.mmaTileShape[1]*tileInfo.bpe // LOAD_WIDTH
+
+    laneId = thread_id % WAVESIZE
+
+    # Contiguous rows for loadRatioGR == 2.0, interleaved rows for loadRatioGR <= 1.0
+    if tileInfo.loadRatioGR == 2.0: 
+        splitOffset = 0
+    else:
+        splitOffset = ((laneId % 16) // numRowsPerHalfWave)*(waveReadSize//2)
+
+
+    enableSwizzling = True
+    if enableSwizzling:
+        enableRotation = True
+        # Swap lanes by 16 (stride of consecutive cols for MFMA layout)
+        if (laneId % 4)//2 == 0:
+            if (laneId // 16) % 2 == 0:
+                laneId = (laneId + 16) % WAVESIZE
+            else:
+                laneId = (laneId - 16) % WAVESIZE
+    else:
+        enableRotation = False
+
+    lane16 = laneId % 16
+    lane16Group = laneId // 16
+
+    colOffset = lane16Group
+    if enableRotation:
+        # rotate by 2 rows every 2 lds_row_id
+        lds_row_id = lane16 // numRowsPerLDSBanks
+        rotation = (lds_row_id//2)*2 
+        colOffset = (colOffset+rotation) % blockSize
+
+    rowOffset = lane16 * depthUBytes + splitOffset
+        
     offsets = []
+    # offset by numMFMACols read along K (TN)
     for lr_idx in range(tileInfo.numLRPerSubtile):
-        offsets.append(0)
+        newColOffset = (numMFMACols*lr_idx+ colOffset) % blockSize
+        offsets.append(rowOffset+ newColOffset*LOAD_WIDTH)
+        # offsets.append(rowOffset)
+
 
     return offsets
 
@@ -65,11 +95,6 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
 def compute_expected_lr_subtile(subtileId0, cfg, tileInfo):
     """Compute expected LR subtile register value.
 
-    The subtile offset for LR is the row offset in LDS:
-      subtile_rows * depthU_bytes * subtileId0
-
-    Unlike GR subtile offsets (which use global stride), LR subtile offsets
-    use the LDS row stride (depthU * bpe).
     """
     subtile_rows = tileInfo.subtileShape[0] * tileInfo.mmaTileShape[0]
     depthU_bytes = cfg.depth_u * BPE
