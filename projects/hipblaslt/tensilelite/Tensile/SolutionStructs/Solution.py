@@ -633,8 +633,8 @@ class Solution(collections.abc.Mapping):
         state["UseMFMAF32XEmulation"] = True # MFMA version for gfx950 etc.
 
     state["MfmaInitCVgprs"] = False
-    state["UseSubtileImpl"] = False#True
-    
+
+    state["UseSubtileImpl"] = True  
     # done
     state["AssignedProblemIndependentDerivedParameters"] = True
 
