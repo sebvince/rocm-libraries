@@ -397,12 +397,12 @@ class TileInfo:
 
 
 
-def _applySplitOffset(module, writer, tileInfo, lane16, numRowsPerWave, bytes_loaded):
+def _applySplitOffset(module, writer, tileInfo, lane16, numRowsPerWave, offset):
   tc = tileInfo.tc
   if tileInfo.loadRatioGR <= 1.0:
     splitOffset = writer.vgprPool.checkOut(1)
-    module.add(VLShiftRightB32(dst=vgpr(splitOffset), shiftHex=hex((numRowsPerWave//2).bit_length()-1), src=vgpr(lane16), comment="%s: splitOffset"%tc))
-    module.add(VLShiftLeftB32(dst=vgpr(splitOffset), shiftHex=hex((bytes_loaded//2).bit_length()-1), src=vgpr(splitOffset), comment="%s: splitOffset for 2nd half wave"%tc))
+    module.add(VLShiftRightB32(dst=vgpr(splitOffset), shiftHex=hex((numRowsPerWave//2).bit_length()-1), src=vgpr(lane16), comment="%s: check 2nd half wave"%tc))
+    module.add(VLShiftLeftB32(dst=vgpr(splitOffset), shiftHex=hex(offset.bit_length()-1), src=vgpr(splitOffset), comment="%s: x splitOffset"%tc))
     for vgprId in range(0, len(tileInfo.sharedVgprLROffset)):
       module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src1=vgpr(splitOffset), comment="%s: +=splitOffset"%tc))
     writer.vgprPool.checkIn(splitOffset)
@@ -484,25 +484,27 @@ def lraTileAssignment(writer, kernel):
   # Row
   module.add(VLShiftLeftB32(dst=vgpr(rowOffset), shiftHex=hex(depthUBytes.bit_length()-1), src=vgpr(lane16), comment="offsetRow = depthUBytes*lane16"))
 
-  # module.add(VMovB32(dst=vgpr(tileInfoA.sharedVgprLROffset[0]), src=vgpr(rowOffset), comment="debug"))
-  # return module
+  
   _computeLROffset(module, tileInfoA, colOffset, rowOffset, numMFMACols, blockSize, loadWidth)
   _computeLROffset(module, tileInfoB, colOffset, rowOffset, numMFMACols, blockSize, loadWidth)
 
   # Apply wavesplit offset separately on A & B as they are different for 1x4 and 4x1
-  _applySplitOffset(module, writer, tileInfoA, lane16, numRowsPerWave, bytes_loaded)
-  _applySplitOffset(module, writer, tileInfoB, lane16, numRowsPerWave, bytes_loaded)  
+  _applySplitOffset(module, writer, tileInfoA, lane16, numRowsPerWave, bytes_loaded//2)
+  _applySplitOffset(module, writer, tileInfoB, lane16, numRowsPerWave, bytes_loaded//2)  
 
-  return module
+  # return module
   
   tmpSgpr = writer.vgprPool.checkOut(1)  
   # Wave partitioning
   # TODO : 1x4 & 4x1
   # A
-  module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex((wavesize).bit_length()-1), src=vgpr("Serial"), comment="waveId"))
+  module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="waveId"))
   module.add(VAndB32(dst=vgpr(tmp), src0=hex(1), src1=vgpr(waveId), comment="A : waveId 1 or 3"))
-  module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(bytes_loaded //2), comment="A : bytes loaded per wave / 2"))
-  module.add(VMulLOU32(dst=vgpr(tmp), src1=vgpr(tmp), src0=tmpSgpr, comment="waveId13 offset"))
+  module.add(SMovB32(dst=sgpr(tmpSgpr), src=bytes_loaded //2, comment="A : bytes loaded per wave / 2"))
+  module.add(VMulLOU32(dst=vgpr(tmp), src0=sgpr(tmpSgpr), src1=vgpr(tmp), comment="waveId13 offset"))
+  # module.add(VMovB32(dst=vgpr(tileInfoA.sharedVgprLROffset[0]), src=vgpr(tmp), comment="debug"))
+  # return modle
+
   for vgprId in range(0,len(tileInfoA.sharedVgprLROffset)):
     module.add(VAddU32(dst=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src1=vgpr(tmp), comment="A : WaveId based offset 2x2 config"))
 

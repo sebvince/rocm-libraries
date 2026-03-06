@@ -47,7 +47,6 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
     waveReadSize = WAVESIZE*LOAD_WIDTH
     numRowsPerHalfWave = WAVESIZE // blockSize // 2 # split wave load
     numMFMACols = tileInfo.mmaTileShape[1]*tileInfo.bpe // LOAD_WIDTH
-
     laneId = thread_id % WAVESIZE
 
     # Contiguous rows for loadRatioGR == 2.0, interleaved rows for loadRatioGR <= 1.0
@@ -55,7 +54,6 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
         splitOffset = 0
     else:
         splitOffset = ((laneId % 16) // numRowsPerHalfWave)*(waveReadSize//2)
-
 
     enableSwizzling = True
     if enableSwizzling:
@@ -86,7 +84,29 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
     for lr_idx in range(tileInfo.numLRPerSubtile):
         newColOffset = (numMFMACols*lr_idx+ colOffset) % blockSize
         offsets.append(rowOffset+ newColOffset*LOAD_WIDTH)
-        # offsets.append(rowOffset)
+
+    # Wave partitioning.
+    waveId = thread_id // WAVESIZE
+    partitionOffset = 0
+    if tileInfo.loadRatioGR <= 1.0: 
+        # 2x2 config
+        # W0 W2
+        # W1 W3
+        if tileInfo.tc == 'A':
+            # Apply offset to W1/W3
+            if waveId % 2 == 1:
+                partitionOffset = numRowsPerHalfWave*depthUBytes
+        elif tileInfo.tc == 'B':
+            # Apply offset to W2/W3
+            if (waveId // 2)%2 == 1:
+                partitionOffset = numRowsPerHalfWave*depthUBytes
+        else:
+            raise ValueError(f"Unexpected tileInfo.tc: {tileInfo.tc}")
+    
+    if tileInfo.tc == 'B':
+        partitionOffset+= cfg.mt_a * depthUBytes # B is after A in memory
+    for id in range(len(offsets)):
+        offsets[id] += partitionOffset
 
 
     return offsets
