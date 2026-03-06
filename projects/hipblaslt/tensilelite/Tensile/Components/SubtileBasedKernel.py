@@ -432,8 +432,8 @@ def lraTileAssignment(writer, kernel):
   block_size = depthUBytes // loadWidth
 
  
-  tmpVgpr = writer.vgprPool.checkOut(6)                                                                                                                                                                                                                                           
-  lane16, lane16Group, splitOffset, rotation, tmp, colId = range(tmpVgpr, tmpVgpr + 6)
+  tmpVgpr = writer.vgprPool.checkOut(7)                                                                                                                                                                                                                                           
+  lane16, lane16Group, splitOffset, rotation, tmp, colId, waveId = range(tmpVgpr, tmpVgpr + 7)
 
 
   # Calculate lane16 and lane16Group for current wave (used by MFMA layout)
@@ -476,11 +476,22 @@ def lraTileAssignment(writer, kernel):
       module.add(VAddU32(dst=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoA.sharedVgprLROffset[vgprId-1]), src1=hex(numMFMACols), comment="colOffset for MFMA %u of subtile"%(vgprId)))
       module.add(VAndB32(dst=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src1=hex(block_size-1), comment="colOffset = colOffset % block_size"))
 
-    # module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(lds_row_id), comment=""))
-    # module.add(VLShiftLeftB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(tmp), comment="(lds_row_id //2) * 2"))
-    # module.add(VSubU32(dst=vgpr(tmp), src0=hex(block_size), src1=vgpr(tmp), comment="rotation offset : block_size - (lds_row_id//2)*2"))
-    # module.add(VAddU32(dst=vgpr(col_id), src0=vgpr(tmp), src1=vgpr(col_id), comment=""))
-    # module.add(VAndB32(dst=vgpr(col_id), src0=vgpr(col_id), src1=hex(block_size-1), comment="(col + offset) % block_size"))
+    for vgprId in range(0,len(tileInfoA.sharedVgprLROffset)):
+      module.add(VLShiftRightB32(dst=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), shiftHex=hex(loadWidth.bit_length()-1), src=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), comment="colOffset*loadWidth"))
+      module.add(VAddU32(dst=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src1=vgpr(tmp), comment="row + col"))
+
+    # bytes_loaded = wavesize * loadWidth
+    # module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex((wavesize).bit_length()-1), src=vgpr("Serial"), comment="waveId"))
+    # module.add(VAndB32(dst=vgpr(waveId13), shiftHex=hex(1), src=vgpr(waveId), comment="waveId 1 or 3"))
+    # module.add(VMulLOU32(dst=vgpr(waveId13), src0=vgpr(waveId13), src1=hex(bytes_loaded //2), comment="waveId13 offset"))
+    # for vgprId in range(0,len(tileInfoA.sharedVgprLROffset)):
+    #   module.add(VAddU32(dst=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src1=vgpr(waveId13), comment="WaveId based offset 2x2 config"))
+
+    # #for B
+    # module.add(VLShiftRightB32(dst=vgpr(waveId13), shiftHex=hex(1), src=vgpr(waveId), comment="waveId 0 or 2"))
+    # module.add(VAndB32(dst=vgpr(waveId13), shiftHex=hex(1), src=vgpr(waveId), comment="waveId 1 or 3"))
+    # module.add(VMulLOU32(dst=vgpr(waveId13), src0=vgpr(waveId13), src1=hex(bytes_loaded //2), comment=""))
+    # module.add(VAddU32(dst=vgpr(waveId13), src0=vgpr(waveId13), src1=hex(mt0*depthUBytes), comment="B matrix offset : mt0*depthUBytes"))
 
 
   
