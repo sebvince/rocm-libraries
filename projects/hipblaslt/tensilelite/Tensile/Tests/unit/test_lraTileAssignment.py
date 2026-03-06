@@ -85,10 +85,11 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
         newColOffset = (numMFMACols*lr_idx+ colOffset) % blockSize
         offsets.append(rowOffset+ newColOffset*LOAD_WIDTH)
 
+
     # Wave partitioning.
     waveId = thread_id // WAVESIZE
     partitionOffset = 0
-    if tileInfo.loadRatioGR <= 1.0: 
+    if tileInfo.loadRatioGR <= 1.0:
         # 2x2 config
         # W0 W2
         # W1 W3
@@ -102,7 +103,7 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
                 partitionOffset = numRowsPerHalfWave*depthUBytes
         else:
             raise ValueError(f"Unexpected tileInfo.tc: {tileInfo.tc}")
-    
+          
     if tileInfo.tc == 'B':
         partitionOffset+= cfg.mt_a * depthUBytes # B is after A in memory
     for id in range(len(offsets)):
@@ -123,8 +124,8 @@ def compute_expected_lr_subtile(subtileId0, cfg, tileInfo):
 
 # Tile configs to test
 TILE_CONFIGS = [
-    # TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=1024, stride_b=256),#TODO. no need for strides
-    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=256, stride_b=256),
+    TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=1024, stride_b=256),#TODO. no need for strides
+    # TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=256, stride_b=256),
 
 #     # 2x2 configs
 #     TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=4096, stride_b=1024, use_swizzling=False),

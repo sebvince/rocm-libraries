@@ -435,11 +435,14 @@ def lraTileAssignment(writer, kernel):
   tileInfoA = writer.states.a.tileInfo
   tileInfoB = writer.states.b.tileInfo
 
+  print("TileInfo A", tileInfoA)
+  
   # Input Parameters.
   depthU = kernel["DepthU"]
   bpeA = kernel["ProblemType"]["DataTypeA"].numBytes()
   bpeB = kernel["ProblemType"]["DataTypeB"].numBytes()
   MT0A = kernel["MacroTileA"]
+  MT0B = kernel["MacroTileB"]
   depthUBytes = depthU * bpeA
   wavesize = kernel["WavefrontSize"]
 
@@ -452,8 +455,8 @@ def lraTileAssignment(writer, kernel):
   numMFMACols = tileInfoA.mmaTileShape[1]*tileInfoA.bpe // loadWidth # TN case only
   blockSize = depthUBytes // loadWidth
  
-  tmpVgpr = writer.vgprPool.checkOut(7)                                                                                                                                                                                                                                           
-  lane16, lane16Group, rotation, rowOffset, colOffset, waveId, tmp = range(tmpVgpr, tmpVgpr + 7)
+  tmpVgpr = writer.vgprPool.checkOut(8)                                                                                                                                                                                                                                           
+  lane16, lane16Group, rotation, rowOffset, colOffset, waveId, tmp, tmp1 = range(tmpVgpr, tmpVgpr + 8)
 
   # Calculate lane16 and lane16Group for current wave (used by MFMA layout)
   module.add(VAndB32(dst=vgpr(lane16Group), src0=vgpr("Serial"), src1=wavesize-1, comment="laneId"))
@@ -492,29 +495,53 @@ def lraTileAssignment(writer, kernel):
   _applySplitOffset(module, writer, tileInfoA, lane16, numRowsPerWave, bytes_loaded//2)
   _applySplitOffset(module, writer, tileInfoB, lane16, numRowsPerWave, bytes_loaded//2)  
 
-  # return module
+  
   
   tmpSgpr = writer.vgprPool.checkOut(1)  
-  # Wave partitioning
-  # TODO : 1x4 & 4x1
-  # A
   module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="waveId"))
-  module.add(VAndB32(dst=vgpr(tmp), src0=hex(1), src1=vgpr(waveId), comment="A : waveId 1 or 3"))
-  module.add(SMovB32(dst=sgpr(tmpSgpr), src=bytes_loaded //2, comment="A : bytes loaded per wave / 2"))
-  module.add(VMulLOU32(dst=vgpr(tmp), src0=sgpr(tmpSgpr), src1=vgpr(tmp), comment="waveId13 offset"))
-  # module.add(VMovB32(dst=vgpr(tileInfoA.sharedVgprLROffset[0]), src=vgpr(tmp), comment="debug"))
-  # return modle
+  # Wave partitioning
+  # TODO. Replace these tests by using loadRatioGR tests
+  if kernel["MIWaveGroup"] == [2, 2]:
+    # A
+    module.add(VAndB32(dst=vgpr(tmp), src0=hex(1), src1=vgpr(waveId), comment="A : waveId 1 or 3"))
+    module.add(SMovB32(dst=sgpr(tmpSgpr), src=bytes_loaded //2, comment="A : bytes loaded per wave / 2"))
+    module.add(VMulLOU32(dst=vgpr(tmp), src0=sgpr(tmpSgpr), src1=vgpr(tmp), comment="waveId13 offset"))
+    # module.add(VMovB32(dst=vgpr(tileInfoA.sharedVgprLROffset[0]), src=vgpr(tmp), comment="debug"))
+    # return modle
 
-  for vgprId in range(0,len(tileInfoA.sharedVgprLROffset)):
-    module.add(VAddU32(dst=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src1=vgpr(tmp), comment="A : WaveId based offset 2x2 config"))
+    for vgprId in range(0,len(tileInfoA.sharedVgprLROffset)):
+      module.add(VAddU32(dst=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src1=vgpr(tmp), comment="A : WaveId based offset 2x2 config"))
 
-  # B
-  module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(waveId), comment="B : waveId 2 or 3"))
-  module.add(VMulLOU32(dst=vgpr(tmp), src1=vgpr(tmp), src0=sgpr(tmpSgpr), comment="B : bytes loaded per wave / 2"))
-  module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0A*depthUBytes), comment=""))
-  module.add(VAddU32(dst=vgpr(tmp), src0=vgpr(tmp), src1=sgpr(tmpSgpr), comment="B matrix offset : mt0*depthUBytes"))
-  for vgprId in range(0,len(tileInfoB.sharedVgprLROffset)):
-    module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src1=vgpr(tmp), comment="B : WaveId based offset 2x2 config"))
+    # B
+    module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(waveId), comment="B : waveId 2 or 3"))
+    module.add(VMulLOU32(dst=vgpr(tmp), src1=vgpr(tmp), src0=sgpr(tmpSgpr), comment="B : bytes loaded per wave / 2"))
+    module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0A*depthUBytes), comment=""))
+    module.add(VAddU32(dst=vgpr(tmp), src0=vgpr(tmp), src1=sgpr(tmpSgpr), comment="B matrix offset : mt0*depthUBytes"))
+    for vgprId in range(0,len(tileInfoB.sharedVgprLROffset)):
+      module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src1=vgpr(tmp), comment="B : WaveId based offset 2x2 config"))
+
+  elif kernel["MIWaveGroup"] == [1, 4]:
+    # Nothing for A. Each wave has the same offset.
+
+    # B. TODO. Test this + cleanup
+    # Data is interleaved between MT0 // 2 + we had a offset of MT0 // 4 within wave pair.
+    module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0B*depthUBytes // 4), comment=""))
+    module.add(VAndB32(dst=vgpr(tmp1), src0=hex(1), src1=vgpr(waveId), comment="A : waveId 1 or 3"))
+    module.add(VMulLOU32(dst=vgpr(tmp1), src1=vgpr(tmp1), src0=sgpr(tmpSgpr), comment="B : bytes loaded per wave / 2"))
+
+    module.add(SMovB32(dst=sgpr(tmpSgpr), src=bytes_loaded //2, comment="A : bytes loaded per wave / 2"))
+    module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(waveId), comment="B : waveId 2 or 3"))
+    module.add(VMulLOU32(dst=vgpr(tmp), src1=vgpr(tmp), src0=sgpr(tmpSgpr), comment="B : bytes loaded per wave / 2"))
+    module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0A*depthUBytes), comment=""))
+    module.add(VAddU32(dst=vgpr(tmp), src0=vgpr(tmp), src1=vgpr(tmp1), comment="B matrix offset : mt0*depthUBytes // 4"))
+    module.add(VAddU32(dst=vgpr(tmp), src0=vgpr(tmp), src1=sgpr(tmpSgpr), comment="B matrix offset : mt0*depthUBytes"))
+    for vgprId in range(0,len(tileInfoB.sharedVgprLROffset)):
+      module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src1=vgpr(tmp), comment="B : WaveId based offset 2x2 config"))
+
+  elif kernel["MIWaveGroup"] == [4, 1]:
+    raise NotImplementedError("Unsupported MIWaveGroup config for wavesplit offset calculation: %s"%str(kernel["MIWaveGroup"]))
+  else:
+    raise NotImplementedError("Unsupported MIWaveGroup config for wavesplit offset calculation: %s"%str(kernel["MIWaveGroup"]))
 
   writer.vgprPool.checkIn(tmpSgpr)  
 
