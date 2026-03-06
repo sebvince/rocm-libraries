@@ -397,6 +397,16 @@ class TileInfo:
 
 
 
+def _applySplitOffset(module, writer, tileInfo, lane16, numRowsPerWave, bytes_loaded):
+  tc = tileInfo.tc
+  if tileInfo.loadRatioGR <= 1.0:
+    splitOffset = writer.vgprPool.checkOut(1)
+    module.add(VLShiftRightB32(dst=vgpr(splitOffset), shiftHex=hex((numRowsPerWave//2).bit_length()-1), src=vgpr(lane16), comment="%s: splitOffset"%tc))
+    module.add(VLShiftLeftB32(dst=vgpr(splitOffset), shiftHex=hex((bytes_loaded//2).bit_length()-1), src=vgpr(splitOffset), comment="%s: splitOffset for 2nd half wave"%tc))
+    for vgprId in range(0, len(tileInfo.sharedVgprLROffset)):
+      module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src1=vgpr(splitOffset), comment="%s: +=splitOffset"%tc))
+    writer.vgprPool.checkIn(splitOffset)
+
 def _computeLROffset(module, tileInfo, colOffset, rowOffset, numMFMACols, block_size, loadWidth):
   tc = tileInfo.tc
   module.add(VMovB32(dst=vgpr(tileInfo.sharedVgprLROffset[0]), src=vgpr(colOffset), comment="%s: laneId"%tc))
@@ -420,13 +430,10 @@ def setExecMask(module, writer, maskLo, maskHi):
 #
 def lraTileAssignment(writer, kernel):
   module = Module()
-  module.addComment0("REMOVE WHEN IMPLEMNTED: Placeholder for subtile based LR Offset computation")
-  for i in range(8):
-    module.addComment("")
+  module.addComment0("LR Offset Calculation for Subtile Based Tiling")
 
   tileInfoA = writer.states.a.tileInfo
   tileInfoB = writer.states.b.tileInfo
-
 
   # Input Parameters.
   depthU = kernel["DepthU"]
@@ -443,11 +450,10 @@ def lraTileAssignment(writer, kernel):
   assert tileInfoA.mmaTileShape == tileInfoB.mmaTileShape, "Expect same MMA tile shape for A and B"
 
   numMFMACols = tileInfoA.mmaTileShape[1]*tileInfoA.bpe // loadWidth # TN case only
-  block_size = depthUBytes // loadWidth
+  blockSize = depthUBytes // loadWidth
  
-  tmpVgpr = writer.vgprPool.checkOut(8)                                                                                                                                                                                                                                           
-  lane16, lane16Group, splitOffset, rotation, rowOffset, colOffset, waveId, tmp = range(tmpVgpr, tmpVgpr + 8)
-
+  tmpVgpr = writer.vgprPool.checkOut(7)                                                                                                                                                                                                                                           
+  lane16, lane16Group, rotation, rowOffset, colOffset, waveId, tmp = range(tmpVgpr, tmpVgpr + 7)
 
   # Calculate lane16 and lane16Group for current wave (used by MFMA layout)
   module.add(VAndB32(dst=vgpr(lane16Group), src0=vgpr("Serial"), src1=wavesize-1, comment="laneId"))
@@ -455,11 +461,8 @@ def lraTileAssignment(writer, kernel):
   module.add(VAndB32(dst=vgpr(lane16), src0=vgpr("Serial"), src1=mi_m-1, comment="laneId % 16"))
 
   bytes_loaded = wavesize * loadWidth
-  numRowsPerWave = wavesize // block_size
-  # Because of split wave load, each wave can load distant chunk of memory contiguously. splitOffset calculates the offset for the 2nd half wave chunk.
-  # TODO : 1x4 & 4x1
-  module.add(VLShiftRightB32(dst=vgpr(splitOffset), shiftHex=hex((numRowsPerWave//2).bit_length()-1), src=vgpr(lane16), comment=""))
-  module.add(VLShiftLeftB32(dst=vgpr(splitOffset), shiftHex=hex((bytes_loaded//2).bit_length()-1), src=vgpr(splitOffset), comment="splitOffset for 2nd half wave"))
+  numRowsPerWave = wavesize // blockSize
+  
   
   swizzling = True
   if swizzling:
@@ -470,7 +473,7 @@ def lraTileAssignment(writer, kernel):
     
     # Apply rotation on Col
     module.add(VAddU32(dst=vgpr(colOffset), src0=vgpr(rotation), src1=vgpr(lane16Group), comment="colOffset = rotation + lane16Group"))
-    module.add(VAndB32(dst=vgpr(colOffset), src0=vgpr(colOffset), src1=hex(block_size-1), comment="colOffset = colOffset % block_size"))
+    module.add(VAndB32(dst=vgpr(colOffset), src0=vgpr(colOffset), src1=hex(blockSize-1), comment="colOffset = colOffset % blockSize"))
     #Swizzle col
     setExecMask(module, writer, 0x33333333, 0x33333333)
     module.add(VPermlane16SwapB32(dst=vgpr(colOffset), src=vgpr(colOffset), comment="apply swizzling"))  
@@ -480,15 +483,19 @@ def lraTileAssignment(writer, kernel):
 
   # Row
   module.add(VLShiftLeftB32(dst=vgpr(rowOffset), shiftHex=hex(depthUBytes.bit_length()-1), src=vgpr(lane16), comment="offsetRow = depthUBytes*lane16"))
-  module.add(VAddU32(dst=vgpr(rowOffset), src0=vgpr(splitOffset), src1=vgpr(rowOffset), comment="offsetRow+=splitOffset"))
 
   # module.add(VMovB32(dst=vgpr(tileInfoA.sharedVgprLROffset[0]), src=vgpr(rowOffset), comment="debug"))
   # return module
-  _computeLROffset(module, tileInfoA, colOffset, rowOffset, numMFMACols, block_size, loadWidth)
-  _computeLROffset(module, tileInfoB, colOffset, rowOffset, numMFMACols, block_size, loadWidth)
-  return module
-  tmpSgpr = writer.vgprPool.checkOut(1)  
+  _computeLROffset(module, tileInfoA, colOffset, rowOffset, numMFMACols, blockSize, loadWidth)
+  _computeLROffset(module, tileInfoB, colOffset, rowOffset, numMFMACols, blockSize, loadWidth)
 
+  # Apply wavesplit offset separately on A & B as they are different for 1x4 and 4x1
+  _applySplitOffset(module, writer, tileInfoA, lane16, numRowsPerWave, bytes_loaded)
+  _applySplitOffset(module, writer, tileInfoB, lane16, numRowsPerWave, bytes_loaded)  
+
+  return module
+  
+  tmpSgpr = writer.vgprPool.checkOut(1)  
   # Wave partitioning
   # TODO : 1x4 & 4x1
   # A

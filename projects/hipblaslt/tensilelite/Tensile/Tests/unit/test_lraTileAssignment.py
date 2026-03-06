@@ -103,7 +103,9 @@ def compute_expected_lr_subtile(subtileId0, cfg, tileInfo):
 
 # Tile configs to test
 TILE_CONFIGS = [
-    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=256, stride_b=256, use_swizzling=False),
+    # TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=1024, stride_b=256),#TODO. no need for strides
+    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=256, stride_b=256),
+
 #     # 2x2 configs
 #     TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=4096, stride_b=1024, use_swizzling=False),
 #     TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=4096, stride_b=1024, use_swizzling=True),
