@@ -41,6 +41,7 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
     """Python reference implementation for LR (Local Read) offset computation.
     """
     depthUBytes = cfg.depth_u * BPE
+    MT = cfg.mt_a if tileInfo.tc == 'A' else cfg.mt_b
     blockSize = depthUBytes // LOAD_WIDTH
     numRowsPerLDSBanks = (WAVESIZE*4) // depthUBytes
 
@@ -89,20 +90,50 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
     # Wave partitioning.
     waveId = thread_id // WAVESIZE
     partitionOffset = 0
-    if tileInfo.loadRatioGR <= 1.0:
-        # 2x2 config
+
+    if tileInfo.tc == 'A':
+        # 2x2 config: W1/W3 get offset for rows 16-31
         # W0 W2
         # W1 W3
-        if tileInfo.tc == 'A':
-            # Apply offset to W1/W3
+        if tileInfo.loadRatioGR == 1.0 and waveId % 2 == 1: 
+            partitionOffset = numRowsPerHalfWave*depthUBytes
+
+    elif tileInfo.tc == 'B':
+        # 2x2 config: W2/W3 get offset for rows 16-31
+        if tileInfo.loadRatioGR == 1.0 and (waveId //2)%2 == 1:
+            partitionOffset = numRowsPerHalfWave*depthUBytes
+        # 1x4 config:
+        # W0
+        # W1 
+        # W2
+        # W3
+        # 1st buffer load (i, i + MT/2)
+        # 2nd buffer load (i+MT/4, i + MT/2 + MT/4)
+        # offset W2/W3 by numRowsPerHalfWave*depthUBytes to get i + MT/2
+        # offset W1/W3 by MT*depthUBytes//4 to get i + MT/4
+        elif tileInfo.loadRatioGR == 0.5:
+            if (waveId // 2) % 2 == 1:
+                partitionOffset += numRowsPerHalfWave*depthUBytes
             if waveId % 2 == 1:
-                partitionOffset = numRowsPerHalfWave*depthUBytes
-        elif tileInfo.tc == 'B':
-            # Apply offset to W2/W3
-            if (waveId // 2)%2 == 1:
-                partitionOffset = numRowsPerHalfWave*depthUBytes
-        else:
-            raise ValueError(f"Unexpected tileInfo.tc: {tileInfo.tc}")
+                partitionOffset += MT * depthUBytes // 4 
+            
+    else:
+        raise ValueError(f"Unexpected tileInfo.tc: {tileInfo.tc}")
+
+    # if tileInfo.loadRatioGR <= 1.0:
+    #     # 2x2 config
+    #     # W0 W2
+    #     # W1 W3
+    #     if tileInfo.tc == 'A':
+    #         # Apply offset to W1/W3
+    #         if waveId % 2 == 1:
+    #             partitionOffset = numRowsPerHalfWave*depthUBytes
+    #     elif tileInfo.tc == 'B':
+    #         # Apply offset to W2/W3
+    #         if (waveId // 2)%2 == 1:
+    #             partitionOffset = numRowsPerHalfWave*depthUBytes
+    #     else:
+    #         raise ValueError(f"Unexpected tileInfo.tc: {tileInfo.tc}")
           
     if tileInfo.tc == 'B':
         partitionOffset+= cfg.mt_a * depthUBytes # B is after A in memory
@@ -124,20 +155,13 @@ def compute_expected_lr_subtile(subtileId0, cfg, tileInfo):
 
 # Tile configs to test
 TILE_CONFIGS = [
-    TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=1024, stride_b=256),#TODO. no need for strides
-    # TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=256, stride_b=256),
-
-#     # 2x2 configs
-#     TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=4096, stride_b=1024, use_swizzling=False),
-#     TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=4096, stride_b=1024, use_swizzling=True),
-#     TileConfig(mt_a=96, mt_b=256, depth_u=64, stride_a=1024, stride_b=256, use_swizzling=True),
-#     # 1x4 configs
-#     TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=1024, stride_b=256, use_swizzling=True),
-#     TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
-#     # 4x1 configs
-#     TileConfig(mt_a=64, mt_b=80, depth_u=64, stride_a=1024, stride_b=256, use_swizzling=True),
-#     # mt0<32 (read size)
-#     TileConfig(mt_a=16, mt_b=64, depth_u=64, stride_a=64, stride_b=64, use_swizzling=True),
+    # 2x2 configs
+    # TileConfig(mt_a=256, mt_b=256, depth_u=64),
+    # TileConfig(mt_a=96, mt_b=256, depth_u=64),
+    # # 1x4 configs
+    # TileConfig(mt_a=80, mt_b=64, depth_u=64),
+    # 4x1 configs
+    TileConfig(mt_a=64, mt_b=80, depth_u=64),
 ]
 
 

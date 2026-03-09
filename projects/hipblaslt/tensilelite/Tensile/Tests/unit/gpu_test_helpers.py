@@ -53,9 +53,9 @@ class TileConfig:
     mt_a: int       # MacroTileA
     mt_b: int       # MacroTileB
     depth_u: int    # DepthU
-    stride_a: int   # StrideA0I (in elements)
-    stride_b: int   # StrideB1J (in elements)
-    use_swizzling: bool = False  # Whether to enable swizzling
+    stride_a: int = 0   # StrideA0I (in elements), only needed by GRA tests
+    stride_b: int = 0   # StrideB1J (in elements), only needed by GRA tests
+    use_swizzling: bool = False  # Whether to enable swizzling, only needed by GRA tests
 
     @property
     def label(self):
