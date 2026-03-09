@@ -514,8 +514,8 @@ def lraTileAssignment(writer, kernel):
     # B
     module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(waveId), comment="B : waveId 2 or 3"))
     module.add(VMulLOU32(dst=vgpr(tmp), src1=vgpr(tmp), src0=sgpr(tmpSgpr), comment="B : bytes loaded per wave / 2"))
-    module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0A*depthUBytes), comment=""))
-    module.add(VAddU32(dst=vgpr(tmp), src0=vgpr(tmp), src1=sgpr(tmpSgpr), comment="B matrix offset : mt0*depthUBytes"))
+    
+
     for vgprId in range(0,len(tileInfoB.sharedVgprLROffset)):
       module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src1=vgpr(tmp), comment="B : WaveId based offset 2x2 config"))
 
@@ -531,9 +531,8 @@ def lraTileAssignment(writer, kernel):
     module.add(SMovB32(dst=sgpr(tmpSgpr), src=bytes_loaded //2, comment="A : bytes loaded per wave / 2"))
     module.add(VLShiftRightB32(dst=vgpr(tmp), shiftHex=hex(1), src=vgpr(waveId), comment="B : waveId 2 or 3"))
     module.add(VMulLOU32(dst=vgpr(tmp), src1=vgpr(tmp), src0=sgpr(tmpSgpr), comment="B : bytes loaded per wave / 2"))
-    module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0A*depthUBytes), comment=""))
     module.add(VAddU32(dst=vgpr(tmp), src0=vgpr(tmp), src1=vgpr(tmp1), comment="B matrix offset : mt0*depthUBytes // 4"))
-    module.add(VAddU32(dst=vgpr(tmp), src0=vgpr(tmp), src1=sgpr(tmpSgpr), comment="B matrix offset : mt0*depthUBytes"))
+
     for vgprId in range(0,len(tileInfoB.sharedVgprLROffset)):
       module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src1=vgpr(tmp), comment="B : WaveId based offset 2x2 config"))
 
@@ -541,6 +540,11 @@ def lraTileAssignment(writer, kernel):
     raise NotImplementedError("Unsupported MIWaveGroup config for wavesplit offset calculation: %s"%str(kernel["MIWaveGroup"]))
   else:
     raise NotImplementedError("Unsupported MIWaveGroup config for wavesplit offset calculation: %s"%str(kernel["MIWaveGroup"]))
+
+  # Apply global offset on B.
+  module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0A*depthUBytes), comment=""))
+  for vgprId in range(0,len(tileInfoB.sharedVgprLROffset)):
+    module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src1=sgpr(tmpSgpr), comment="B matrix offset : mt0*depthUBytes"))
 
   writer.vgprPool.checkIn(tmpSgpr)  
 
