@@ -55,7 +55,7 @@ from test_lraTileAssignment import compute_expected_lr_offset
 INTEGRATION_CFG = TileConfig(
     mt_a=32, mt_b=64, depth_u=64,
     stride_a=64, stride_b=64,
-    use_swizzling=False,
+    use_swizzling=True,
 )
 
 
@@ -142,6 +142,13 @@ def generate_integration_kernel(gra_lra_asm, tileInfoA, gra_only=False):
         next_s += 4 - (next_s % 4)
     srd = next_s; next_s += 4
 
+    # Exec save pair for wave masking (normal mode)
+    exec_save = 0  # unused in gra_only
+    if not gra_only:
+        if next_s % 2 != 0:
+            next_s += 1
+        exec_save = next_s; next_s += 2
+
     max_vgpr = next_v
     max_sgpr = next_s
     # Align vgpr count to 4 for accum_offset
@@ -149,6 +156,48 @@ def generate_integration_kernel(gra_lra_asm, tileInfoA, gra_only=False):
 
     # LDS size: mt_a * depthU * BPE (only matrix A for this test)
     lds_size = INTEGRATION_CFG.mt_a * INTEGRATION_CFG.depth_u * BPE
+
+    # Build step 5+6 asm: ds_read + output store
+    stride_bytes = INTEGRATION_CFG.depth_u * BPE  # 64*2 = 128
+    stride_shift = stride_bytes.bit_length() - 1   # 7  (r << 7 = r * 128)
+    col_bytes = 8 * BPE                           # 16 elements * 2 = 32
+    col_shift = col_bytes.bit_length() - 1         # 5  ((laneId/16) << 5 = c_bytes)
+
+    if gra_only:
+        step56_asm = f"""\
+  // ---- 5+6. Linear LDS dump (tid*16) ----
+  v_lshlrev_b32 v{tmp}, 4, v0               // byte offset = tid * 16
+  // gra-only: read LDS linearly at tid*16 to dump full LDS contents
+  ds_read_b128 v[{data0}:{data0+3}], v{tmp}
+  s_waitcnt lgkmcnt(0)
+  // Write 16 bytes to output_ptr + tid * 16
+  v_mov_b32 v{tmp2}, s[7]                    // output_ptr hi
+  v_add_co_u32 v{addr_lo}, vcc, s[6], v{tmp}
+  v_addc_co_u32 v{addr_hi}, vcc, v{tmp2}, 0, vcc
+  flat_store_dwordx4 v[{addr_lo}:{addr_hi}], v[{data0}:{data0+3}]"""
+    else:
+        step56_asm = f"""\
+  // ---- 5. ds_read using LRA offset ----
+#   v_lshlrev_b32 v{lra_offset_reg}, 4, v0               // byte offset = tid * 16
+  ds_read_b128 v[{data0}:{data0+3}], v{lra_offset_reg}
+    #s_trap 1
+  s_waitcnt lgkmcnt(0)
+
+  // ---- 6. Write to output: wave 0 only (waveId = threadId / 64) ----
+  // r = laneId % 16,  c = (laneId / 16) * 16
+  // byte_offset = r * {stride_bytes} + c * {BPE}
+  v_cmp_gt_u32 vcc, 64, v0                   // wave 0 only (threadId < 64)
+  s_and_saveexec_b64 s[{exec_save}:{exec_save+1}], vcc
+  v_and_b32 v{tmp}, 0xF, v0                  // r = laneId % 16
+  v_lshlrev_b32 v{tmp}, {stride_shift}, v{tmp}  // r * {stride_bytes}
+  v_lshrrev_b32 v{tmp2}, 4, v0               // laneId / 16
+  v_lshlrev_b32 v{tmp2}, {col_shift}, v{tmp2}   // c_bytes = (laneId/16) * {col_bytes}
+  v_add_u32 v{tmp}, v{tmp}, v{tmp2}          // byte_offset
+  v_mov_b32 v{tmp2}, s[7]                    // output_ptr hi
+  v_add_co_u32 v{addr_lo}, vcc, s[6], v{tmp}
+  v_addc_co_u32 v{addr_hi}, vcc, v{tmp2}, 0, vcc
+  flat_store_dwordx4 v[{addr_lo}:{addr_hi}], v[{data0}:{data0+3}]
+  s_or_b64 exec, exec, s[{exec_save}:{exec_save+1}]"""
 
     # Kernarg layout:
     #   offset 0:  input_ptr  (8B)
@@ -210,9 +259,9 @@ test_kernel:
   s_mov_b32 s[{srd+3}], 0x20000             // OOB_SELECT=2 (raw buffer)
 
   // ---- 4. buffer_load to LDS using GRA offset ----
-  v_lshrrev_b32 v2, 6, v0 
+  v_lshrrev_b32 v{tmp} , 6, v0 
   s_nop 1
-  v_readfirstlane_b32 s4, v2  
+  v_readfirstlane_b32 s4, v{tmp}  
   s_mul_i32 s4, s4, 0x400 // Hardcoded to reads size 8x128Bytes per warp. 
   s_mov_b32 m0, s4                            // LDS base offset = 0
   //DEBUG purpose: use tid as input
@@ -222,17 +271,7 @@ test_kernel:
   s_waitcnt vmcnt(0)
   s_barrier
 
-  // ---- 5+6. {'Linear LDS dump (tid*16)' if gra_only else 'ds_read LRA + store'} ----
-  v_lshlrev_b32 v{tmp}, 4, v0               // byte offset = tid * 16
-{'  // gra-only: read LDS linearly at tid*16 to dump full LDS contents' if gra_only else '  // normal: read LDS at LRA offset'}
-  ds_read_b128 v[{data0}:{data0+3}], v{tmp if gra_only else lra_offset_reg}
-  
-  s_waitcnt lgkmcnt(0)
-  // Write 16 bytes to output_ptr + tid * 16
-  v_mov_b32 v{tmp2}, s[7]                    // move output_ptr hi to vgpr
-  v_add_co_u32 v{addr_lo}, vcc, s[6], v{tmp}
-  v_addc_co_u32 v{addr_hi}, vcc, v{tmp2}, 0, vcc
-  flat_store_dwordx4 v[{addr_lo}:{addr_hi}], v[{data0}:{data0+3}]
+{step56_asm}
   s_waitcnt vmcnt(0)
   s_endpgm
 
@@ -374,23 +413,14 @@ def print_matrix_fp16(label, data_bytes, rows, cols):
         print(f"[{r:3d}] {vals}")
 
 
-def rebuild_output_matrix(output_bytes, cfg, tileInfoA, gra_only=False):
-    """Reconstruct output as mt_a x depth_u bytes.
+def rebuild_output_matrix(output_bytes, cfg):
+    """Return output as mt_a x depth_u bytes.
 
-    When gra_only=True, the output is already a linear LDS dump (tid*16 layout),
-    so the raw bytes are the LDS contents in order — no reordering needed.
-    Otherwise, places each thread's chunk back at its LRA offset.
+    Both modes write directly to matrix positions in the output buffer,
+    so the raw bytes are the matrix in row-major order.
     """
     total = cfg.mt_a * cfg.depth_u * BPE
-    if gra_only:
-        # Output is a linear dump of LDS, already in byte order
-        return bytes(output_bytes[:total])
-    buf = bytearray(total)
-    for tid in range(NUM_THREADS):
-        offset = compute_expected_lr_offset(tid, cfg, tileInfoA)[0]
-        chunk = output_bytes[tid * LOAD_WIDTH:(tid + 1) * LOAD_WIDTH]
-        buf[offset:offset + LOAD_WIDTH] = chunk
-    return bytes(buf)
+    return bytes(output_bytes[:total])
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +559,7 @@ if __name__ == "__main__":
 
         if args.show_matrices:
             print_matrix_fp16("Input", input_bytes, cfg.mt_a, cfg.depth_u)
-            out_matrix_bytes = rebuild_output_matrix(output_bytes, cfg, tileInfoA, gra_only=args.gra_only)
+            out_matrix_bytes = rebuild_output_matrix(output_bytes, cfg)
             label = "Output (GRA layout in LDS)" if args.gra_only else "Output"
             print_matrix_fp16(label, out_matrix_bytes, cfg.mt_a, cfg.depth_u)
 
@@ -555,20 +585,30 @@ if __name__ == "__main__":
                             print(f"    expected: {exp_fp16}")
                             print(f"    actual:   {act_fp16}")
         else:
-            for tid in range(NUM_THREADS):
-                offset = compute_expected_lr_offset(tid, cfg, tileInfoA)[0]
+            # Normal mode: wave 0 writes to matrix positions
+            # r = laneId % 16, c = (laneId / 16) * 16
+            # byte_offset = r * stride_bytes + c * BPE
+            stride_bytes = cfg.depth_u * BPE
+            for lane in range(WAVESIZE):  # wave 0 only
+                r = lane % 16
+                c = (lane // 16) * 16
+                out_off = r * stride_bytes + c * BPE
+                lr_offset = compute_expected_lr_offset(lane, cfg, tileInfoA)[0]
 
-                expected_bytes = input_bytes[offset:offset + LOAD_WIDTH]
-                actual_bytes = output_bytes[tid * LOAD_WIDTH:(tid + 1) * LOAD_WIDTH]
+                expected_bytes = input_bytes[lr_offset:lr_offset + LOAD_WIDTH]
+                actual_bytes = output_bytes[out_off:out_off + LOAD_WIDTH]
 
                 match = actual_bytes == expected_bytes
 
                 if args.debug or not match:
-                    exp_dwords = struct.unpack("4I", expected_bytes)
-                    act_dwords = struct.unpack("4I", actual_bytes)
+                    exp_fp16 = np.frombuffer(expected_bytes, dtype=np.float16)
+                    act_fp16 = np.frombuffer(actual_bytes, dtype=np.float16)
                     status = "OK  " if match else "FAIL"
-                    print(f"  {status} tid={tid:3d}  LR_off={offset:5d}  "
-                          f"exp={exp_dwords}  act={act_dwords}")
+                    print(f"  {status} lane={lane:3d}  r={r:2d} c={c:2d}  "
+                          f"LR_off={lr_offset:5d}  out_off={out_off:5d}")
+                    if not match:
+                        print(f"    expected: {exp_fp16}")
+                        print(f"    actual:   {act_fp16}")
 
                 if not match:
                     errors += 1
