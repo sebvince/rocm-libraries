@@ -96,18 +96,19 @@ def generate_gra_lra_asm(cfg, gra_only=False):
     return combined_asm, tileInfoA, tileInfoB, kernel
 
 
-def generate_integration_kernel(gra_lra_asm, tileInfoA, gra_only=False):
+def generate_integration_kernel(gra_lra_asm, tileInfoA, gra_only=False, wave_id=0):
     """Generate a full kernel that:
     1. Loads kernargs (input_ptr, output_ptr, strideA, strideB)
     2. Runs GRA+LRA offset computation
     3. Sets up SRD for buffer_load
     4. buffer_load_dwordx4 offen lds (GRA offset -> LDS write)
     5. s_barrier
-    6. ds_read_b128 (LRA offset or linear tid*16 -> VGPRs)
-    7. flat_store_dwordx4 (VGPRs -> output buffer)
+    6. ds_read_b128 × 2 (LRA offsets [0] and [1]) or linear tid*16 dump
+    7. flat_store_dwordx4 to output (single subtile: 16 × depth_u)
 
-    When gra_only=True, ds_read uses tid*16 to linearly dump the entire LDS,
-    showing how GRA arranged data. 256 threads × 16B = 4096B = full LDS.
+    Normal mode: selected wave exports a 16×64 subtile using both LR offsets.
+      1st store at c = (laneId/16)*8, 2nd store at c+32 → fills all 64 columns.
+    gra_only: linear LDS dump (32×64), all threads.
     """
     # Find highest register indices in the GRA/LRA asm
     vgpr_indices = set(int(m) for m in re.findall(r'\bv(\d+)\b', gra_lra_asm))
@@ -119,8 +120,9 @@ def generate_integration_kernel(gra_lra_asm, tileInfoA, gra_only=False):
 
     # GRA offset register for matrix A (first/only one)
     gra_offset_reg = tileInfoA.sharedVgprGROffset[0]
-    # LRA offset register for matrix A (first of numLRPerSubtile)
-    lra_offset_reg = tileInfoA.sharedVgprLROffset[0]
+    # LRA offset registers for matrix A (two per subtile)
+    lra_offset_reg0 = tileInfoA.sharedVgprLROffset[0]
+    lra_offset_reg1 = tileInfoA.sharedVgprLROffset[1]
 
     # ds_read_b128 destination must be 4-aligned
     if next_v % 4 != 0:
@@ -158,10 +160,15 @@ def generate_integration_kernel(gra_lra_asm, tileInfoA, gra_only=False):
     lds_size = INTEGRATION_CFG.mt_a * INTEGRATION_CFG.depth_u * BPE
 
     # Build step 5+6 asm: ds_read + output store
+    # Output row stride (in bytes): depth_u columns * BPE
     stride_bytes = INTEGRATION_CFG.depth_u * BPE  # 64*2 = 128
     stride_shift = stride_bytes.bit_length() - 1   # 7  (r << 7 = r * 128)
-    col_bytes = 8 * BPE                           # 16 elements * 2 = 32
-    col_shift = col_bytes.bit_length() - 1         # 5  ((laneId/16) << 5 = c_bytes)
+    # Each ds_read_b128 loads 8 fp16 elements; c = (laneId/16)*8
+    # c_bytes = (laneId/16) * 8 * BPE = (laneId/16) * 16
+    col_bytes = 8 * BPE                            # 8 elements * 2 = 16
+    col_shift = col_bytes.bit_length() - 1         # 4  ((laneId>>4) << 4)
+    # 2nd LR offset writes 32 elements (columns) further
+    col2_offset_bytes = 32 * BPE                   # 32 * 2 = 64
 
     if gra_only:
         step56_asm = f"""\
@@ -177,26 +184,40 @@ def generate_integration_kernel(gra_lra_asm, tileInfoA, gra_only=False):
   flat_store_dwordx4 v[{addr_lo}:{addr_hi}], v[{data0}:{data0+3}]"""
     else:
         step56_asm = f"""\
-  // ---- 5. ds_read using LRA offset ----
-#   v_lshlrev_b32 v{lra_offset_reg}, 4, v0               // byte offset = tid * 16
-  ds_read_b128 v[{data0}:{data0+3}], v{lra_offset_reg}
-    #s_trap 1
-  s_waitcnt lgkmcnt(0)
-
-  // ---- 6. Write to output: wave 0 only (waveId = threadId / 64) ----
-  // r = laneId % 16,  c = (laneId / 16) * 16
-  // byte_offset = r * {stride_bytes} + c * {BPE}
-  v_cmp_gt_u32 vcc, 64, v0                   // wave 0 only (threadId < 64)
+  // ---- 5+6. Subtile export: wave {wave_id}, dual ds_read (LR[0] + LR[1]) ----
+  // Select wave {wave_id} only (waveId = threadId / 64)
+  v_lshrrev_b32 v{tmp}, 6, v0                    // waveId
+  v_cmp_eq_u32 vcc, {wave_id}, v{tmp}
   s_and_saveexec_b64 s[{exec_save}:{exec_save+1}], vcc
-  v_and_b32 v{tmp}, 0xF, v0                  // r = laneId % 16
-  v_lshlrev_b32 v{tmp}, {stride_shift}, v{tmp}  // r * {stride_bytes}
-  v_lshrrev_b32 v{tmp2}, 4, v0               // laneId / 16
-  v_lshlrev_b32 v{tmp2}, {col_shift}, v{tmp2}   // c_bytes = (laneId/16) * {col_bytes}
-  v_add_u32 v{tmp}, v{tmp}, v{tmp2}          // byte_offset
-  v_mov_b32 v{tmp2}, s[7]                    // output_ptr hi
+
+  // Compute output base offset for 16×64 subtile
+  // laneId = threadId % 64
+  // r = laneId % 16,  c = (laneId / 16) * 8
+  // byte_offset = r * {stride_bytes} + c * {BPE}
+  v_and_b32 v{tmp}, 0x3F, v0                     // laneId = threadId % 64
+  v_and_b32 v{tmp2}, 0xF, v{tmp}                 // r = laneId % 16
+  v_lshlrev_b32 v{tmp2}, {stride_shift}, v{tmp2} // r * {stride_bytes}
+  v_lshrrev_b32 v{tmp}, 4, v{tmp}                // laneId / 16  (0-3)
+  v_lshlrev_b32 v{tmp}, {col_shift}, v{tmp}      // c_bytes = (laneId/16) * {col_bytes}
+  v_add_u32 v{tmp}, v{tmp}, v{tmp2}              // byte_offset_base
+
+  // 1st read+store: LR offset[0] → columns 0-7, 8-15, 16-23, 24-31
+  ds_read_b128 v[{data0}:{data0+3}], v{lra_offset_reg0}
+  s_waitcnt lgkmcnt(0)
+  v_mov_b32 v{tmp2}, s[7]                        // output_ptr hi
   v_add_co_u32 v{addr_lo}, vcc, s[6], v{tmp}
   v_addc_co_u32 v{addr_hi}, vcc, v{tmp2}, 0, vcc
   flat_store_dwordx4 v[{addr_lo}:{addr_hi}], v[{data0}:{data0+3}]
+  s_waitcnt vmcnt(0)
+
+  // 2nd read+store: LR offset[1] → columns +32 (32-39, 40-47, 48-55, 56-63)
+  ds_read_b128 v[{data0}:{data0+3}], v{lra_offset_reg1}
+  s_waitcnt lgkmcnt(0)
+  v_add_u32 v{tmp}, v{tmp}, {col2_offset_bytes}  // shift by 32 elements ({col2_offset_bytes} bytes)
+  v_add_co_u32 v{addr_lo}, vcc, s[6], v{tmp}
+  v_addc_co_u32 v{addr_hi}, vcc, v{tmp2}, 0, vcc // tmp2 still has output_ptr hi
+  flat_store_dwordx4 v[{addr_lo}:{addr_hi}], v[{data0}:{data0+3}]
+
   s_or_b64 exec, exec, s[{exec_save}:{exec_save+1}]"""
 
     # Kernarg layout:
@@ -327,16 +348,14 @@ amdhsa.kernels:
 # GPU execution
 # ---------------------------------------------------------------------------
 
-def run_integration_on_gpu(co_path, input_data, cfg):
+def run_integration_on_gpu(co_path, input_data, cfg, output_size=None):
     """Launch integration kernel and return output buffer.
 
     Args:
-        co_path:    Path to assembled .co file
-        input_data: numpy array of fp16 values (mt_a * depthU elements)
-        cfg:        TileConfig
-
-    Returns:
-        output bytes (NUM_THREADS * 16 bytes)
+        co_path:     Path to assembled .co file
+        input_data:  numpy array of fp16 values (mt_a * depthU elements)
+        cfg:         TileConfig
+        output_size: output buffer size in bytes (default: mt_a * depth_u * BPE)
     """
     hip_check(hip.hipInit(0))
 
@@ -345,7 +364,8 @@ def run_integration_on_gpu(co_path, input_data, cfg):
 
     input_bytes = input_data.tobytes()
     input_size = len(input_bytes)
-    output_size = NUM_THREADS * 16  # 16 bytes per thread
+    if output_size is None:
+        output_size = cfg.mt_a * cfg.depth_u * BPE
 
     lds_size = cfg.mt_a * cfg.depth_u * BPE
 
@@ -413,13 +433,9 @@ def print_matrix_fp16(label, data_bytes, rows, cols):
         print(f"[{r:3d}] {vals}")
 
 
-def rebuild_output_matrix(output_bytes, cfg):
-    """Return output as mt_a x depth_u bytes.
-
-    Both modes write directly to matrix positions in the output buffer,
-    so the raw bytes are the matrix in row-major order.
-    """
-    total = cfg.mt_a * cfg.depth_u * BPE
+def rebuild_output_matrix(output_bytes, rows, cols):
+    """Return output as rows x cols bytes (raw matrix in row-major order)."""
+    total = rows * cols * BPE
     return bytes(output_bytes[:total])
 
 
@@ -508,6 +524,8 @@ if __name__ == "__main__":
                         help="Display input and output as fp16 matrices (mt_a x depth_u)")
     parser.add_argument("--gra-only", action="store_true",
                         help="Skip LRA; read back from LDS using GRA offset to see how GRA loads data into LDS")
+    parser.add_argument("--wave", type=int, default=0, choices=[0, 1, 2, 3],
+                        help="Which wave exports the subtile (default: 0)")
     args = parser.parse_args()
 
     cfg = INTEGRATION_CFG
@@ -521,7 +539,9 @@ if __name__ == "__main__":
           f"LR regs={tileInfoA.sharedVgprLROffset}, "
           f"numGR={tileInfoA.numGRPerSubtile}, numLR={tileInfoA.numLRPerSubtile}")
     if args.gra_only:
-        print("  Mode: GRA-only (ds_read uses GRA offset, LRA skipped)")
+        print("  Mode: GRA-only (ds_read at tid*16, LRA skipped)")
+    else:
+        print(f"  Mode: Subtile export (wave {args.wave}, 16×{cfg.depth_u} output)")
 
     if args.debug:
         print("\n--- Combined GRA+LRA Assembly ---")
@@ -533,7 +553,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        full_asm = generate_integration_kernel(combined_asm, tileInfoA, gra_only=args.gra_only)
+        full_asm = generate_integration_kernel(combined_asm, tileInfoA,
+                                              gra_only=args.gra_only, wave_id=args.wave)
         print(full_asm)
         co_path = os.path.join(tmp_dir, "integration_test.co")
         asm_path = os.path.join(tmp_dir, "integration_test.s")
@@ -553,15 +574,25 @@ if __name__ == "__main__":
         input_data = np.arange(0, num_elements, dtype=np.float16)
         input_bytes = input_data.tobytes()
 
+        # Output dimensions
+        subtile_rows = cfg.mt_a // 2  # 16 (subtile = half the macro tile)
+        if args.gra_only:
+            out_rows, out_cols = cfg.mt_a, cfg.depth_u       # 32×64
+        else:
+            out_rows, out_cols = subtile_rows, cfg.depth_u   # 16×64
+        output_size = out_rows * out_cols * BPE
+
         # Run
         sys.stdout.flush()
-        output_bytes = run_integration_on_gpu(co_path, input_data, cfg)
+        output_bytes = run_integration_on_gpu(co_path, input_data, cfg,
+                                              output_size=output_size)
 
         if args.show_matrices:
             print_matrix_fp16("Input", input_bytes, cfg.mt_a, cfg.depth_u)
-            out_matrix_bytes = rebuild_output_matrix(output_bytes, cfg)
-            label = "Output (GRA layout in LDS)" if args.gra_only else "Output"
-            print_matrix_fp16(label, out_matrix_bytes, cfg.mt_a, cfg.depth_u)
+            out_matrix_bytes = rebuild_output_matrix(output_bytes, out_rows, out_cols)
+            label = "Output (GRA layout in LDS)" if args.gra_only \
+                    else f"Output (wave {args.wave} subtile)"
+            print_matrix_fp16(label, out_matrix_bytes, out_rows, out_cols)
 
         # Verify
         errors = 0
@@ -571,7 +602,6 @@ if __name__ == "__main__":
             actual = output_bytes[:lds_size]
             expected = input_bytes[:lds_size]
             if actual != expected:
-                # Find first mismatch for debugging
                 for i in range(0, lds_size, LOAD_WIDTH):
                     a = actual[i:i + LOAD_WIDTH]
                     e = expected[i:i + LOAD_WIDTH]
@@ -585,35 +615,42 @@ if __name__ == "__main__":
                             print(f"    expected: {exp_fp16}")
                             print(f"    actual:   {act_fp16}")
         else:
-            # Normal mode: wave 0 writes to matrix positions
-            # r = laneId % 16, c = (laneId / 16) * 16
-            # byte_offset = r * stride_bytes + c * BPE
+            # Normal mode: selected wave writes 16×64 subtile
+            # Two stores per lane: LR[0] at c, LR[1] at c+32
+            # r = laneId % 16, c = (laneId / 16) * 8
             stride_bytes = cfg.depth_u * BPE
-            for lane in range(WAVESIZE):  # wave 0 only
+            base_tid = args.wave * WAVESIZE
+            for lane in range(WAVESIZE):
+                tid = base_tid + lane
                 r = lane % 16
-                c = (lane // 16) * 16
-                out_off = r * stride_bytes + c * BPE
-                lr_offset = compute_expected_lr_offset(lane, cfg, tileInfoA)[0]
+                c_base = (lane // 16) * 8
 
-                expected_bytes = input_bytes[lr_offset:lr_offset + LOAD_WIDTH]
-                actual_bytes = output_bytes[out_off:out_off + LOAD_WIDTH]
+                # Check both LR offsets
+                for lr_idx, c_off in enumerate([0, 32]):
+                    c = c_base + c_off
+                    out_off = r * stride_bytes + c * BPE
+                    lr_offset = compute_expected_lr_offset(tid, cfg, tileInfoA)[lr_idx]
 
-                match = actual_bytes == expected_bytes
+                    expected_bytes = input_bytes[lr_offset:lr_offset + LOAD_WIDTH]
+                    actual_bytes = output_bytes[out_off:out_off + LOAD_WIDTH]
 
-                if args.debug or not match:
-                    exp_fp16 = np.frombuffer(expected_bytes, dtype=np.float16)
-                    act_fp16 = np.frombuffer(actual_bytes, dtype=np.float16)
-                    status = "OK  " if match else "FAIL"
-                    print(f"  {status} lane={lane:3d}  r={r:2d} c={c:2d}  "
-                          f"LR_off={lr_offset:5d}  out_off={out_off:5d}")
+                    match = actual_bytes == expected_bytes
+
+                    if args.debug or not match:
+                        exp_fp16 = np.frombuffer(expected_bytes, dtype=np.float16)
+                        act_fp16 = np.frombuffer(actual_bytes, dtype=np.float16)
+                        status = "OK  " if match else "FAIL"
+                        print(f"  {status} lane={lane:3d} LR[{lr_idx}]  r={r:2d} c={c:2d}  "
+                              f"LR_off={lr_offset:5d}  out_off={out_off:5d}")
+                        if not match:
+                            print(f"    expected: {exp_fp16}")
+                            print(f"    actual:   {act_fp16}")
+
                     if not match:
-                        print(f"    expected: {exp_fp16}")
-                        print(f"    actual:   {act_fp16}")
+                        errors += 1
 
-                if not match:
-                    errors += 1
-
-        print(f"\n  Result: {NUM_THREADS} threads, {errors} errors")
+        total_checks = WAVESIZE * 2 if not args.gra_only else NUM_THREADS
+        print(f"\n  Result: {total_checks} checks, {errors} errors")
         if errors > 0:
             print("  FAILED")
             sys.exit(1)
