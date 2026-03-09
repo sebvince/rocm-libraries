@@ -156,12 +156,12 @@ def compute_expected_lr_subtile(subtileId0, cfg, tileInfo):
 # Tile configs to test
 TILE_CONFIGS = [
     # 2x2 configs
-    # TileConfig(mt_a=256, mt_b=256, depth_u=64),
-    # TileConfig(mt_a=96, mt_b=256, depth_u=64),
+    TileConfig(mt_a=256, mt_b=256, depth_u=64),
+    TileConfig(mt_a=96, mt_b=256, depth_u=64),
     # # 1x4 configs
-    # TileConfig(mt_a=80, mt_b=64, depth_u=64),
+    TileConfig(mt_a=80, mt_b=64, depth_u=64),
     # 4x1 configs
-    TileConfig(mt_a=64, mt_b=80, depth_u=64),
+    # TileConfig(mt_a=64, mt_b=80, depth_u=64),
 ]
 
 
