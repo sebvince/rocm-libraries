@@ -27,7 +27,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
   MFMAInstruction, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
   SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SWaitCnt, SWaitAlu, \
-  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpEQU32, VCndMaskB32, VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64, VSubU32, VPermlane16SwapB32
+  SLongBranchPositive, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpXEqU32, VCndMaskB32, VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64, VSubU32, VPermlane16SwapB32
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
 # Store various scheduling info
@@ -667,7 +667,7 @@ def graTileAssignment(writer, kernel, useSwizzling=True):
     module.addComment0("Swizzling")
     module.add(VLShiftRightB32(dst=vgpr(lds_row_id), shiftHex=hex(numRowsPerLDSBanks.bit_length()-1), src=vgpr(row_id), comment="lds row id"))
     module.add(VAndB32(dst=vgpr(tmp), src0=vgpr(lds_row_id), src1=hex(1), comment="lds row id % 2"))
-    module.add(VCmpEQU32(dst=VCC(), src0=0, src1=vgpr(tmp), comment="lds row id % 2 == 0 ?"))
+    module.add(VCmpXEqU32(dst=VCC(), src0=0, src1=vgpr(tmp), comment="lds row id % 2 == 0 ?"))
     module.add(VMovB32(dst=vgpr(col_id), src=vgpr(col_id), dpp=DPPModifiers(quad_perm=[1,0,3,2]), comment="swap col_id pairs for swizzling"))
     module.add(SMovB64(dst=EXEC(), src=-1))
     module.addComment0("Rotation")
