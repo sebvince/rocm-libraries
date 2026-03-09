@@ -466,18 +466,17 @@ def lraTileAssignment(writer, kernel):
   bytes_loaded = wavesize * loadWidth
   numRowsPerWave = wavesize // blockSize
   
-  
   swizzling = True
   if swizzling:
     # Get lds row id
     module.add(VLShiftRightB32(dst=vgpr(rotation), shiftHex=hex(numRowsPerLDSBanks.bit_length()-1), src=vgpr(lane16), comment="lds_row_id"))
     module.add(VLShiftRightB32(dst=vgpr(rotation), shiftHex=hex(1), src=vgpr(rotation), comment="(lds_row_id //2 )"))
+    # Calculate rotation
     module.add(VLShiftLeftB32(dst=vgpr(rotation), shiftHex=hex(1), src=vgpr(rotation), comment="rotation=(lds_row_id //2) * 2"))
-    
     # Apply rotation on Col
     module.add(VAddU32(dst=vgpr(colOffset), src0=vgpr(rotation), src1=vgpr(lane16Group), comment="colOffset = rotation + lane16Group"))
     module.add(VAndB32(dst=vgpr(colOffset), src0=vgpr(colOffset), src1=hex(blockSize-1), comment="colOffset = colOffset % blockSize"))
-    #Swizzle col
+    # Swizzle col
     setExecMask(module, writer, 0x33333333, 0x33333333)
     module.add(VPermlane16SwapB32(dst=vgpr(colOffset), src=vgpr(colOffset), comment="apply swizzling"))  
     setExecMask(module, writer, -1, -1)
