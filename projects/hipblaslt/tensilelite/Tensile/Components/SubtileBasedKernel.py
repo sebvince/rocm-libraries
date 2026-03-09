@@ -397,9 +397,16 @@ class TileInfo:
 
 
 
-def _applySplitOffset(module, writer, tileInfo, lane16, numRowsPerWave, offset):
+def _applySplitOffset(module, writer, kernel, tileInfo, lane16):
   tc = tileInfo.tc
   if tileInfo.loadRatioGR <= 1.0:
+    wavesize = kernel["WavefrontSize"]
+    depthUBytes = kernel["DepthU"] * tileInfo.bpe
+    loadWidth = tileInfo.mmaTileShape[0] * tileInfo.mmaTileShape[1] * tileInfo.bpe // wavesize
+    blockSize = depthUBytes // loadWidth
+    numRowsPerWave = wavesize // blockSize
+    offset = wavesize * loadWidth // 2  # bytes_loaded // 2
+
     splitOffset = writer.vgprPool.checkOut(1)
     module.add(VLShiftRightB32(dst=vgpr(splitOffset), shiftHex=hex((numRowsPerWave//2).bit_length()-1), src=vgpr(lane16), comment="%s: check 2nd half wave"%tc))
     module.add(VLShiftLeftB32(dst=vgpr(splitOffset), shiftHex=hex(offset.bit_length()-1), src=vgpr(splitOffset), comment="%s: x splitOffset"%tc))
@@ -407,13 +414,19 @@ def _applySplitOffset(module, writer, tileInfo, lane16, numRowsPerWave, offset):
       module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src1=vgpr(splitOffset), comment="%s: +=splitOffset"%tc))
     writer.vgprPool.checkIn(splitOffset)
 
-def _computeLROffset(module, tileInfo, colOffset, rowOffset, numMFMACols, block_size, loadWidth):
+def _computeLROffset(module, kernel, tileInfo, colOffset, rowOffset):
   tc = tileInfo.tc
+  wavesize = kernel["WavefrontSize"]
+  depthUBytes = kernel["DepthU"] * tileInfo.bpe
+  loadWidth = tileInfo.mmaTileShape[0] * tileInfo.mmaTileShape[1] * tileInfo.bpe // wavesize
+  numMFMACols = tileInfo.mmaTileShape[1] * tileInfo.bpe // loadWidth  # TN case only
+  blockSize = depthUBytes // loadWidth
+
   module.add(VMovB32(dst=vgpr(tileInfo.sharedVgprLROffset[0]), src=vgpr(colOffset), comment="%s: laneId"%tc))
   for vgprId in range(1, len(tileInfo.sharedVgprLROffset)):
     module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfo.sharedVgprLROffset[vgprId-1]), src1=hex(numMFMACols), comment="%s: colOffset for MFMA %u of subtile"%(tc, vgprId)))
-    module.add(VAndB32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src1=hex(block_size-1), comment="%s: colOffset = colOffset %% block_size"%tc))
-  
+    module.add(VAndB32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src1=hex(blockSize-1), comment="%s: colOffset = colOffset %% block_size"%tc))
+
   for vgprId in range(0, len(tileInfo.sharedVgprLROffset)):
     module.add(VLShiftLeftB32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), shiftHex=hex(loadWidth.bit_length()-1), src=vgpr(tileInfo.sharedVgprLROffset[vgprId]), comment="%s: colOffset*loadWidth"%tc))
     module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfo.sharedVgprLROffset[vgprId]), src1=vgpr(rowOffset), comment="%s: row + col"%tc))
@@ -515,13 +528,12 @@ def lraTileAssignment(writer, kernel):
   depthUBytes = depthU * bpeA
   wavesize = kernel["WavefrontSize"]
 
-  mi_m = 16 #TODO . MFMA M/N
+  mi_m = tileInfoA.mmaTileShape[0]
   loadWidth = tileInfoA.mmaTileShape[0]*tileInfoA.mmaTileShape[1]*tileInfoA.bpe//wavesize
   ldsRowBankSize = wavesize*4
   numRowsPerLDSBanks = ldsRowBankSize // depthUBytes
   assert tileInfoA.mmaTileShape == tileInfoB.mmaTileShape, "Expect same MMA tile shape for A and B"
 
-  numMFMACols = tileInfoA.mmaTileShape[1]*tileInfoA.bpe // loadWidth # TN case only
   blockSize = depthUBytes // loadWidth
  
   tmpVgpr = writer.vgprPool.checkOut(8)                                                                                                                                                                                                                                           
@@ -532,9 +544,6 @@ def lraTileAssignment(writer, kernel):
   module.add(VLShiftRightB32(dst=vgpr(lane16Group), shiftHex=hex(mi_m.bit_length()-1), src=vgpr(lane16Group), comment="lane16Group"))
   module.add(VAndB32(dst=vgpr(lane16), src0=vgpr("Serial"), src1=mi_m-1, comment="laneId % 16"))
 
-  bytes_loaded = wavesize * loadWidth
-  numRowsPerWave = wavesize // blockSize
-  
   swizzling = True
   if swizzling:
     # Get lds row id
@@ -555,28 +564,27 @@ def lraTileAssignment(writer, kernel):
   # Row
   module.add(VLShiftLeftB32(dst=vgpr(rowOffset), shiftHex=hex(depthUBytes.bit_length()-1), src=vgpr(lane16), comment="offsetRow = depthUBytes*lane16"))
 
-  
-  _computeLROffset(module, tileInfoA, colOffset, rowOffset, numMFMACols, blockSize, loadWidth)
-  _computeLROffset(module, tileInfoB, colOffset, rowOffset, numMFMACols, blockSize, loadWidth)
+  # Calculate LR offset for A and B
+  _computeLROffset(module, kernel, tileInfoA, colOffset, rowOffset)
+  _computeLROffset(module, kernel, tileInfoB, colOffset, rowOffset)
 
   # Apply wavesplit offset separately on A & B as they are different for 1x4 and 4x1
-  _applySplitOffset(module, writer, tileInfoA, lane16, numRowsPerWave, bytes_loaded//2)
-  _applySplitOffset(module, writer, tileInfoB, lane16, numRowsPerWave, bytes_loaded//2)
+  _applySplitOffset(module, writer, kernel, tileInfoA, lane16)
+  _applySplitOffset(module, writer, kernel, tileInfoB, lane16)
 
   writer.vgprPool.checkIn(tmpVgpr)
 
-  # Wave partitioning
+  # Wave partitioning (e.g. 2x2 or 4x1/1x4)
   _lraWavePartitioning(module, writer, kernel)
 
   # Apply global offset on B (B data follows A in LDS).
   MT0A = tileInfoA.globalMMATileGrid[0] * tileInfoA.mmaTileShape[0]
   tmpSgpr = writer.vgprPool.checkOut(1)
-  module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0A*depthUBytes), comment=""))
+  module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0A*depthUBytes), comment="LDS offset for B matrix"))
   for vgprId in range(len(tileInfoB.sharedVgprLROffset)):
     module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src1=sgpr(tmpSgpr), comment="B matrix offset : mt0*depthUBytes"))
   writer.vgprPool.checkIn(tmpSgpr)
 
-  print(tileInfoA)
   return module
 
 
