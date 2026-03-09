@@ -21,7 +21,6 @@
 import ctypes
 import os
 import re
-import struct
 import sys
 import tempfile
 
@@ -44,9 +43,6 @@ if HAS_HIP:
     from hip import hip  # type: ignore
 
 from Tensile.Components.SubtileBasedKernel import graTileAssignment, lraTileAssignment
-
-# Import reference offset computation for LRA reads
-from test_lraTileAssignment import compute_expected_lr_offset
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +92,7 @@ def generate_gra_lra_asm(cfg, gra_only=False):
     return combined_asm, tileInfoA, tileInfoB, kernel
 
 
-def generate_integration_kernel(gra_lra_asm, tileInfoA, gra_only=False, wave_id=0):
+def generate_integration_kernel(gra_lra_asm, tileInfoA, gra_only=False, wave_id=1):
     """Generate a full kernel that:
     1. Loads kernargs (input_ptr, output_ptr, strideA, strideB)
     2. Runs GRA+LRA offset computation
@@ -439,6 +435,15 @@ def rebuild_output_matrix(output_bytes, rows, cols):
     return bytes(output_bytes[:total])
 
 
+def wave_to_input_row_start(wave_id, subtile_rows):
+    """Map wave ID to the starting input row for its subtile.
+
+    Wave 0, 2 → rows 0  (input rows 0..subtile_rows-1)
+    Wave 1, 3 → rows 16 (input rows subtile_rows..2*subtile_rows-1)
+    """
+    return (wave_id % 2) * subtile_rows
+
+
 # ---------------------------------------------------------------------------
 # Pytest tests
 # ---------------------------------------------------------------------------
@@ -446,17 +451,18 @@ def rebuild_output_matrix(output_bytes, rows, cols):
 @pytest.mark.skipif(not HAS_HIP, reason="HIP Python bindings not available")
 class TestGraLraIntegration:
 
-    @pytest.fixture
-    def integration_env(self, tmp_path):
-        """Set up the integration test: generate asm, assemble, prepare input."""
+    @pytest.fixture(params=[0, 1, 2, 3], ids=lambda w: f"wave{w}")
+    def integration_env(self, tmp_path, request):
+        """Set up the integration test for a single wave's subtile."""
         cfg = INTEGRATION_CFG
+        wave_id = request.param
 
         combined_asm, tileInfoA, tileInfoB, kernel = generate_gra_lra_asm(cfg)
-        full_asm = generate_integration_kernel(combined_asm, tileInfoA)
-        print(full_asm)
+        full_asm = generate_integration_kernel(combined_asm, tileInfoA,
+                                               gra_only=False, wave_id=wave_id)
 
-        co_path = str(tmp_path / "integration_test.co")
-        asm_path = str(tmp_path / "integration_test.s")
+        co_path = str(tmp_path / f"integration_wave{wave_id}.co")
+        asm_path = str(tmp_path / f"integration_wave{wave_id}.s")
         with open(asm_path, "w") as f:
             f.write(full_asm)
 
@@ -475,41 +481,54 @@ class TestGraLraIntegration:
             input_data=input_data,
             tileInfoA=tileInfoA,
             tileInfoB=tileInfoB,
+            wave_id=wave_id,
         )
 
     def test_gra_to_lds_to_lra_roundtrip(self, integration_env):
-        """Verify: input -> GRA buffer_load lds -> LRA ds_read -> output matches input.
+        """Verify: input -> GRA buffer_load lds -> LRA ds_read -> output matches input subtile.
 
-        Since stride == depthU, GRA offsets == LDS byte addresses, so LDS is an
-        identical copy of the input.  Each thread reads 16 bytes from LDS at its
-        LRA offset, so output[tid] should equal input[LRA_offset:LRA_offset+16].
+        Each wave exports a 16×64 subtile. Wave 0,2 → input rows 0-15;
+        wave 1,3 → input rows 16-31. Output should match exactly.
         """
         env = integration_env
         cfg = env.cfg
         input_bytes = env.input_data.tobytes()
         sys.stdout.flush()
 
+        subtile_rows = cfg.mt_a // 2  # 16
+        out_rows, out_cols = subtile_rows, cfg.depth_u
+        output_size = out_rows * out_cols * BPE
+        stride_bytes = cfg.depth_u * BPE
+
         # Run kernel on GPU
-        output_bytes = run_integration_on_gpu(env.co_path, env.input_data, cfg)
+        output_bytes = run_integration_on_gpu(env.co_path, env.input_data, cfg,
+                                              output_size=output_size)
 
-        # Verify: for each thread, output == input[LRA_offset : LRA_offset + 16]
+        # Expected: input rows for this wave's subtile
+        row_start = wave_to_input_row_start(env.wave_id, subtile_rows)
+        subtile_size = subtile_rows * stride_bytes
+        expected = input_bytes[row_start * stride_bytes :
+                               row_start * stride_bytes + subtile_size]
+        actual = output_bytes[:subtile_size]
+
+        # Per-row comparison for clear error reporting
         errors = 0
-        for tid in range(NUM_THREADS):
-            lr_offset = compute_expected_lr_offset(tid, cfg, env.tileInfoA)[0]
-
-            expected_bytes = input_bytes[lr_offset:lr_offset + LOAD_WIDTH]
-            actual_bytes = output_bytes[tid * LOAD_WIDTH:(tid + 1) * LOAD_WIDTH]
-
-            if actual_bytes != expected_bytes:
+        for r in range(subtile_rows):
+            row_off = r * stride_bytes
+            exp_row = expected[row_off:row_off + stride_bytes]
+            act_row = actual[row_off:row_off + stride_bytes]
+            if exp_row != act_row:
                 errors += 1
-                if errors <= 10:
-                    exp_dwords = struct.unpack("4I", expected_bytes)
-                    act_dwords = struct.unpack("4I", actual_bytes)
-                    print(f"  MISMATCH tid={tid}: LR_offset={lr_offset}")
-                    print(f"    expected: {exp_dwords}")
-                    print(f"    actual:   {act_dwords}")
+                if errors <= 16:
+                    exp_fp16 = np.frombuffer(exp_row, dtype=np.float16)
+                    act_fp16 = np.frombuffer(act_row, dtype=np.float16)
+                    print(f"  MISMATCH wave {env.wave_id} row {r} "
+                          f"(input row {row_start + r}):")
+                    print(f"    expected: {exp_fp16}")
+                    print(f"    actual:   {act_fp16}")
 
-        assert errors == 0, f"{errors}/{NUM_THREADS} threads produced wrong output"
+        assert errors == 0, (f"Wave {env.wave_id}: {errors}/{subtile_rows} rows "
+                             f"mismatch (input rows {row_start}..{row_start + subtile_rows - 1})")
 
 
 # ---------------------------------------------------------------------------
@@ -524,8 +543,8 @@ if __name__ == "__main__":
                         help="Display input and output as fp16 matrices (mt_a x depth_u)")
     parser.add_argument("--gra-only", action="store_true",
                         help="Skip LRA; read back from LDS using GRA offset to see how GRA loads data into LDS")
-    parser.add_argument("--wave", type=int, default=0, choices=[0, 1, 2, 3],
-                        help="Which wave exports the subtile (default: 0)")
+    parser.add_argument("--wave", default="all",
+                        help="Which wave exports the subtile: 0-3 or 'all' (default: all)")
     args = parser.parse_args()
 
     cfg = INTEGRATION_CFG
@@ -538,6 +557,12 @@ if __name__ == "__main__":
     print(f"\n  TileInfoA: GR regs={tileInfoA.sharedVgprGROffset}, "
           f"LR regs={tileInfoA.sharedVgprLROffset}, "
           f"numGR={tileInfoA.numGRPerSubtile}, numLR={tileInfoA.numLRPerSubtile}")
+    # Parse --wave: single wave (0-3) or "all"
+    if args.wave == "all":
+        wave_list = [0, 1, 2, 3]
+    else:
+        wave_list = [int(args.wave)]
+
     if args.gra_only:
         print("  Mode: GRA-only (ds_read at tid*16, LRA skipped)")
     else:
@@ -552,52 +577,46 @@ if __name__ == "__main__":
         print("HIP not available - cannot run GPU test")
         sys.exit(1)
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        full_asm = generate_integration_kernel(combined_asm, tileInfoA,
-                                              gra_only=args.gra_only, wave_id=args.wave)
-        print(full_asm)
-        co_path = os.path.join(tmp_dir, "integration_test.co")
-        asm_path = os.path.join(tmp_dir, "integration_test.s")
-        with open(asm_path, "w") as f:
-            f.write(full_asm)
+    # Create input: 0, 1, 2, ... for easy debugging
+    num_elements = cfg.mt_a * cfg.depth_u
+    input_data = np.arange(0, num_elements, dtype=np.float16)
+    input_bytes = input_data.tobytes()
 
-        if args.debug:
-            print("\n--- Full Kernel Assembly ---")
+    subtile_rows = cfg.mt_a // 2  # 16 (subtile = half the macro tile)
+    total_errors = 0
+
+    if args.gra_only:
+        # GRA-only: single run, linear LDS dump
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            full_asm = generate_integration_kernel(combined_asm, tileInfoA,
+                                                  gra_only=True)
             print(full_asm)
-            print("--- End ---\n")
+            co_path = os.path.join(tmp_dir, "integration_test.co")
+            asm_path = os.path.join(tmp_dir, "integration_test.s")
+            with open(asm_path, "w") as f:
+                f.write(full_asm)
 
-        assemble_kernel(full_asm, co_path)
-        print(f"  Assembled: {co_path}")
+            if args.debug:
+                print("\n--- Full Kernel Assembly ---")
+                print(full_asm)
+                print("--- End ---\n")
 
-        # Create input: 0, 1, 2, ... for easy debugging
-        num_elements = cfg.mt_a * cfg.depth_u
-        input_data = np.arange(0, num_elements, dtype=np.float16)
-        input_bytes = input_data.tobytes()
+            assemble_kernel(full_asm, co_path)
+            print(f"  Assembled: {co_path}")
 
-        # Output dimensions
-        subtile_rows = cfg.mt_a // 2  # 16 (subtile = half the macro tile)
-        if args.gra_only:
-            out_rows, out_cols = cfg.mt_a, cfg.depth_u       # 32×64
-        else:
-            out_rows, out_cols = subtile_rows, cfg.depth_u   # 16×64
-        output_size = out_rows * out_cols * BPE
+            out_rows, out_cols = cfg.mt_a, cfg.depth_u
+            output_size = out_rows * out_cols * BPE
 
-        # Run
-        sys.stdout.flush()
-        output_bytes = run_integration_on_gpu(co_path, input_data, cfg,
-                                              output_size=output_size)
+            sys.stdout.flush()
+            output_bytes = run_integration_on_gpu(co_path, input_data, cfg,
+                                                  output_size=output_size)
 
-        if args.show_matrices:
-            print_matrix_fp16("Input", input_bytes, cfg.mt_a, cfg.depth_u)
-            out_matrix_bytes = rebuild_output_matrix(output_bytes, out_rows, out_cols)
-            label = "Output (GRA layout in LDS)" if args.gra_only \
-                    else f"Output (wave {args.wave} subtile)"
-            print_matrix_fp16(label, out_matrix_bytes, out_rows, out_cols)
+            if args.show_matrices:
+                print_matrix_fp16("Input", input_bytes, cfg.mt_a, cfg.depth_u)
+                out_matrix_bytes = rebuild_output_matrix(output_bytes, out_rows, out_cols)
+                print_matrix_fp16("Output (GRA layout in LDS)", out_matrix_bytes, out_rows, out_cols)
 
-        # Verify
-        errors = 0
-        if args.gra_only:
-            # Linear LDS dump: output bytes should match input bytes exactly
+            # Verify: output should match input exactly
             lds_size = cfg.mt_a * cfg.depth_u * BPE
             actual = output_bytes[:lds_size]
             expected = input_bytes[:lds_size]
@@ -606,53 +625,75 @@ if __name__ == "__main__":
                     a = actual[i:i + LOAD_WIDTH]
                     e = expected[i:i + LOAD_WIDTH]
                     if a != e:
-                        errors += 1
-                        if errors <= 10:
+                        total_errors += 1
+                        if total_errors <= 10:
                             tid = i // LOAD_WIDTH
                             exp_fp16 = np.frombuffer(e, dtype=np.float16)
                             act_fp16 = np.frombuffer(a, dtype=np.float16)
                             print(f"  MISMATCH LDS[{i}..{i+LOAD_WIDTH}] (tid={tid})")
                             print(f"    expected: {exp_fp16}")
                             print(f"    actual:   {act_fp16}")
-        else:
-            # Normal mode: selected wave writes 16×64 subtile
-            # Two stores per lane: LR[0] at c, LR[1] at c+32
-            # r = laneId % 16, c = (laneId / 16) * 8
-            stride_bytes = cfg.depth_u * BPE
-            base_tid = args.wave * WAVESIZE
-            for lane in range(WAVESIZE):
-                tid = base_tid + lane
-                r = lane % 16
-                c_base = (lane // 16) * 8
 
-                # Check both LR offsets
-                for lr_idx, c_off in enumerate([0, 32]):
-                    c = c_base + c_off
-                    out_off = r * stride_bytes + c * BPE
-                    lr_offset = compute_expected_lr_offset(tid, cfg, tileInfoA)[lr_idx]
+    else:
+        # Normal mode: test each wave
+        for wave_id in wave_list:
+            row_start = wave_to_input_row_start(wave_id, subtile_rows)
+            print(f"\n  === Wave {wave_id} (expected input rows {row_start}..{row_start + subtile_rows - 1}) ===")
 
-                    expected_bytes = input_bytes[lr_offset:lr_offset + LOAD_WIDTH]
-                    actual_bytes = output_bytes[out_off:out_off + LOAD_WIDTH]
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                full_asm = generate_integration_kernel(combined_asm, tileInfoA,
+                                                      gra_only=False, wave_id=wave_id)
+                if args.debug:
+                    print(full_asm)
 
-                    match = actual_bytes == expected_bytes
+                co_path = os.path.join(tmp_dir, "integration_test.co")
+                asm_path = os.path.join(tmp_dir, "integration_test.s")
+                with open(asm_path, "w") as f:
+                    f.write(full_asm)
 
-                    if args.debug or not match:
-                        exp_fp16 = np.frombuffer(expected_bytes, dtype=np.float16)
-                        act_fp16 = np.frombuffer(actual_bytes, dtype=np.float16)
-                        status = "OK  " if match else "FAIL"
-                        print(f"  {status} lane={lane:3d} LR[{lr_idx}]  r={r:2d} c={c:2d}  "
-                              f"LR_off={lr_offset:5d}  out_off={out_off:5d}")
-                        if not match:
-                            print(f"    expected: {exp_fp16}")
-                            print(f"    actual:   {act_fp16}")
+                assemble_kernel(full_asm, co_path)
 
-                    if not match:
-                        errors += 1
+                out_rows, out_cols = subtile_rows, cfg.depth_u
+                output_size = out_rows * out_cols * BPE
 
-        total_checks = WAVESIZE * 2 if not args.gra_only else NUM_THREADS
-        print(f"\n  Result: {total_checks} checks, {errors} errors")
-        if errors > 0:
-            print("  FAILED")
-            sys.exit(1)
-        else:
-            print("  PASSED")
+                sys.stdout.flush()
+                output_bytes = run_integration_on_gpu(co_path, input_data, cfg,
+                                                      output_size=output_size)
+
+                if args.show_matrices:
+                    if wave_id == wave_list[0]:
+                        print_matrix_fp16("Input", input_bytes, cfg.mt_a, cfg.depth_u)
+                    out_matrix_bytes = rebuild_output_matrix(output_bytes, out_rows, out_cols)
+                    print_matrix_fp16(f"Output (wave {wave_id} subtile)", out_matrix_bytes, out_rows, out_cols)
+
+                # Verify: output should match input rows [row_start..row_start+15]
+                stride_bytes = cfg.depth_u * BPE
+                subtile_size = subtile_rows * stride_bytes
+                expected = input_bytes[row_start * stride_bytes :
+                                       row_start * stride_bytes + subtile_size]
+                actual = output_bytes[:subtile_size]
+
+                wave_errors = 0
+                if actual == expected:
+                    print(f"  PASS: output matches input rows [{row_start}..{row_start + subtile_rows - 1}]")
+                else:
+                    for r in range(subtile_rows):
+                        row_off = r * stride_bytes
+                        exp_row = expected[row_off:row_off + stride_bytes]
+                        act_row = actual[row_off:row_off + stride_bytes]
+                        if exp_row != act_row:
+                            wave_errors += 1
+                            if wave_errors <= 16:
+                                exp_fp16 = np.frombuffer(exp_row, dtype=np.float16)
+                                act_fp16 = np.frombuffer(act_row, dtype=np.float16)
+                                print(f"  MISMATCH row {r} (input row {row_start + r}):")
+                                print(f"    expected: {exp_fp16}")
+                                print(f"    actual:   {act_fp16}")
+                    total_errors += wave_errors
+
+    print(f"\n  Result: {len(wave_list)} wave(s) tested, {total_errors} errors")
+    if total_errors > 0:
+        print("  FAILED")
+        sys.exit(1)
+    else:
+        print("  PASSED")
