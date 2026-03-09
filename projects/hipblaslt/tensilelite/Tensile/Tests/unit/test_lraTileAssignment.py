@@ -91,49 +91,34 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
     waveId = thread_id // WAVESIZE
     partitionOffset = 0
 
-    if tileInfo.tc == 'A':
-        # 2x2 config: W1/W3 get offset for rows 16-31
+    # 2x2 config. Partitionning depends on tc.
+    if tileInfo.loadRatioGR == 1.0:
         # W0 W2
         # W1 W3
-        if tileInfo.loadRatioGR == 1.0 and waveId % 2 == 1: 
-            partitionOffset = numRowsPerHalfWave*depthUBytes
-
-    elif tileInfo.tc == 'B':
-        # 2x2 config: W2/W3 get offset for rows 16-31
-        if tileInfo.loadRatioGR == 1.0 and (waveId //2)%2 == 1:
-            partitionOffset = numRowsPerHalfWave*depthUBytes
-        # 1x4 config:
-        # W0
-        # W1 
-        # W2
-        # W3
-        # 1st buffer load (i, i + MT/2)
-        # 2nd buffer load (i+MT/4, i + MT/2 + MT/4)
-        # offset W2/W3 by numRowsPerHalfWave*depthUBytes to get i + MT/2
-        # offset W1/W3 by MT*depthUBytes//4 to get i + MT/4
-        elif tileInfo.loadRatioGR == 0.5:
-            if (waveId // 2) % 2 == 1:
-                partitionOffset += numRowsPerHalfWave*depthUBytes
-            if waveId % 2 == 1:
-                partitionOffset += MT * depthUBytes // 4 
-            
-    else:
-        raise ValueError(f"Unexpected tileInfo.tc: {tileInfo.tc}")
-
-    # if tileInfo.loadRatioGR <= 1.0:
-    #     # 2x2 config
-    #     # W0 W2
-    #     # W1 W3
-    #     if tileInfo.tc == 'A':
-    #         # Apply offset to W1/W3
-    #         if waveId % 2 == 1:
-    #             partitionOffset = numRowsPerHalfWave*depthUBytes
-    #     elif tileInfo.tc == 'B':
-    #         # Apply offset to W2/W3
-    #         if (waveId // 2)%2 == 1:
-    #             partitionOffset = numRowsPerHalfWave*depthUBytes
-    #     else:
-    #         raise ValueError(f"Unexpected tileInfo.tc: {tileInfo.tc}")
+        if tileInfo.tc == 'A':
+            #W1/W3 get offset for rows 16-31
+            if waveId % 2 == 1: 
+                partitionOffset = numRowsPerHalfWave*depthUBytes
+        elif tileInfo.tc == 'B':
+            #W2/W3 get offset for rows 16-31
+            if (waveId //2)%2 == 1:
+                partitionOffset = numRowsPerHalfWave*depthUBytes
+    # 1x4 config:
+    # W0
+    # W1 
+    # W2
+    # W3
+    # 1st buffer load (i, i + MT/2)
+    # 2nd buffer load (i+MT/4, i + MT/2 + MT/4)
+    # offset W2/W3 by numRowsPerHalfWave*depthUBytes to get i + MT/2
+    # offset W1/W3 by MT*depthUBytes//4 to get i + MT/4
+    elif tileInfo.loadRatioGR == 0.5:
+        if (waveId // 2) % 2 == 1:
+            partitionOffset += numRowsPerHalfWave*depthUBytes
+        if waveId % 2 == 1:
+            partitionOffset += MT * depthUBytes // 4 
+    elif tileInfo.loadRatioGR > 2.0:
+        raise NotImplementedError("Unsupported loadRatioGR > 2.0 in reference implementation")
           
     if tileInfo.tc == 'B':
         partitionOffset+= cfg.mt_a * depthUBytes # B is after A in memory
@@ -158,10 +143,10 @@ TILE_CONFIGS = [
     # 2x2 configs
     TileConfig(mt_a=256, mt_b=256, depth_u=64),
     TileConfig(mt_a=96, mt_b=256, depth_u=64),
-    # # 1x4 configs
+    # 1x4 configs
     TileConfig(mt_a=80, mt_b=64, depth_u=64),
     # 4x1 configs
-    # TileConfig(mt_a=64, mt_b=80, depth_u=64),
+    TileConfig(mt_a=64, mt_b=80, depth_u=64),
 ]
 
 

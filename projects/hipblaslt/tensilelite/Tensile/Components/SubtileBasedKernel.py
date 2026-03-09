@@ -530,7 +530,7 @@ def lraTileAssignment(writer, kernel):
 
   mi_m = tileInfoA.mmaTileShape[0]
   loadWidth = tileInfoA.mmaTileShape[0]*tileInfoA.mmaTileShape[1]*tileInfoA.bpe//wavesize
-  ldsRowBankSize = wavesize*4
+  ldsRowBankSize = 64*4 # 64 banks, 4 bytes per bank
   numRowsPerLDSBanks = ldsRowBankSize // depthUBytes
   assert tileInfoA.mmaTileShape == tileInfoB.mmaTileShape, "Expect same MMA tile shape for A and B"
 
