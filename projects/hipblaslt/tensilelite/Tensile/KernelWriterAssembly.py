@@ -2643,13 +2643,13 @@ class KernelWriterAssembly(KernelWriter):
         module.add(SMovB32(dst=sgpr("PackKFor%sV3"%tPackM), src="0x0c0c0703", comment=""))
 
     # self.states.groOffsetInMacroTile == 1 case, subtract pre-pad here
-    if self.states.groOffsetInMacroTile:
+    if self.states.groOffsetInMacroTile and not kernel["UseSubtileImpl"]:
       # Added logic to check for Pointer Array case (ArgType==3) and not prepad the double pointer addresses
       Skip_Address_Prepad_For_Pointer_Array = Label(label="Skip_Address_Prepad_For_Pointer_Array", comment="Skip pre-padding of address for pointer array case")
       if kernel["ProblemType"]["SupportUserArgs"]:
         module.add(SCmpEQU32(src0=sgpr("ArgType"), src1=3, comment="ArgType == 3 for General Batched GEMM"))
-        module.add(SCBranchSCC1(labelName=Skip_Address_Prepad_For_Pointer_Array.getLabelName())) 
-      if not kernel["enableTDMA"]:       
+        module.add(SCBranchSCC1(labelName=Skip_Address_Prepad_For_Pointer_Array.getLabelName()))
+      if not kernel["enableTDMA"]:
         prePad = int(self.states.srdShiftLeft["A"] * tPA["bpeGR"]) # leave room in case we have to pointer shift
         module.add(SSubU32(dst=sgpr("AddressA+0"), src0=sgpr("AddressA+0"), src1=prePad, comment="pre-pad to make room for possible pointer shift"))
         module.add(SSubBU32(dst=sgpr("AddressA+1"), src0=sgpr("AddressA+1"), src1=0, comment="pre-pad to make room for possible pointer shift"))
@@ -13696,7 +13696,6 @@ class KernelWriterAssembly(KernelWriter):
           module.add(SCBranchSCC1(labelName=gsuLabel.getLabelName(), comment="branch if GSU == 1"))
 
     gsuLimitRange = range(0, gsuLimit) # generate GSU1 and GSUM label
-    print("gsuLimitRange", gsuLimitRange)
     for gsuLimitIdx in gsuLimitRange:
       if gsuLimit > 1:
         betas = betasBackup
