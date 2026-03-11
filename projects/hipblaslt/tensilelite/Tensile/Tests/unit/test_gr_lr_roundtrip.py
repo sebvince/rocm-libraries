@@ -3,8 +3,6 @@
 # End-to-end GPU roundtrip test: Uses production globalReadDoSubtile /
 # localReadDoSubtile code paths.
 #
-# Tests multiple tile sizes, wave group configs ([2,2], [1,4], [4,1]),
-# and stride variants (stride==depthU, stride>depthU).
 #
 # Usage:
 #   pytest test_gr_lr_roundtrip.py -v -s
@@ -193,13 +191,17 @@ def generate_roundtrip_kernel(cfg, wave_id=0):
     # Export
     export_asm, _next_v = generate_export_asm(wave_id, tileInfoA, tileInfoB)
 
-    # Build inner_asm: prologue + SRD setup + production code + export
+    # Load params
     prologue = generate_load_params([
         (4, 4, 0x00, "input_A_ptr + input_B_ptr"),
         (8, 4, 0x10, "output_ptr + strideA + strideB"),
     ])
     srd_module = generate_srd_setup()
-    production_asm = "\n".join([
+
+    # Put everyting together
+    inner_asm = "\n".join([
+        str(prologue),
+        str(srd_module),
         str(gra_module),
         str(lra_module),
         str(dtl_module),
@@ -210,16 +212,8 @@ def generate_roundtrip_kernel(cfg, wave_id=0):
         str(lr_a_module),
         str(lr_b_module),
         str(wait_lr),
+        str(export_asm)
     ])
-
-    inner_asm = f"""{prologue}
-{srd_module}
-  // ---- GRA + LRA offset computation ----
-{production_asm}
-
-  // ---- Export ----
-{export_asm}
-"""
 
     args = (
         ("input_A_ptr", 8, "global_buffer", "f16"),
