@@ -24,9 +24,9 @@ from gpu_test_helpers import (
     BPE, WAVESIZE, NUM_THREADS,
     create_writer_for_subtile_test,
     init_rocisa,
-    assemble_kernel,
+    assemble_and_run,
     generate_kernel_asm,
-    run_on_gpu,
+    generate_load_params,
 )
 
 from Tensile.Components.SubtileBasedKernel import (
@@ -36,7 +36,9 @@ from Tensile.Components.SubtileBasedKernel import (
     globalReadDoSubtile,
     localReadDoSubtile,
 )
-from rocisa.instruction import SWaitCnt, SBarrier
+from rocisa.code import Module
+from rocisa.container import sgpr
+from rocisa.instruction import SMovB32, SMovB64, SWaitCnt, SBarrier
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +55,7 @@ CONFIGS = [
     # Stride > depthU variants
     TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=128, stride_b=128),
     TileConfig(mt_a=96,  mt_b=128, depth_u=64, stride_a=128, stride_b=128),
+    
 ]
 
 
@@ -60,27 +63,16 @@ CONFIGS = [
 # Assembly generation using production code paths
 # ---------------------------------------------------------------------------
 
-def generate_set_directives(named_sgprs):
-    """Generate .set directives mapping symbolic names to sgpr indices."""
-    lines = []
-    for name, idx in named_sgprs.items():
-        lines.append(f".set sgpr{name}, {idx}")
-    return "\n".join(lines)
-
-
-def generate_srd_setup(named_sgprs):
-    """Set up SRD buffer descriptors for A and B from loaded input pointers."""
-    srdA = named_sgprs["SrdA"]
-    srdB = named_sgprs["SrdB"]
-    return f"""\
-  // ---- Setup SRDs ----
-  s_mov_b64 s[{srdA}:{srdA+1}], s[4:5]        // SrdA base = input_A_ptr
-  s_mov_b32 s[{srdA+2}], 0xFFFFFFFF            // SrdA NumRecords = max
-  s_mov_b32 s[{srdA+3}], 0x20000               // SrdA OOB_SELECT=2
-  s_mov_b64 s[{srdB}:{srdB+1}], s[6:7]        // SrdB base = input_B_ptr
-  s_mov_b32 s[{srdB+2}], 0xFFFFFFFF            // SrdB NumRecords = max
-  s_mov_b32 s[{srdB+3}], 0x20000               // SrdB OOB_SELECT=2
-"""
+def generate_srd_setup():
+    """Generate SRD buffer descriptor setup for A and B using rocisa instructions."""
+    module = Module("SRD setup")
+    module.add(SMovB64(dst=sgpr("SrdA+0", 2), src=sgpr(4, 2), comment="SrdA base = input_A_ptr"))
+    module.add(SMovB32(dst=sgpr("SrdA+2"), src="0xFFFFFFFF",   comment="SrdA NumRecords = max"))
+    module.add(SMovB32(dst=sgpr("SrdA+3"), src="0x20000",      comment="SrdA OOB_SELECT=2"))
+    module.add(SMovB64(dst=sgpr("SrdB+0", 2), src=sgpr(6, 2), comment="SrdB base = input_B_ptr"))
+    module.add(SMovB32(dst=sgpr("SrdB+2"), src="0xFFFFFFFF",   comment="SrdB NumRecords = max"))
+    module.add(SMovB32(dst=sgpr("SrdB+3"), src="0x20000",      comment="SrdB OOB_SELECT=2"))
+    return module
 
 
 def generate_export_asm(wave_id, tileInfoA, tileInfoB):
@@ -185,7 +177,7 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
     export_asm, _next_v = generate_export_asm(wave_id, tileInfoA, tileInfoB)
 
     # Build inner_asm: SRD setup + production code + export
-    srd_setup = generate_srd_setup(writer.sgprs)
+    srd_module = generate_srd_setup()
     production_asm = "\n".join([
         str(gra_module),
         str(lra_module),
@@ -199,7 +191,7 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
         str(wait_lr),
     ])
 
-    inner_asm = f"""{srd_setup}
+    inner_asm = f"""{srd_module}
   // ---- GRA + LRA offset computation ----
 {production_asm}
 
@@ -207,10 +199,21 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
 {export_asm}
 """
 
-    lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
-    set_directives = generate_set_directives(writer.sgprs)
+    prologue = generate_load_params([
+        (4, 4, 0x00, "input_A_ptr + input_B_ptr"),
+        (8, 4, 0x10, "output_ptr + strideA + strideB"),
+    ])
 
-    kernel_asm = generate_kernel_asm(inner_asm, lds_size, set_directives)
+    args = (
+        ("input_A_ptr", 8, "global_buffer", "f16"),
+        ("input_B_ptr", 8, "global_buffer", "f16"),
+        ("output_ptr",  8, "global_buffer", "u32"),
+        ("strideA",     4, "by_value",      "u32"),
+        ("strideB",     4, "by_value",      "u32"),
+    )
+
+    lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
+    kernel_asm = generate_kernel_asm(inner_asm, writer, str(prologue), args, lds_size)
 
     num_tiles_a = len(tileInfoA.vgprTiles)
     num_tiles_b = len(tileInfoB.vgprTiles)
@@ -338,34 +341,20 @@ class TestGraLraIntegrationV2:
         """Verify GR -> LDS -> LR roundtrip using production code paths."""
         sys.stdout.flush()
 
-        # 1. Generate kernel assembly
         kernel_asm, writer, kernel, tileInfoA, tileInfoB, output_size = \
             generate_integration_kernel_v2(cfg, wave_id=wave_id)
 
-        # 2. Assemble
-        label = f"{cfg.label}_wave{wave_id}"
-        co_path = str(tmp_path / f"v2_{label}.co")
-        asm_path = str(tmp_path / f"v2_{label}.s")
-        with open(asm_path, "w") as f:
-            f.write(kernel_asm)
-        assemble_kernel(kernel_asm, co_path)
+        # Create input data
+        input_A = np.arange(1, cfg.mt_a * cfg.stride_a + 1, dtype=np.float16)
+        input_B = -np.arange(1, cfg.mt_b * cfg.stride_b + 1, dtype=np.float16)
 
-        # 3. Create input data
-        # A: mt_a rows x stride_a cols, sequential fp16
-        num_elements_A = cfg.mt_a * cfg.stride_a
-        input_A = np.arange(1, num_elements_A + 1, dtype=np.float16)
-        # B: mt_b rows x stride_b cols, negative for distinguishability
-        num_elements_B = cfg.mt_b * cfg.stride_b
-        input_B = -np.arange(1, num_elements_B + 1, dtype=np.float16)
-
-        # 4. Run on GPU
         lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
-        output_bytes = run_on_gpu(co_path, output_size,
-                                  inputs=(input_A, input_B),
-                                  scalars=(cfg.stride_a, cfg.stride_b),
-                                  lds_size=lds_size)
+        label = f"v2_{cfg.label}_wave{wave_id}"
+        output_bytes = assemble_and_run(kernel_asm, tmp_path, label, output_size,
+                                        inputs=(input_A, input_B),
+                                        scalars=(cfg.stride_a, cfg.stride_b),
+                                        lds_size=lds_size)
 
-        # 5. Compute expected and compare
         expected_tiles = compute_expected_output(cfg, tileInfoA, tileInfoB, kernel,
                                                  input_A, input_B, wave_id)
         errors = compare_tiles(output_bytes, expected_tiles, tileInfoA, tileInfoB, wave_id)
@@ -419,25 +408,17 @@ if __name__ == "__main__":
                 print(f"\n--- Kernel ASM ---\n{kernel_asm}\n--- End ---\n")
 
             with tempfile.TemporaryDirectory() as tmp_dir:
-                label = f"{cfg.label}_wave{wave_id}"
-                co_path = os.path.join(tmp_dir, f"v2_{label}.co")
-                asm_path = os.path.join(tmp_dir, f"v2_{label}.s")
-                with open(asm_path, "w") as f:
-                    f.write(kernel_asm)
+                tmp_path = type('P', (), {'__truediv__': lambda s, n: os.path.join(tmp_dir, n)})()
 
-                assemble_kernel(kernel_asm, co_path)
+                input_A = np.arange(1, cfg.mt_a * cfg.stride_a + 1, dtype=np.float16)
+                input_B = -np.arange(1, cfg.mt_b * cfg.stride_b + 1, dtype=np.float16)
 
-                num_elements_A = cfg.mt_a * cfg.stride_a
-                input_A = np.arange(1, num_elements_A + 1, dtype=np.float16)
-                num_elements_B = cfg.mt_b * cfg.stride_b
-                input_B = -np.arange(1, num_elements_B + 1, dtype=np.float16)
-
-                sys.stdout.flush()
                 lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
-                output_bytes = run_on_gpu(co_path, output_size,
-                                          inputs=(input_A, input_B),
-                                          scalars=(cfg.stride_a, cfg.stride_b),
-                                          lds_size=lds_size)
+                label = f"v2_{cfg.label}_wave{wave_id}"
+                output_bytes = assemble_and_run(kernel_asm, tmp_path, label, output_size,
+                                                inputs=(input_A, input_B),
+                                                scalars=(cfg.stride_a, cfg.stride_b),
+                                                lds_size=lds_size)
 
                 expected_tiles = compute_expected_output(cfg, tileInfoA, tileInfoB, kernel,
                                                         input_A, input_B, wave_id)

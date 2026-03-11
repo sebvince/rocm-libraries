@@ -6,9 +6,9 @@
 #   - TileConfig dataclass for parameterized tile configurations
 #   - Mock/kernel creation helpers (_mock_dtype, _create_kernel, create_writer_for_gpu)
 #   - rocIsa initialization (init_rocisa)
-#   - Unified kernel asm generator (generate_kernel_asm) with export/integration layouts
-#   - Convenience wrapper for single-register-export tests (generate_export_kernel)
-#   - Assembly & GPU execution (assemble_kernel, run_on_gpu, build_and_run)
+#   - Unified kernel asm generator (generate_kernel_asm)
+#   - Prologue builder (generate_load_params) and export epilogue (generate_export_epilogue)
+#   - Assembly & GPU execution (assemble_kernel, assemble_and_run)
 #   - Debug utilities (print_offset_grid)
 ################################################################################
 
@@ -35,6 +35,9 @@ from unittest.mock import MagicMock
 from types import SimpleNamespace
 from dataclasses import dataclass
 
+from rocisa.code import Module, TextBlock
+from rocisa.container import vgpr, sgpr
+from rocisa.instruction import SLoadB32, SLoadB64, SLoadB128, SWaitCnt, VLShiftLeftB32, VMovB32
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType
 from Tensile.Components.SubtileBasedKernel import TileInfo
@@ -209,6 +212,15 @@ def create_writer_for_subtile_test(cfg):
     return writer, kernel, tileInfoA, tileInfoB
 
 
+def generate_set_directives(sgprs):
+    """Generate .set directives mapping symbolic names to sgpr indices.
+
+    Args:
+        sgprs: dict mapping name -> index (e.g. writer.sgprs).
+    """
+    return "\n".join(f".set sgpr{name}, {idx}" for name, idx in sgprs.items())
+
+
 def init_rocisa():
     """Initialize rocIsa singleton if needed."""
     from rocisa import rocIsa
@@ -267,42 +279,21 @@ def _scan_register_indices(*texts):
     return vgprs, sgprs
 
 
-_DEFAULT_PROLOGUE = """\
-  s_load_dwordx4 s[4:7], s[0:1], 0x00       // input_A_ptr (s[4:5]) + input_B_ptr (s[6:7])
-  s_load_dwordx4 s[8:11], s[0:1], 0x10      // output_ptr (s[8:9]) + strideA (s10) + strideB (s11)
-  s_waitcnt lgkmcnt(0)"""
-
-_DEFAULT_ARGS = (
-    ("input_A_ptr", 8, "global_buffer", "f16"),
-    ("input_B_ptr", 8, "global_buffer", "f16"),
-    ("output_ptr",  8, "global_buffer", "u32"),
-    ("strideA",     4, "by_value",      "u32"),
-    ("strideB",     4, "by_value",      "u32"),
-)
-
-
-def generate_kernel_asm(inner_asm, lds_size=0, set_directives="",
-                        args=None, prologue=None):
+def generate_kernel_asm(inner_asm, writer, prologue, args, lds_size=0):
     """Generate a complete AMDHSA kernel wrapping inner_asm.
 
     Args:
-        inner_asm:       Assembly code between prologue and endpgm.
-        lds_size:        LDS allocation size in bytes.
-        set_directives:  .set lines for register name mappings.
-        args:            Kernarg descriptors — sequence of
-                         (name, size, value_kind, value_type) tuples.
-                         Defaults to the integration layout (5 args, 32B).
-        prologue:        Prologue asm (kernarg loads). Defaults to the
-                         integration prologue.
+        inner_asm:  Assembly code between prologue and endpgm.
+        writer:     Object with .sgprs dict (name -> index) for .set directives.
+        prologue:   Prologue asm (kernarg loads).
+        args:       Kernarg descriptors — sequence of
+                    (name, size, value_kind, value_type) tuples.
+        lds_size:   LDS allocation size in bytes.
 
     Returns:
         Assembly source string.
     """
-    if args is None:
-        args = _DEFAULT_ARGS
-    if prologue is None:
-        prologue = _DEFAULT_PROLOGUE
-
+    set_directives = generate_set_directives(writer.sgprs)
     args_metadata, kernarg_size = _generate_args_metadata(args)
 
     # Auto-compute register counts from prologue + inner_asm + set directives
@@ -380,49 +371,61 @@ amdhsa.kernels:
 """
 
 
-def generate_export_kernel(test_asm, export_reg, is_sgpr=False):
-    """Generate a kernel that runs test_asm and exports a single register.
+def generate_load_params(loads):
+    """Generate prologue module that loads kernel arguments from kernarg segment.
 
     Args:
-        test_asm:    Assembly string from the function under test.
-        export_reg: Register index to export (e.g. 3 for v3 or s3).
-        is_sgpr:    True to export an sgpr (uniform value, broadcast to all
-                    threads), False to export a vgpr (per-thread value).
+        loads: sequence of (dst, count, offset, comment) tuples.
+            dst:     sgpr index (int) or symbolic name (str).
+            count:   number of dwords to load (1, 2, or 4).
+            offset:  byte offset into kernarg segment.
+            comment: comment string for the instruction.
 
     Returns:
-        Assembly source string.
+        Module with SLoad instructions + SWaitCnt.
     """
-    prologue = """\
-  s_load_dwordx2 s[4:5], s[0:1], 0x00     // output_ptr
-  s_load_dword s[sgprStrideA0I], s[0:1], 0x08   // strideA -> s8
-  s_load_dword s[sgprStrideB1J], s[0:1], 0x0c   // strideB -> s9
-  s_waitcnt lgkmcnt(0)"""
+    load_cls = {1: SLoadB32, 2: SLoadB64, 4: SLoadB128}
+    module = Module("prologue")
+    for dst, count, offset, comment in loads:
+        cls = load_cls[count]
+        dst_sgpr = sgpr(dst, count) if count > 1 else sgpr(dst)
+        module.add(cls(dst=dst_sgpr, base=sgpr(0, 2), soffset=offset, comment=comment))
+    module.add(SWaitCnt(dscnt=0))
+    return module
 
-    # Find highest register indices used by test_asm
-    vgpr_indices = set(int(m) for m in re.findall(r'\bv(\d+)\b', test_asm))
 
-    tmp_vgpr = max(vgpr_indices | {0}) + 1      # byte-offset register
-    data_vgpr = tmp_vgpr + 1 if is_sgpr else export_reg
+def generate_export_epilogue(writer, export_reg, is_sgpr=False):
+    """Generate epilogue module that exports a single register via global_store.
 
-    # Build epilogue
-    epilogue = f"  v_lshlrev_b32 v{tmp_vgpr}, 2, v0\n"
+    Allocates tmp vgprs from writer.vgprPool. Exports export_reg (vgpr or sgpr)
+    to the output buffer at s[4:5].
+
+    Args:
+        writer:     Writer with vgprPool for register allocation.
+        export_reg: Register index to export (e.g. 3 for v3 or s3).
+        is_sgpr:    True to export an sgpr, False for a vgpr.
+
+    Returns:
+        (module, allocated_vgprs) — Module and list of vgpr indices to checkIn later.
+    """
+    allocated = []
+    tmp_vgpr = writer.vgprPool.checkOut(1, "export_addr", preventOverflow=False)
+    allocated.append(tmp_vgpr)
+
+    module = Module("export epilogue")
+    module.add(VLShiftLeftB32(dst=vgpr(tmp_vgpr), shiftHex=2, src=vgpr(0),
+                              comment="byte offset = tid * 4"))
+
     if is_sgpr:
-        epilogue += f"  v_mov_b32 v{data_vgpr}, s{export_reg}\n"
-    epilogue += f"  global_store_dword v{tmp_vgpr}, v{data_vgpr}, s[4:5]\n"
+        data_vgpr = writer.vgprPool.checkOut(1, "export_data", preventOverflow=False)
+        allocated.append(data_vgpr)
+        module.add(VMovB32(dst=vgpr(data_vgpr), src=sgpr(export_reg),
+                           comment=f"copy s{export_reg} to v{data_vgpr}"))
+    else:
+        data_vgpr = export_reg
 
-    inner_asm = f"""\
-  // ---- Generated test code ----
-{test_asm}
-  // ---- Epilogue: Export register ----
-{epilogue}"""
-
-    return generate_kernel_asm(inner_asm, prologue=prologue,
-                               set_directives=".set sgprStrideA0I, 8\n.set sgprStrideB1J, 9",
-                               args=(
-                                   ("output_ptr", 8, "global_buffer", "u32"),
-                                   ("strideA",    4, "by_value",      "u32"),
-                                   ("strideB",    4, "by_value",      "u32"),
-                               ))
+    module.add(TextBlock(f"  global_store_dword v{tmp_vgpr}, v{data_vgpr}, s[4:5]\n"))
+    return module, allocated
 
 
 # ---- Assemble / run ----
@@ -530,19 +533,17 @@ def run_on_gpu(co_path, output_size, inputs=(), scalars=(), lds_size=0):
     return bytes(h_output)
 
 
-def build_and_run(test_asm, export_reg, is_sgpr, cfg, tmp_path, label):
-    """Generate, assemble, run a single-register export kernel. Returns results tuple."""
-    sys.stdout.flush()  # flush before GPU calls to avoid buffering issues with HIP runtime
-    asm = generate_export_kernel(test_asm, export_reg, is_sgpr=is_sgpr)
+
+
+def assemble_and_run(asm, tmp_path, label, output_size, inputs=(), scalars=(), lds_size=0):
+    """Write asm to file, assemble to code object, run on GPU, return raw bytes."""
     co_path = str(tmp_path / f"test_{label}.co")
     asm_path = str(tmp_path / f"test_{label}.s")
     with open(asm_path, "w") as f:
         f.write(asm)
     assemble_kernel(asm, co_path)
-    output_size = NUM_THREADS * 4
-    raw = run_on_gpu(co_path, output_size,
-                     scalars=(cfg.stride_a, cfg.stride_b))
-    return struct.unpack(f"{NUM_THREADS}I", raw)
+    return run_on_gpu(co_path, output_size, inputs=inputs, scalars=scalars, lds_size=lds_size)
+
 
 
 # ---- Utilities ----

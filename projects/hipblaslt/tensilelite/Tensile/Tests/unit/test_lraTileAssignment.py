@@ -7,6 +7,7 @@
 ################################################################################
 
 import os
+import struct
 import sys
 import tempfile
 
@@ -19,20 +20,50 @@ from gpu_test_helpers import (
     BPE, LOAD_WIDTH, WAVESIZE, NUM_THREADS, NUM_WAVES,
     create_writer_for_gpu,
     init_rocisa,
-    build_and_run,
+    assemble_and_run,
+    generate_kernel_asm,
+    generate_load_params,
+    generate_export_epilogue,
     print_offset_grid,
 )
 from Tensile.Components.SubtileBasedKernel import lraTileAssignment
 
 
 def generate_lra_asm(cfg):
-    """Run lraTileAssignment and return (lra_asm, tileInfoA, tileInfoB, kernel)."""
+    """Run lraTileAssignment and return (lra_asm, writer, tileInfoA, tileInfoB, kernel)."""
     writer, kernel, tileInfoA, tileInfoB = create_writer_for_gpu(cfg)
     init_rocisa()
 
     module = lraTileAssignment(writer, kernel)
     lra_asm = str(module)
-    return lra_asm, tileInfoA, tileInfoB, kernel
+    return lra_asm, writer, tileInfoA, tileInfoB, kernel
+
+
+def export_register(writer, test_asm, export_reg, is_sgpr, cfg, tmp_path, label):
+    """Generate export kernel, assemble, run, return per-thread u32 results."""
+
+    loadParams = (
+            (4, 2, 0x00, "output_ptr"),
+            ("StrideA0I", 1, 0x08, "strideA"),
+            ("StrideB1J", 1, 0x0c, "strideB"),
+    )
+
+    args = (
+        ("output_ptr", 8, "global_buffer", "u32"),
+        ("strideA",    4, "by_value",      "u32"),
+        ("strideB",    4, "by_value",      "u32"),
+    )
+
+    prologue = generate_load_params(loadParams)
+    epilogue, allocated = generate_export_epilogue(writer, export_reg, is_sgpr)
+    kernel_asm = generate_kernel_asm(f"{test_asm}\n{epilogue}", writer,
+                                     str(prologue), args)
+    for v in allocated:
+        writer.vgprPool.checkIn(v)
+
+    raw = assemble_and_run(kernel_asm, tmp_path, label, NUM_THREADS * 4,
+                           scalars=(cfg.stride_a, cfg.stride_b))
+    return struct.unpack(f"{NUM_THREADS}I", raw)
 
 
 # ---- Reference implementations ----
@@ -51,7 +82,7 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
     laneId = thread_id % WAVESIZE
 
     # Contiguous rows for loadRatioGR == 2.0, interleaved rows for loadRatioGR <= 1.0
-    if tileInfo.loadRatioGR == 2.0: 
+    if tileInfo.loadRatioGR == 2.0:
         splitOffset = 0
     else:
         splitOffset = ((laneId % 16) // numRowsPerHalfWave)*(waveReadSize//2)
@@ -75,11 +106,11 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
     if enableRotation:
         # rotate by 2 rows every 2 lds_row_id
         lds_row_id = lane16 // numRowsPerLDSBanks
-        rotation = (lds_row_id//2)*2 
+        rotation = (lds_row_id//2)*2
         colOffset = (colOffset+rotation) % blockSize
 
     rowOffset = lane16 * depthUBytes + splitOffset
-        
+
     offsets = []
     # offset by numMFMACols read along K (TN)
     for lr_idx in range(tileInfo.numLRPerSubtile):
@@ -97,7 +128,7 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
         # W1 W3
         if tileInfo.tc == 'A':
             #W1/W3 get offset for rows 16-31
-            if waveId % 2 == 1: 
+            if waveId % 2 == 1:
                 partitionOffset = numRowsPerHalfWave*depthUBytes
         elif tileInfo.tc == 'B':
             #W2/W3 get offset for rows 16-31
@@ -105,7 +136,7 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
                 partitionOffset = numRowsPerHalfWave*depthUBytes
     # 1x4 config:
     # W0
-    # W1 
+    # W1
     # W2
     # W3
     # 1st buffer load (i, i + MT/2)
@@ -116,10 +147,10 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
         if (waveId // 2) % 2 == 1:
             partitionOffset += numRowsPerHalfWave*depthUBytes
         if waveId % 2 == 1:
-            partitionOffset += MT * depthUBytes // 4 
+            partitionOffset += MT * depthUBytes // 4
     elif tileInfo.loadRatioGR > 2.0:
         raise NotImplementedError("Unsupported loadRatioGR > 2.0 in reference implementation")
-          
+
     if tileInfo.tc == 'B':
         partitionOffset+= cfg.mt_a * depthUBytes # B is after A in memory
     for id in range(len(offsets)):
@@ -160,10 +191,11 @@ class TestLraTileAssignmentUnit:
     def lra_env(self, request):
         """Generate lraTileAssignment output once per tile config."""
         cfg = request.param
-        lra_asm, tileInfoA, tileInfoB, kernel = generate_lra_asm(cfg)
+        lra_asm, writer, tileInfoA, tileInfoB, kernel = generate_lra_asm(cfg)
         return SimpleNamespace(
             cfg=cfg,
             lra_asm=lra_asm,
+            writer=writer,
             tileInfoA=tileInfoA,
             tileInfoB=tileInfoB,
             kernel=kernel,
@@ -201,10 +233,11 @@ class TestLraTileAssignmentGPU:
     def lra_env(self, request, tmp_path):
         """Generate lraTileAssignment asm once per tile config."""
         cfg = request.param
-        lra_asm, tileInfoA, tileInfoB, kernel = generate_lra_asm(cfg)
+        lra_asm, writer, tileInfoA, tileInfoB, kernel = generate_lra_asm(cfg)
         return SimpleNamespace(
             cfg=cfg,
             lra_asm=lra_asm,
+            writer=writer,
             tileInfoA=tileInfoA,
             tileInfoB=tileInfoB,
             kernel=kernel,
@@ -215,8 +248,8 @@ class TestLraTileAssignmentGPU:
         """Validate all sharedVgprLROffset vgprs for matrix A across all threads."""
         cfg = lra_env.cfg
         for idx, reg in enumerate(lra_env.tileInfoA.sharedVgprLROffset):
-            results = build_and_run(lra_env.lra_asm, reg, False, cfg, lra_env.tmp_path,
-                                    f"lr_offsetA_v{reg}_{cfg.label}")
+            results = export_register(lra_env.writer, lra_env.lra_asm, reg, False,
+                                      cfg, lra_env.tmp_path, f"lr_offsetA_v{reg}_{cfg.label}")
 
             for tid in range(NUM_THREADS):
                 expected = compute_expected_lr_offset(tid, cfg, lra_env.tileInfoA)
@@ -228,8 +261,8 @@ class TestLraTileAssignmentGPU:
         """Validate all sharedVgprLROffset vgprs for matrix B across all threads."""
         cfg = lra_env.cfg
         for idx, reg in enumerate(lra_env.tileInfoB.sharedVgprLROffset):
-            results = build_and_run(lra_env.lra_asm, reg, False, cfg, lra_env.tmp_path,
-                                    f"lr_offsetB_v{reg}_{cfg.label}")
+            results = export_register(lra_env.writer, lra_env.lra_asm, reg, False,
+                                      cfg, lra_env.tmp_path, f"lr_offsetB_v{reg}_{cfg.label}")
 
             for tid in range(NUM_THREADS):
                 expected = compute_expected_lr_offset(tid, cfg, lra_env.tileInfoB)
@@ -255,7 +288,7 @@ if __name__ == "__main__":
         print(f"  Tile Config: {cfg.label}")
         print(f"{'='*60}")
 
-        lra_asm, tileInfoA, tileInfoB, kernel = generate_lra_asm(cfg)
+        lra_asm, writer, tileInfoA, tileInfoB, kernel = generate_lra_asm(cfg)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = type('P', (), {'__truediv__': lambda s, n: os.path.join(tmp_dir, n)})()
@@ -277,8 +310,8 @@ if __name__ == "__main__":
                 # Test all sharedVgprLROffset vgprs for both matrices
                 for tc, tileInfo in [("A", tileInfoA), ("B", tileInfoB)]:
                     for idx, reg in enumerate(tileInfo.sharedVgprLROffset):
-                        results = build_and_run(lra_asm, reg, False, cfg, tmp_path,
-                                                f"lr_offset{tc}_v{reg}_{cfg.label}")
+                        results = export_register(writer, lra_asm, reg, False, cfg, tmp_path,
+                                                  f"lr_offset{tc}_v{reg}_{cfg.label}")
 
                         if args.grid:
                             print_offset_grid(f"Matrix {tc} LR GPU offset[{idx}] v{reg} ({cfg.label})",
