@@ -60,7 +60,10 @@ class TileConfig:
     @property
     def label(self):
         swz = "_swz" if self.use_swizzling else ""
-        return f"{self.mt_a}x{self.mt_b}x{self.depth_u}{swz}"
+        stride = ""
+        if self.stride_a and self.stride_a != self.depth_u:
+            stride = f"_s{self.stride_a}"
+        return f"{self.mt_a}x{self.mt_b}x{self.depth_u}{swz}{stride}"
 
 
 # ---- HIP helpers ----
@@ -166,6 +169,49 @@ def create_writer_for_gpu(cfg):
     tileInfoB.allocOffsetRegisters(writer, kernel)
 
     return writer, kernel, tileInfoA, tileInfoB
+
+
+def create_writer_for_subtile_test(cfg):
+    """Create a mock writer with allocations needed by production GR/LR functions.
+
+    Extends create_writer_for_gpu with:
+      - SrdA/SrdB sgprs (4 each, 4-aligned) for buffer_load descriptors
+      - LocalWriteBaseAddr/LocalWriteDTLOffset sgprs for DTL init
+      - ldsStartOffset{A,B} for emitSubtileBufferLoad m0 calculations
+      - vgprTile registers allocated via TileInfo.allocVgprTileRegisters
+
+    Returns:
+        (writer, kernel, tileInfoA, tileInfoB, named_sgprs)
+        named_sgprs maps symbolic names to allocated sgpr indices for .set directives.
+    """
+    writer, kernel, tileInfoA, tileInfoB = create_writer_for_gpu(cfg)
+
+    # Allocate SrdA: 4 sgprs, 4-aligned
+    srdA = writer.sgprPool.checkOutAligned(4, 4, "SrdA", preventOverflow=False)
+    # Allocate SrdB: 4 sgprs, 4-aligned
+    srdB = writer.sgprPool.checkOutAligned(4, 4, "SrdB", preventOverflow=False)
+    # Allocate LocalWriteBaseAddr and LocalWriteDTLOffset
+    lwba = writer.sgprPool.checkOut(1, "LocalWriteBaseAddr", preventOverflow=False)
+    lwdtl = writer.sgprPool.checkOut(1, "LocalWriteDTLOffset", preventOverflow=False)
+
+    # Set LDS start offsets used by emitSubtileBufferLoad
+    writer.ldsStartOffsetA = 0
+    writer.ldsStartOffsetB = cfg.mt_a * cfg.depth_u * BPE
+
+    # Allocate vgprTile registers for local read destinations
+    tileInfoA.allocVgprTileRegisters(writer, kernel)
+    tileInfoB.allocVgprTileRegisters(writer, kernel)
+
+    named_sgprs = {
+        "SrdA": srdA,
+        "SrdB": srdB,
+        "StrideA0I": 10,
+        "StrideB1J": 11,
+        "LocalWriteBaseAddr": lwba,
+        "LocalWriteDTLOffset": lwdtl,
+    }
+
+    return writer, kernel, tileInfoA, tileInfoB, named_sgprs
 
 
 def init_rocisa():
