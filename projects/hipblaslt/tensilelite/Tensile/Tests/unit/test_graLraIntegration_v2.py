@@ -22,7 +22,7 @@ from gpu_test_helpers import (
     HAS_HIP,
     TileConfig,
     BPE, WAVESIZE, NUM_THREADS,
-    create_writer_for_subtile_test,
+    create_writer,
     init_rocisa,
     assemble_and_run,
     generate_kernel_asm,
@@ -149,7 +149,24 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
     """Generate a complete kernel using production GR/LR code paths."""
     init_rocisa()
 
-    writer, kernel, tileInfoA, tileInfoB = create_writer_for_subtile_test(cfg)
+    writer, kernel, tileInfoA, tileInfoB = create_writer(cfg)
+
+    # Reserve s0-s11 for hardware regs + kernarg loads
+    writer.sgprPool.checkOut(12)
+    writer.sgprs["StrideA0I"] = 10
+    writer.sgprs["StrideB1J"] = 11
+    tileInfoA.allocOffsetRegisters(writer, kernel)
+    tileInfoB.allocOffsetRegisters(writer, kernel)
+
+    # Subtile-specific: SRD descriptors, DTL sgprs, LDS offsets, vgprTile
+    writer.sgprs["SrdA"] = writer.sgprPool.checkOutAligned(4, 4, "SrdA", preventOverflow=False)
+    writer.sgprs["SrdB"] = writer.sgprPool.checkOutAligned(4, 4, "SrdB", preventOverflow=False)
+    writer.sgprs["LocalWriteBaseAddr"] = writer.sgprPool.checkOut(1, "LocalWriteBaseAddr", preventOverflow=False)
+    writer.sgprs["LocalWriteDTLOffset"] = writer.sgprPool.checkOut(1, "LocalWriteDTLOffset", preventOverflow=False)
+    writer.ldsStartOffsetA = 0
+    writer.ldsStartOffsetB = cfg.mt_a * cfg.depth_u * BPE
+    tileInfoA.allocVgprTileRegisters(writer, kernel)
+    tileInfoB.allocVgprTileRegisters(writer, kernel)
 
     # GRA + LRA offset computation
     gra_module = graTileAssignment(writer, kernel, useSwizzling=True)
@@ -176,7 +193,11 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
     # Export
     export_asm, _next_v = generate_export_asm(wave_id, tileInfoA, tileInfoB)
 
-    # Build inner_asm: SRD setup + production code + export
+    # Build inner_asm: prologue + SRD setup + production code + export
+    prologue = generate_load_params([
+        (4, 4, 0x00, "input_A_ptr + input_B_ptr"),
+        (8, 4, 0x10, "output_ptr + strideA + strideB"),
+    ])
     srd_module = generate_srd_setup()
     production_asm = "\n".join([
         str(gra_module),
@@ -191,18 +212,14 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
         str(wait_lr),
     ])
 
-    inner_asm = f"""{srd_module}
+    inner_asm = f"""{prologue}
+{srd_module}
   // ---- GRA + LRA offset computation ----
 {production_asm}
 
   // ---- Export ----
 {export_asm}
 """
-
-    prologue = generate_load_params([
-        (4, 4, 0x00, "input_A_ptr + input_B_ptr"),
-        (8, 4, 0x10, "output_ptr + strideA + strideB"),
-    ])
 
     args = (
         ("input_A_ptr", 8, "global_buffer", "f16"),
@@ -213,7 +230,7 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
     )
 
     lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
-    kernel_asm = generate_kernel_asm(inner_asm, writer, str(prologue), args, lds_size)
+    kernel_asm = generate_kernel_asm(inner_asm, writer, args, lds_size)
 
     num_tiles_a = len(tileInfoA.vgprTiles)
     num_tiles_b = len(tileInfoB.vgprTiles)

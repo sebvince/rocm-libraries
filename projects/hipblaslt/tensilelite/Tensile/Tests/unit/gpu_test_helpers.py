@@ -4,7 +4,7 @@
 #
 # Provides:
 #   - TileConfig dataclass for parameterized tile configurations
-#   - Mock/kernel creation helpers (_mock_dtype, _create_kernel, create_writer_for_gpu)
+#   - Mock/kernel creation helpers (_mock_dtype, _create_kernel, create_writer)
 #   - rocIsa initialization (init_rocisa)
 #   - Unified kernel asm generator (generate_kernel_asm)
 #   - Prologue builder (generate_load_params) and export epilogue (generate_export_epilogue)
@@ -122,25 +122,21 @@ def _create_kernel(cfg):
     }
 
 
-def create_writer_for_gpu(cfg):
-    """Create a mock writer with register pools laid out for GPU execution.
+def create_writer(cfg):
+    """Create a minimal mock writer with register pools, kernel dict, and TileInfo.
 
-    Register layout (must match the kernel prologue/epilogue):
-      v0           = Serial
-      v1+          = allocated by allocOffsetRegisters and the function under test
+    Sets up the base writer that all tests need:
+      - vgprPool/sgprPool (empty)
+      - v0 reserved for Serial (hardware workitem_id)
+      - kernel dict from cfg
+      - TileInfo A/B
+      - writer.states with tileInfo refs and register caps
 
-      s0:s1        = kernarg_segment_ptr
-      s2           = workgroup_id_x
-      s3           = padding
-      s[4:5]       = input_A_ptr (integration) or output_ptr (export kernel)
-      s[6:7]       = input_B_ptr (integration) or free (export kernel)
-      s[8:9]       = output_ptr (integration) or strideA/B (export kernel)
-      s10          = strideA (integration, mapped via .set sgprStrideA0I)
-      s11          = strideB (integration, mapped via .set sgprStrideB1J)
-      s12+         = sgprPool for temps (sHalfOffset, subtile offsets, etc.)
+    Each test is responsible for reserving sgprs, defining named sgprs
+    (writer.sgprs), and calling allocOffsetRegisters etc.
 
-    Note: export kernel (test_graTileAssignment) uses .set sgprStrideA0I=8,
-    sgprStrideB1J=9, which is fine since those sgprs are still reserved.
+    Returns:
+        (writer, kernel, tileInfoA, tileInfoB)
     """
     writer = SimpleNamespace()
 
@@ -153,16 +149,9 @@ def create_writer_for_gpu(cfg):
     # Reserve v0 for Serial (hardware workitem_id)
     writer.vgprPool.checkOut(1)
 
-    # Reserve s0-s11 for hardware regs + kernarg loads
-    # s[0:1]=kernarg, s2=workgroup_id_x, s3=pad,
-    # s[4:5]=input_A, s[6:7]=input_B, s[8:9]=output, s10=strideA, s11=strideB
-    writer.sgprPool.checkOut(12)
-    writer.sgprs["StrideA0I"] = 10
-    writer.sgprs["StrideB1J"] = 11
-
     # Build kernel and TileInfo
     kernel = _create_kernel(cfg)
-    
+
     tileInfoA = TileInfo('A', kernel)
     tileInfoB = TileInfo('B', kernel)
 
@@ -171,43 +160,6 @@ def create_writer_for_gpu(cfg):
         b=SimpleNamespace(tileInfo=tileInfoB),
         regCaps={"MaxSgpr": 106, "MaxVgpr": 256},
     )
-
-    tileInfoA.allocOffsetRegisters(writer, kernel)
-    tileInfoB.allocOffsetRegisters(writer, kernel)
-
-    return writer, kernel, tileInfoA, tileInfoB
-
-
-def create_writer_for_subtile_test(cfg):
-    """Create a mock writer with allocations needed by production GR/LR functions.
-
-    Extends create_writer_for_gpu with:
-      - SrdA/SrdB sgprs (4 each, 4-aligned) for buffer_load descriptors
-      - LocalWriteBaseAddr/LocalWriteDTLOffset sgprs for DTL init
-      - ldsStartOffset{A,B} for emitSubtileBufferLoad m0 calculations
-      - vgprTile registers allocated via TileInfo.allocVgprTileRegisters
-
-    Sgpr name→index mappings are stored in writer.sgprs (like production
-    KernelWriter.defineSgpr), so callers can generate .set directives from it.
-
-    Returns:
-        (writer, kernel, tileInfoA, tileInfoB)
-    """
-    writer, kernel, tileInfoA, tileInfoB = create_writer_for_gpu(cfg)
-
-    # Allocate named sgprs (mirroring KernelWriter.defineSgpr)
-    writer.sgprs["SrdA"] = writer.sgprPool.checkOutAligned(4, 4, "SrdA", preventOverflow=False)
-    writer.sgprs["SrdB"] = writer.sgprPool.checkOutAligned(4, 4, "SrdB", preventOverflow=False)
-    writer.sgprs["LocalWriteBaseAddr"] = writer.sgprPool.checkOut(1, "LocalWriteBaseAddr", preventOverflow=False)
-    writer.sgprs["LocalWriteDTLOffset"] = writer.sgprPool.checkOut(1, "LocalWriteDTLOffset", preventOverflow=False)
-
-    # Set LDS start offsets used by emitSubtileBufferLoad
-    writer.ldsStartOffsetA = 0
-    writer.ldsStartOffsetB = cfg.mt_a * cfg.depth_u * BPE
-
-    # Allocate vgprTile registers for local read destinations
-    tileInfoA.allocVgprTileRegisters(writer, kernel)
-    tileInfoB.allocVgprTileRegisters(writer, kernel)
 
     return writer, kernel, tileInfoA, tileInfoB
 
@@ -279,13 +231,12 @@ def _scan_register_indices(*texts):
     return vgprs, sgprs
 
 
-def generate_kernel_asm(inner_asm, writer, prologue, args, lds_size=0):
+def generate_kernel_asm(inner_asm, writer, args, lds_size=0):
     """Generate a complete AMDHSA kernel wrapping inner_asm.
 
     Args:
-        inner_asm:  Assembly code between prologue and endpgm.
+        inner_asm:  Assembly code including prologue, test logic, and epilogue.
         writer:     Object with .sgprs dict (name -> index) for .set directives.
-        prologue:   Prologue asm (kernarg loads).
         args:       Kernarg descriptors — sequence of
                     (name, size, value_kind, value_type) tuples.
         lds_size:   LDS allocation size in bytes.
@@ -296,9 +247,9 @@ def generate_kernel_asm(inner_asm, writer, prologue, args, lds_size=0):
     set_directives = generate_set_directives(writer.sgprs)
     args_metadata, kernarg_size = _generate_args_metadata(args)
 
-    # Auto-compute register counts from prologue + inner_asm + set directives
+    # Auto-compute register counts from inner_asm + set directives
     vgpr_indices, sgpr_indices = _scan_register_indices(
-        prologue, inner_asm, set_directives)
+        inner_asm, set_directives)
 
     max_vgpr = max(vgpr_indices | {0}) + 1
     max_sgpr = max(sgpr_indices | {0}) + 1
@@ -336,10 +287,6 @@ def generate_kernel_asm(inner_asm, writer, prologue, args, lds_size=0):
 
 .text
 test_kernel:
-  // ---- Prologue: Load kernel arguments ----
-{prologue}
-
-  // ---- Test code ----
 {inner_asm}
   s_waitcnt vmcnt(0)
   s_endpgm
@@ -531,8 +478,6 @@ def run_on_gpu(co_path, output_size, inputs=(), scalars=(), lds_size=0):
     hip_check(hip.hipModuleUnload(module))
 
     return bytes(h_output)
-
-
 
 
 def assemble_and_run(asm, tmp_path, label, output_size, inputs=(), scalars=(), lds_size=0):
