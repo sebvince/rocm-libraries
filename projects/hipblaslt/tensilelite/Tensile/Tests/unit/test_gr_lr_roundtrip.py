@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 ################################################################################
-# End-to-end GPU integration test (v2): Uses production globalReadDoSubtile /
-# localReadDoSubtile code paths instead of hand-written asm.
+# End-to-end GPU roundtrip test: Uses production globalReadDoSubtile /
+# localReadDoSubtile code paths.
 #
 # Tests multiple tile sizes, wave group configs ([2,2], [1,4], [4,1]),
 # and stride variants (stride==depthU, stride>depthU).
 #
 # Usage:
-#   pytest test_graLraIntegration_v2.py -v -s
-#   python test_graLraIntegration_v2.py --debug --wave all
+#   pytest test_gr_lr_roundtrip.py -v -s
+#   python test_gr_lr_roundtrip.py --debug --wave all
 ################################################################################
 
 import os
@@ -55,7 +55,7 @@ CONFIGS = [
     # Stride > depthU variants
     TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=128, stride_b=128),
     TileConfig(mt_a=96,  mt_b=128, depth_u=64, stride_a=128, stride_b=128),
-    
+
 ]
 
 
@@ -145,7 +145,7 @@ def generate_export_asm(wave_id, tileInfoA, tileInfoB):
     return "\n".join(lines), next_v
 
 
-def generate_integration_kernel_v2(cfg, wave_id=0):
+def generate_roundtrip_kernel(cfg, wave_id=0):
     """Generate a complete kernel using production GR/LR code paths."""
     init_rocisa()
 
@@ -344,7 +344,7 @@ def compare_tiles(actual_bytes, expected_tiles, tileInfoA, tileInfoB, wave_id, d
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(not HAS_HIP, reason="HIP Python bindings not available")
-class TestGraLraIntegrationV2:
+class TestGrLrRoundtrip:
 
     @pytest.fixture(params=CONFIGS, ids=lambda c: c.label)
     def cfg(self, request):
@@ -354,19 +354,19 @@ class TestGraLraIntegrationV2:
     def wave_id(self, request):
         return request.param
 
-    def test_gra_to_lds_to_lra_roundtrip(self, cfg, wave_id, tmp_path):
+    def test_gr_lr_roundtrip(self, cfg, wave_id, tmp_path):
         """Verify GR -> LDS -> LR roundtrip using production code paths."""
         sys.stdout.flush()
 
         kernel_asm, writer, kernel, tileInfoA, tileInfoB, output_size = \
-            generate_integration_kernel_v2(cfg, wave_id=wave_id)
+            generate_roundtrip_kernel(cfg, wave_id=wave_id)
 
         # Create input data
         input_A = np.arange(1, cfg.mt_a * cfg.stride_a + 1, dtype=np.float16)
         input_B = -np.arange(1, cfg.mt_b * cfg.stride_b + 1, dtype=np.float16)
 
         lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
-        label = f"v2_{cfg.label}_wave{wave_id}"
+        label = f"roundtrip_{cfg.label}_wave{wave_id}"
         output_bytes = assemble_and_run(kernel_asm, tmp_path, label, output_size,
                                         inputs=(input_A, input_B),
                                         scalars=(cfg.stride_a, cfg.stride_b),
@@ -384,7 +384,7 @@ class TestGraLraIntegrationV2:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="GRA+LRA integration GPU test v2")
+    parser = argparse.ArgumentParser(description="GR/LR roundtrip GPU test")
     parser.add_argument("--debug", action="store_true",
                         help="Print detailed output and asm")
     parser.add_argument("--wave", default="all",
@@ -414,7 +414,7 @@ if __name__ == "__main__":
             print(f"\n  --- Wave {wave_id} ---")
 
             kernel_asm, writer, kernel, tileInfoA, tileInfoB, output_size = \
-                generate_integration_kernel_v2(cfg, wave_id=wave_id)
+                generate_roundtrip_kernel(cfg, wave_id=wave_id)
 
             num_tiles_a = len(tileInfoA.vgprTiles)
             num_tiles_b = len(tileInfoB.vgprTiles)
@@ -431,7 +431,7 @@ if __name__ == "__main__":
                 input_B = -np.arange(1, cfg.mt_b * cfg.stride_b + 1, dtype=np.float16)
 
                 lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
-                label = f"v2_{cfg.label}_wave{wave_id}"
+                label = f"roundtrip_{cfg.label}_wave{wave_id}"
                 output_bytes = assemble_and_run(kernel_asm, tmp_path, label, output_size,
                                                 inputs=(input_A, input_B),
                                                 scalars=(cfg.stride_a, cfg.stride_b),
