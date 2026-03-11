@@ -26,7 +26,7 @@ from gpu_test_helpers import (
     init_rocisa,
     assemble_kernel,
     generate_kernel_asm,
-    run_integration_on_gpu,
+    run_on_gpu,
 )
 
 from Tensile.Components.SubtileBasedKernel import (
@@ -359,7 +359,11 @@ class TestGraLraIntegrationV2:
         input_B = -np.arange(1, num_elements_B + 1, dtype=np.float16)
 
         # 4. Run on GPU
-        output_bytes = run_integration_on_gpu(co_path, input_A, input_B, cfg, output_size)
+        lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
+        output_bytes = run_on_gpu(co_path, output_size,
+                                  inputs=(input_A, input_B),
+                                  scalars=(cfg.stride_a, cfg.stride_b),
+                                  lds_size=lds_size)
 
         # 5. Compute expected and compare
         expected_tiles = compute_expected_output(cfg, tileInfoA, tileInfoB, kernel,
@@ -429,7 +433,11 @@ if __name__ == "__main__":
                 input_B = -np.arange(1, num_elements_B + 1, dtype=np.float16)
 
                 sys.stdout.flush()
-                output_bytes = run_integration_on_gpu(co_path, input_A, input_B, cfg, output_size)
+                lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
+                output_bytes = run_on_gpu(co_path, output_size,
+                                          inputs=(input_A, input_B),
+                                          scalars=(cfg.stride_a, cfg.stride_b),
+                                          lds_size=lds_size)
 
                 expected_tiles = compute_expected_output(cfg, tileInfoA, tileInfoB, kernel,
                                                         input_A, input_B, wave_id)

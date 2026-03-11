@@ -228,36 +228,6 @@ def init_rocisa():
 
 # ---- Kernel assembly generator ----
 
-# Pre-defined prologue / args for the two standard kernel layouts.
-
-EXPORT_PROLOGUE = """\
-  s_load_dwordx2 s[4:5], s[0:1], 0x00     // output_ptr
-  s_load_dword s[sgprStrideA0I], s[0:1], 0x08   // strideA -> s8
-  s_load_dword s[sgprStrideB1J], s[0:1], 0x0c   // strideB -> s9
-  s_waitcnt lgkmcnt(0)"""
-
-EXPORT_ARGS = (
-    ("output_ptr", 8, "global_buffer", "u32"),
-    ("strideA",    4, "by_value",      "u32"),
-    ("strideB",    4, "by_value",      "u32"),
-)
-
-EXPORT_SET_DIRECTIVES = ".set sgprStrideA0I, 8\n.set sgprStrideB1J, 9"
-
-INTEGRATION_PROLOGUE = """\
-  s_load_dwordx4 s[4:7], s[0:1], 0x00       // input_A_ptr (s[4:5]) + input_B_ptr (s[6:7])
-  s_load_dwordx4 s[8:11], s[0:1], 0x10      // output_ptr (s[8:9]) + strideA (s10) + strideB (s11)
-  s_waitcnt lgkmcnt(0)"""
-
-INTEGRATION_ARGS = (
-    ("input_A_ptr", 8, "global_buffer", "f16"),
-    ("input_B_ptr", 8, "global_buffer", "f16"),
-    ("output_ptr",  8, "global_buffer", "u32"),
-    ("strideA",     4, "by_value",      "u32"),
-    ("strideB",     4, "by_value",      "u32"),
-)
-
-
 def _generate_args_metadata(args):
     """Generate YAML args metadata and kernarg_segment_size from an args list.
 
@@ -303,6 +273,20 @@ def _scan_register_indices(*texts):
     return vgprs, sgprs
 
 
+_DEFAULT_PROLOGUE = """\
+  s_load_dwordx4 s[4:7], s[0:1], 0x00       // input_A_ptr (s[4:5]) + input_B_ptr (s[6:7])
+  s_load_dwordx4 s[8:11], s[0:1], 0x10      // output_ptr (s[8:9]) + strideA (s10) + strideB (s11)
+  s_waitcnt lgkmcnt(0)"""
+
+_DEFAULT_ARGS = (
+    ("input_A_ptr", 8, "global_buffer", "f16"),
+    ("input_B_ptr", 8, "global_buffer", "f16"),
+    ("output_ptr",  8, "global_buffer", "u32"),
+    ("strideA",     4, "by_value",      "u32"),
+    ("strideB",     4, "by_value",      "u32"),
+)
+
+
 def generate_kernel_asm(inner_asm, lds_size=0, set_directives="",
                         args=None, prologue=None):
     """Generate a complete AMDHSA kernel wrapping inner_asm.
@@ -313,17 +297,17 @@ def generate_kernel_asm(inner_asm, lds_size=0, set_directives="",
         set_directives:  .set lines for register name mappings.
         args:            Kernarg descriptors — sequence of
                          (name, size, value_kind, value_type) tuples.
-                         Defaults to INTEGRATION_ARGS.
-        prologue:        Prologue asm (kernarg loads). Defaults to
-                         INTEGRATION_PROLOGUE.
+                         Defaults to the integration layout (5 args, 32B).
+        prologue:        Prologue asm (kernarg loads). Defaults to the
+                         integration prologue.
 
     Returns:
         Assembly source string.
     """
     if args is None:
-        args = INTEGRATION_ARGS
+        args = _DEFAULT_ARGS
     if prologue is None:
-        prologue = INTEGRATION_PROLOGUE
+        prologue = _DEFAULT_PROLOGUE
 
     args_metadata, kernarg_size = _generate_args_metadata(args)
 
@@ -414,6 +398,12 @@ def generate_export_kernel(test_asm, export_reg, is_sgpr=False):
     Returns:
         Assembly source string.
     """
+    prologue = """\
+  s_load_dwordx2 s[4:5], s[0:1], 0x00     // output_ptr
+  s_load_dword s[sgprStrideA0I], s[0:1], 0x08   // strideA -> s8
+  s_load_dword s[sgprStrideB1J], s[0:1], 0x0c   // strideB -> s9
+  s_waitcnt lgkmcnt(0)"""
+
     # Find highest register indices used by test_asm
     vgpr_indices = set(int(m) for m in re.findall(r'\bv(\d+)\b', test_asm))
 
@@ -432,94 +422,13 @@ def generate_export_kernel(test_asm, export_reg, is_sgpr=False):
   // ---- Epilogue: Export register ----
 {epilogue}"""
 
-    return generate_kernel_asm(inner_asm, args=EXPORT_ARGS,
-                               prologue=EXPORT_PROLOGUE,
-                               set_directives=EXPORT_SET_DIRECTIVES)
-
-
-def run_integration_on_gpu(co_path, input_data_A, input_data_B, cfg, output_size=None):
-    """Launch an integration kernel on GPU and return output buffer.
-
-    Uses the standard integration kernarg layout:
-      input_A_ptr (8B), input_B_ptr (8B), output_ptr (8B), strideA (4B), strideB (4B)
-
-    Args:
-        co_path:      Path to assembled .co file.
-        input_data_A: numpy array of input values for matrix A.
-        input_data_B: numpy array of input values for matrix B.
-        cfg:          TileConfig with mt_a, mt_b, depth_u, stride_a, stride_b.
-        output_size:  Output buffer size in bytes (default: (mt_a+mt_b)*depth_u*BPE).
-
-    Returns:
-        bytes: Raw output buffer contents.
-    """
-    hip_check(hip.hipInit(0))
-
-    module = hip_check(hip.hipModuleLoad(co_path.encode() if isinstance(co_path, str) else co_path))
-    kernel = hip_check(hip.hipModuleGetFunction(module, b"test_kernel"))
-
-    input_bytes_A = input_data_A.tobytes()
-    input_bytes_B = input_data_B.tobytes()
-    input_size_A = len(input_bytes_A)
-    input_size_B = len(input_bytes_B)
-    if output_size is None:
-        output_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
-
-    lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
-
-    d_input_A = hip_check(hip.hipMalloc(input_size_A))
-    d_input_B = hip_check(hip.hipMalloc(input_size_B))
-    d_output = hip_check(hip.hipMalloc(output_size))
-
-    hip_check(hip.hipMemcpyHtoD(d_input_A, input_bytes_A, input_size_A))
-    hip_check(hip.hipMemcpyHtoD(d_input_B, input_bytes_B, input_size_B))
-    hip_check(hip.hipMemset(d_output, 0, output_size))
-
-    class KernelArgs(ctypes.Structure):
-        _fields_ = [
-            ("input_A_ptr", ctypes.c_uint64),
-            ("input_B_ptr", ctypes.c_uint64),
-            ("output_ptr", ctypes.c_uint64),
-            ("stride_a", ctypes.c_uint32),
-            ("stride_b", ctypes.c_uint32),
-        ]
-
-    kargs = KernelArgs(int(d_input_A), int(d_input_B), int(d_output),
-                       cfg.stride_a, cfg.stride_b)
-    kargs_size = ctypes.c_size_t(ctypes.sizeof(kargs))
-
-    HIP_LAUNCH_PARAM_BUFFER_POINTER = 0x01
-    HIP_LAUNCH_PARAM_BUFFER_SIZE    = 0x02
-    HIP_LAUNCH_PARAM_END            = 0x03
-
-    extra = (ctypes.c_void_p * 5)(
-        ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_POINTER),
-        ctypes.c_void_p(ctypes.addressof(kargs)),
-        ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_SIZE),
-        ctypes.c_void_p(ctypes.addressof(kargs_size)),
-        ctypes.c_void_p(HIP_LAUNCH_PARAM_END),
-    )
-
-    hip_check(hip.hipModuleLaunchKernel(
-        kernel,
-        1, 1, 1,
-        NUM_THREADS, 1, 1,
-        lds_size,
-        None,
-        None,
-        extra
-    ))
-    hip_check(hip.hipDeviceSynchronize())
-
-    h_output = bytearray(output_size)
-    hip_check(hip.hipMemcpyDtoH(h_output, d_output, output_size))
-
-    hip_check(hip.hipFree(d_input_A))
-    hip_check(hip.hipFree(d_input_B))
-    hip_check(hip.hipFree(d_output))
-    hip_check(hip.hipModuleUnload(module))
-
-    return bytes(h_output)
+    return generate_kernel_asm(inner_asm, prologue=prologue,
+                               set_directives=".set sgprStrideA0I, 8\n.set sgprStrideB1J, 9",
+                               args=(
+                                   ("output_ptr", 8, "global_buffer", "u32"),
+                                   ("strideA",    4, "by_value",      "u32"),
+                                   ("strideB",    4, "by_value",      "u32"),
+                               ))
 
 
 # ---- Assemble / run ----
@@ -550,58 +459,81 @@ def assemble_kernel(asm_source, output_path):
             os.unlink(obj_path)
 
 
-def run_on_gpu(co_path, stride_a, stride_b, num_threads):
-    """Load code object, launch kernel, read single output buffer."""
+def run_on_gpu(co_path, output_size, inputs=(), scalars=(), lds_size=0):
+    """Load code object, launch kernel, read output buffer.
+
+    Builds the kernarg struct dynamically: one u64 per input buffer pointer,
+    one u64 for the output pointer, then one u32 per scalar.
+
+    Args:
+        co_path:     Path to assembled .co file.
+        output_size: Output buffer size in bytes.
+        inputs:      Sequence of numpy arrays (or bytes-like) to upload as
+                     input buffers. Each becomes a u64 pointer in kernargs.
+        scalars:     Sequence of u32 scalar values appended after pointers.
+        lds_size:    Shared memory (LDS) size in bytes.
+
+    Returns:
+        bytes: Raw output buffer contents.
+    """
     hip_check(hip.hipInit(0))
-    device = hip_check(hip.hipGetDevice())
 
     module = hip_check(hip.hipModuleLoad(co_path.encode() if isinstance(co_path, str) else co_path))
     kernel = hip_check(hip.hipModuleGetFunction(module, b"test_kernel"))
 
-    buf_size = num_threads * 4  # 4 bytes per u32
-    d_out = hip_check(hip.hipMalloc(buf_size))
-    hip_check(hip.hipMemset(d_out, 0, buf_size))
+    # Upload input buffers
+    d_inputs = []
+    for inp in inputs:
+        data = inp.tobytes() if hasattr(inp, 'tobytes') else bytes(inp)
+        d_buf = hip_check(hip.hipMalloc(len(data)))
+        hip_check(hip.hipMemcpyHtoD(d_buf, data, len(data)))
+        d_inputs.append(d_buf)
 
-    class KernelArgs(ctypes.Structure):
-        _fields_ = [
-            ("ptr_out", ctypes.c_uint64),
-            ("stride_a", ctypes.c_uint32),
-            ("stride_b", ctypes.c_uint32),
-        ]
+    # Allocate output buffer
+    d_output = hip_check(hip.hipMalloc(output_size))
+    hip_check(hip.hipMemset(d_output, 0, output_size))
 
-    kargs = KernelArgs(int(d_out), stride_a, stride_b)
+    # Build kernarg struct: [input_ptrs...] + [output_ptr] + [scalars...]
+    fields = []
+    for i in range(len(d_inputs)):
+        fields.append((f"input_{i}", ctypes.c_uint64))
+    fields.append(("output_ptr", ctypes.c_uint64))
+    for i in range(len(scalars)):
+        fields.append((f"scalar_{i}", ctypes.c_uint32))
+
+    KernelArgs = type("KernelArgs", (ctypes.Structure,), {"_fields_": fields})
+    values = [int(d) for d in d_inputs] + [int(d_output)] + list(scalars)
+    kargs = KernelArgs(*values)
     kargs_size = ctypes.c_size_t(ctypes.sizeof(kargs))
 
-    HIP_LAUNCH_PARAM_BUFFER_POINTER = 0x01
-    HIP_LAUNCH_PARAM_BUFFER_SIZE    = 0x02
-    HIP_LAUNCH_PARAM_END            = 0x03
-
     extra = (ctypes.c_void_p * 5)(
-        ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_POINTER),
+        ctypes.c_void_p(0x01),  # HIP_LAUNCH_PARAM_BUFFER_POINTER
         ctypes.c_void_p(ctypes.addressof(kargs)),
-        ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_SIZE),
+        ctypes.c_void_p(0x02),  # HIP_LAUNCH_PARAM_BUFFER_SIZE
         ctypes.c_void_p(ctypes.addressof(kargs_size)),
-        ctypes.c_void_p(HIP_LAUNCH_PARAM_END),
+        ctypes.c_void_p(0x03),  # HIP_LAUNCH_PARAM_END
     )
 
     hip_check(hip.hipModuleLaunchKernel(
         kernel,
-        1, 1, 1,                 # grid
-        num_threads, 1, 1,       # block
-        0,                       # shared mem
-        None,                    # stream
-        None,                    # kernel params (unused with extra)
-        extra                    # extra params
+        1, 1, 1,
+        NUM_THREADS, 1, 1,
+        lds_size,
+        None,
+        None,
+        extra
     ))
     hip_check(hip.hipDeviceSynchronize())
 
-    h_out = bytearray(buf_size)
-    hip_check(hip.hipMemcpyDtoH(h_out, d_out, buf_size))
+    h_output = bytearray(output_size)
+    hip_check(hip.hipMemcpyDtoH(h_output, d_output, output_size))
 
-    hip_check(hip.hipFree(d_out))
+    for d_buf in d_inputs:
+        hip_check(hip.hipFree(d_buf))
+    hip_check(hip.hipFree(d_output))
     hip_check(hip.hipModuleUnload(module))
 
-    return struct.unpack(f"{num_threads}I", h_out)
+    return bytes(h_output)
 
 
 def build_and_run(test_asm, export_reg, is_sgpr, cfg, tmp_path, label):
@@ -613,7 +545,10 @@ def build_and_run(test_asm, export_reg, is_sgpr, cfg, tmp_path, label):
     with open(asm_path, "w") as f:
         f.write(asm)
     assemble_kernel(asm, co_path)
-    return run_on_gpu(co_path, cfg.stride_a, cfg.stride_b, NUM_THREADS)
+    output_size = NUM_THREADS * 4
+    raw = run_on_gpu(co_path, output_size,
+                     scalars=(cfg.stride_a, cfg.stride_b))
+    return struct.unpack(f"{NUM_THREADS}I", raw)
 
 
 # ---- Utilities ----
