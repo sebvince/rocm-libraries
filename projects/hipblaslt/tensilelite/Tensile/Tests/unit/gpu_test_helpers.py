@@ -348,6 +348,226 @@ amdhsa.kernels:
 """
 
 
+# ---- Integration kernel template ----
+
+def generate_integration_kernel_asm(inner_asm, lds_size, extra_set_directives=""):
+    """Generate a complete integration kernel wrapping inner_asm.
+
+    Standard kernarg layout (32 bytes):
+      offset 0:  input_A_ptr (8B) -> s[4:5]
+      offset 8:  input_B_ptr (8B) -> s[6:7]
+      offset 16: output_ptr  (8B) -> s[8:9]
+      offset 24: strideA     (4B) -> s10
+      offset 28: strideB     (4B) -> s11
+
+    The kernel prologue loads these kernargs, then executes inner_asm,
+    then ends with s_waitcnt + s_endpgm.
+
+    Args:
+        inner_asm:            Assembly code between prologue and endpgm.
+        lds_size:             LDS allocation size in bytes.
+        extra_set_directives: Additional .set lines (e.g. for SrdA, SrdB).
+
+    Returns:
+        Assembly source string.
+    """
+    # Auto-compute register counts from inner_asm + set directives
+    vgpr_indices = set(int(m) for m in re.findall(r'\bv(\d+)\b', inner_asm))
+    sgpr_indices = set(int(m) for m in re.findall(r'\bs(\d+)\b', inner_asm))
+
+    # Also account for sgpr/vgpr indices in .set directives (symbolic references
+    # in inner_asm are resolved by the assembler, but the kernel descriptor needs
+    # to declare enough registers to cover them)
+    set_sgpr_indices = set(int(m) for m in re.findall(r'\.set\s+sgpr\w+,\s*(\d+)', extra_set_directives))
+    set_vgpr_indices = set(int(m) for m in re.findall(r'\.set\s+vgpr\w+,\s*(\d+)', extra_set_directives))
+    sgpr_indices |= set_sgpr_indices
+    vgpr_indices |= set_vgpr_indices
+
+    max_vgpr = max(vgpr_indices | {0}) + 1
+    max_sgpr = max(sgpr_indices | {11}) + 1  # at least s0-s11 for kernarg layout
+    max_vgpr = max(((max_vgpr + 3) // 4) * 4, 4)  # align to 4 for accum_offset
+
+    return f"""\
+.amdgcn_target "amdgcn-amd-amdhsa--{GFX_TARGET}"
+
+// Register name mappings
+.set vgprSerial, 0
+{extra_set_directives}
+
+.text
+.protected test_kernel
+.globl test_kernel
+.p2align 8
+.type test_kernel,@function
+
+.section .rodata,#alloc
+.p2align 6
+.amdhsa_kernel test_kernel
+  .amdhsa_user_sgpr_kernarg_segment_ptr 1
+  .amdhsa_accum_offset {max_vgpr}
+  .amdhsa_next_free_vgpr {max_vgpr}
+  .amdhsa_next_free_sgpr {max_sgpr}
+  .amdhsa_group_segment_fixed_size {lds_size}
+  .amdhsa_private_segment_fixed_size 0
+  .amdhsa_system_sgpr_workgroup_id_x 1
+  .amdhsa_system_sgpr_workgroup_id_y 0
+  .amdhsa_system_sgpr_workgroup_id_z 0
+  .amdhsa_system_vgpr_workitem_id 0
+  .amdhsa_float_denorm_mode_32 3
+  .amdhsa_float_denorm_mode_16_64 3
+.end_amdhsa_kernel
+
+.text
+test_kernel:
+  // ---- Prologue: Load kernel arguments ----
+  s_load_dwordx4 s[4:7], s[0:1], 0x00       // input_A_ptr (s[4:5]) + input_B_ptr (s[6:7])
+  s_load_dwordx4 s[8:11], s[0:1], 0x10      // output_ptr (s[8:9]) + strideA (s10) + strideB (s11)
+  s_waitcnt lgkmcnt(0)
+
+  // ---- Test code ----
+{inner_asm}
+  s_waitcnt vmcnt(0)
+  s_endpgm
+
+.amdgpu_metadata
+---
+amdhsa.version:
+  - 1
+  - 1
+amdhsa.kernels:
+  - .name: test_kernel
+    .symbol: 'test_kernel.kd'
+    .language: OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .args:
+      - .name:            input_A_ptr
+        .size:            8
+        .offset:          0
+        .value_kind:      global_buffer
+        .value_type:      f16
+        .address_space:   global
+      - .name:            input_B_ptr
+        .size:            8
+        .offset:          8
+        .value_kind:      global_buffer
+        .value_type:      f16
+        .address_space:   global
+      - .name:            output_ptr
+        .size:            8
+        .offset:          16
+        .value_kind:      global_buffer
+        .value_type:      u32
+        .address_space:   global
+      - .name:            strideA
+        .size:            4
+        .offset:          24
+        .value_kind:      by_value
+        .value_type:      u32
+      - .name:            strideB
+        .size:            4
+        .offset:          28
+        .value_kind:      by_value
+        .value_type:      u32
+    .kernarg_segment_size: 32
+    .kernarg_segment_align: 8
+    .group_segment_fixed_size: {lds_size}
+    .private_segment_fixed_size: 0
+    .wavefront_size: {WAVESIZE}
+    .sgpr_count: {max_sgpr}
+    .vgpr_count: {max_vgpr}
+    .max_flat_workgroup_size: {NUM_THREADS}
+...
+.end_amdgpu_metadata
+"""
+
+
+def run_integration_on_gpu(co_path, input_data_A, input_data_B, cfg, output_size=None):
+    """Launch an integration kernel on GPU and return output buffer.
+
+    Uses the standard integration kernarg layout:
+      input_A_ptr (8B), input_B_ptr (8B), output_ptr (8B), strideA (4B), strideB (4B)
+
+    Args:
+        co_path:      Path to assembled .co file.
+        input_data_A: numpy array of input values for matrix A.
+        input_data_B: numpy array of input values for matrix B.
+        cfg:          TileConfig with mt_a, mt_b, depth_u, stride_a, stride_b.
+        output_size:  Output buffer size in bytes (default: (mt_a+mt_b)*depth_u*BPE).
+
+    Returns:
+        bytes: Raw output buffer contents.
+    """
+    hip_check(hip.hipInit(0))
+
+    module = hip_check(hip.hipModuleLoad(co_path.encode() if isinstance(co_path, str) else co_path))
+    kernel = hip_check(hip.hipModuleGetFunction(module, b"test_kernel"))
+
+    input_bytes_A = input_data_A.tobytes()
+    input_bytes_B = input_data_B.tobytes()
+    input_size_A = len(input_bytes_A)
+    input_size_B = len(input_bytes_B)
+    if output_size is None:
+        output_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
+
+    lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
+
+    d_input_A = hip_check(hip.hipMalloc(input_size_A))
+    d_input_B = hip_check(hip.hipMalloc(input_size_B))
+    d_output = hip_check(hip.hipMalloc(output_size))
+
+    hip_check(hip.hipMemcpyHtoD(d_input_A, input_bytes_A, input_size_A))
+    hip_check(hip.hipMemcpyHtoD(d_input_B, input_bytes_B, input_size_B))
+    hip_check(hip.hipMemset(d_output, 0, output_size))
+
+    class KernelArgs(ctypes.Structure):
+        _fields_ = [
+            ("input_A_ptr", ctypes.c_uint64),
+            ("input_B_ptr", ctypes.c_uint64),
+            ("output_ptr", ctypes.c_uint64),
+            ("stride_a", ctypes.c_uint32),
+            ("stride_b", ctypes.c_uint32),
+        ]
+
+    kargs = KernelArgs(int(d_input_A), int(d_input_B), int(d_output),
+                       cfg.stride_a, cfg.stride_b)
+    kargs_size = ctypes.c_size_t(ctypes.sizeof(kargs))
+
+    HIP_LAUNCH_PARAM_BUFFER_POINTER = 0x01
+    HIP_LAUNCH_PARAM_BUFFER_SIZE    = 0x02
+    HIP_LAUNCH_PARAM_END            = 0x03
+
+    extra = (ctypes.c_void_p * 5)(
+        ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_POINTER),
+        ctypes.c_void_p(ctypes.addressof(kargs)),
+        ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_SIZE),
+        ctypes.c_void_p(ctypes.addressof(kargs_size)),
+        ctypes.c_void_p(HIP_LAUNCH_PARAM_END),
+    )
+
+    hip_check(hip.hipModuleLaunchKernel(
+        kernel,
+        1, 1, 1,
+        NUM_THREADS, 1, 1,
+        lds_size,
+        None,
+        None,
+        extra
+    ))
+    hip_check(hip.hipDeviceSynchronize())
+
+    h_output = bytearray(output_size)
+    hip_check(hip.hipMemcpyDtoH(h_output, d_output, output_size))
+
+    hip_check(hip.hipFree(d_input_A))
+    hip_check(hip.hipFree(d_input_B))
+    hip_check(hip.hipFree(d_output))
+    hip_check(hip.hipModuleUnload(module))
+
+    return bytes(h_output)
+
+
 # ---- Assemble / run ----
 
 def assemble_kernel(asm_source, output_path):

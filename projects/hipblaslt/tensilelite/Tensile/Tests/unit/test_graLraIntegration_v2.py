@@ -11,28 +11,23 @@
 #   python test_graLraIntegration_v2.py --debug --wave all
 ################################################################################
 
-import ctypes
 import os
-import re
 import sys
 import tempfile
 
 import pytest
 import numpy as np
-from types import SimpleNamespace
 
 from gpu_test_helpers import (
     HAS_HIP,
     TileConfig,
-    BPE, WAVESIZE, NUM_THREADS, NUM_WAVES,
-    GFX_TARGET,
+    BPE, WAVESIZE, NUM_THREADS,
     create_writer_for_subtile_test,
     init_rocisa,
     assemble_kernel,
+    generate_integration_kernel_asm,
+    run_integration_on_gpu,
 )
-
-if HAS_HIP:
-    from hip import hip  # type: ignore
 
 from Tensile.Components.SubtileBasedKernel import (
     graTileAssignment,
@@ -61,17 +56,6 @@ CONFIGS = [
 ]
 
 
-def hip_check(result):
-    """Check HIP call result."""
-    if isinstance(result, tuple):
-        err = result[0]
-        if err != 0:
-            raise RuntimeError(f"HIP error {err}")
-        return result[1] if len(result) == 2 else result[1:]
-    if result != 0:
-        raise RuntimeError(f"HIP error {result}")
-
-
 # ---------------------------------------------------------------------------
 # Assembly generation using production code paths
 # ---------------------------------------------------------------------------
@@ -82,24 +66,6 @@ def generate_set_directives(named_sgprs):
     for name, idx in named_sgprs.items():
         lines.append(f".set sgpr{name}, {idx}")
     return "\n".join(lines)
-
-
-def generate_prologue():
-    """Load kernargs into sgprs.
-
-    Kernarg layout (32 bytes):
-      offset 0:  input_A_ptr (8B) -> s[4:5]
-      offset 8:  input_B_ptr (8B) -> s[6:7]
-      offset 16: output_ptr  (8B) -> s[8:9]
-      offset 24: strideA     (4B) -> s10
-      offset 28: strideB     (4B) -> s11
-    """
-    return """\
-  // ---- Prologue: Load kernel arguments ----
-  s_load_dwordx4 s[4:7], s[0:1], 0x00       // input_A_ptr (s[4:5]) + input_B_ptr (s[6:7])
-  s_load_dwordx4 s[8:11], s[0:1], 0x10      // output_ptr (s[8:9]) + strideA (s10) + strideB (s11)
-  s_waitcnt lgkmcnt(0)
-"""
 
 
 def generate_srd_setup(named_sgprs):
@@ -193,32 +159,33 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
 
     writer, kernel, tileInfoA, tileInfoB, named_sgprs = create_writer_for_subtile_test(cfg)
 
-    # Step 4: GRA + LRA offset computation
+    # GRA + LRA offset computation
     gra_module = graTileAssignment(writer, kernel, useSwizzling=True)
     lra_module = lraTileAssignment(writer, kernel)
 
-    # Step 5: DTL init (computes LocalWriteBaseAddr from waveId)
+    # DTL init (computes LocalWriteBaseAddr from waveId)
     dtl_module = globalReadDTLInitCommonSgpr(writer, kernel)
 
-    # Step 6: Global read
+    # Global read
     gr_a_module = globalReadDoSubtile('A', writer, kernel)
     gr_b_module = globalReadDoSubtile('B', writer, kernel)
 
-    # Step 7: Wait + Barrier
+    # Wait + Barrier
     wait_gr = SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1)
     barrier = SBarrier()
 
-    # Step 8: Local read
+    # Local read
     lr_a_module = localReadDoSubtile('A', writer, kernel)
     lr_b_module = localReadDoSubtile('B', writer, kernel)
 
-    # Step 9: Wait for LR
+    # Wait for LR
     wait_lr = SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1)
 
-    # Step 10: Export
-    export_asm, next_v = generate_export_asm(wave_id, tileInfoA, tileInfoB)
+    # Export
+    export_asm, _next_v = generate_export_asm(wave_id, tileInfoA, tileInfoB)
 
-    # Combine all generated asm
+    # Build inner_asm: SRD setup + production code + export
+    srd_setup = generate_srd_setup(named_sgprs)
     production_asm = "\n".join([
         str(gra_module),
         str(lra_module),
@@ -232,196 +199,25 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
         str(wait_lr),
     ])
 
-    # Find highest register indices in the combined asm
-    full_asm_text = production_asm + "\n" + export_asm
-    vgpr_indices = set(int(m) for m in re.findall(r'\bv(\d+)\b', full_asm_text))
-    sgpr_indices = set(int(m) for m in re.findall(r'\bs(\d+)\b', full_asm_text))
+    inner_asm = f"""{srd_setup}
+  // ---- GRA + LRA offset computation ----
+{production_asm}
 
-    max_vgpr = max(vgpr_indices | {next_v - 1}) + 1
-    max_sgpr = max(sgpr_indices | {11}) + 1
-    max_vgpr = max(((max_vgpr + 3) // 4) * 4, 4)
+  // ---- Export ----
+{export_asm}
+"""
 
     lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
-
     set_directives = generate_set_directives(named_sgprs)
-    prologue = generate_prologue()
-    srd_setup = generate_srd_setup(named_sgprs)
+
+    kernel_asm = generate_integration_kernel_asm(inner_asm, lds_size, set_directives)
 
     num_tiles_a = len(tileInfoA.vgprTiles)
     num_tiles_b = len(tileInfoB.vgprTiles)
     total_tiles = num_tiles_a + num_tiles_b
     output_size = total_tiles * WAVESIZE * 16
 
-    kernel_asm = f"""\
-.amdgcn_target "amdgcn-amd-amdhsa--{GFX_TARGET}"
-
-// Register name mappings
-.set vgprSerial, 0
-{set_directives}
-
-.text
-.protected test_kernel
-.globl test_kernel
-.p2align 8
-.type test_kernel,@function
-
-.section .rodata,#alloc
-.p2align 6
-.amdhsa_kernel test_kernel
-  .amdhsa_user_sgpr_kernarg_segment_ptr 1
-  .amdhsa_accum_offset {max_vgpr}
-  .amdhsa_next_free_vgpr {max_vgpr}
-  .amdhsa_next_free_sgpr {max_sgpr}
-  .amdhsa_group_segment_fixed_size {lds_size}
-  .amdhsa_private_segment_fixed_size 0
-  .amdhsa_system_sgpr_workgroup_id_x 1
-  .amdhsa_system_sgpr_workgroup_id_y 0
-  .amdhsa_system_sgpr_workgroup_id_z 0
-  .amdhsa_system_vgpr_workitem_id 0
-  .amdhsa_float_denorm_mode_32 3
-  .amdhsa_float_denorm_mode_16_64 3
-.end_amdhsa_kernel
-
-.text
-test_kernel:
-{prologue}
-{srd_setup}
-  // ---- GRA + LRA offset computation ----
-{production_asm}
-
-  // ---- Export ----
-{export_asm}
-
-  s_waitcnt vmcnt(0)
-  s_endpgm
-
-.amdgpu_metadata
----
-amdhsa.version:
-  - 1
-  - 1
-amdhsa.kernels:
-  - .name: test_kernel
-    .symbol: 'test_kernel.kd'
-    .language: OpenCL C
-    .language_version:
-      - 2
-      - 0
-    .args:
-      - .name:            input_A_ptr
-        .size:            8
-        .offset:          0
-        .value_kind:      global_buffer
-        .value_type:      f16
-        .address_space:   global
-      - .name:            input_B_ptr
-        .size:            8
-        .offset:          8
-        .value_kind:      global_buffer
-        .value_type:      f16
-        .address_space:   global
-      - .name:            output_ptr
-        .size:            8
-        .offset:          16
-        .value_kind:      global_buffer
-        .value_type:      u32
-        .address_space:   global
-      - .name:            strideA
-        .size:            4
-        .offset:          24
-        .value_kind:      by_value
-        .value_type:      u32
-      - .name:            strideB
-        .size:            4
-        .offset:          28
-        .value_kind:      by_value
-        .value_type:      u32
-    .kernarg_segment_size: 32
-    .kernarg_segment_align: 8
-    .group_segment_fixed_size: {lds_size}
-    .private_segment_fixed_size: 0
-    .wavefront_size: {WAVESIZE}
-    .sgpr_count: {max_sgpr}
-    .vgpr_count: {max_vgpr}
-    .max_flat_workgroup_size: {NUM_THREADS}
-...
-.end_amdgpu_metadata
-"""
-
     return kernel_asm, writer, kernel, tileInfoA, tileInfoB, named_sgprs, output_size
-
-
-# ---------------------------------------------------------------------------
-# GPU execution
-# ---------------------------------------------------------------------------
-
-def run_integration_on_gpu(co_path, input_data_A, input_data_B, cfg, output_size):
-    """Launch integration kernel and return output buffer."""
-    hip_check(hip.hipInit(0))
-
-    module = hip_check(hip.hipModuleLoad(co_path.encode() if isinstance(co_path, str) else co_path))
-    kernel = hip_check(hip.hipModuleGetFunction(module, b"test_kernel"))
-
-    input_bytes_A = input_data_A.tobytes()
-    input_bytes_B = input_data_B.tobytes()
-    input_size_A = len(input_bytes_A)
-    input_size_B = len(input_bytes_B)
-
-    lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
-
-    d_input_A = hip_check(hip.hipMalloc(input_size_A))
-    d_input_B = hip_check(hip.hipMalloc(input_size_B))
-    d_output = hip_check(hip.hipMalloc(output_size))
-
-    hip_check(hip.hipMemcpyHtoD(d_input_A, input_bytes_A, input_size_A))
-    hip_check(hip.hipMemcpyHtoD(d_input_B, input_bytes_B, input_size_B))
-    hip_check(hip.hipMemset(d_output, 0, output_size))
-
-    class KernelArgs(ctypes.Structure):
-        _fields_ = [
-            ("input_A_ptr", ctypes.c_uint64),
-            ("input_B_ptr", ctypes.c_uint64),
-            ("output_ptr", ctypes.c_uint64),
-            ("stride_a", ctypes.c_uint32),
-            ("stride_b", ctypes.c_uint32),
-        ]
-
-    kargs = KernelArgs(int(d_input_A), int(d_input_B), int(d_output),
-                       cfg.stride_a, cfg.stride_b)
-    kargs_size = ctypes.c_size_t(ctypes.sizeof(kargs))
-
-    HIP_LAUNCH_PARAM_BUFFER_POINTER = 0x01
-    HIP_LAUNCH_PARAM_BUFFER_SIZE    = 0x02
-    HIP_LAUNCH_PARAM_END            = 0x03
-
-    extra = (ctypes.c_void_p * 5)(
-        ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_POINTER),
-        ctypes.c_void_p(ctypes.addressof(kargs)),
-        ctypes.c_void_p(HIP_LAUNCH_PARAM_BUFFER_SIZE),
-        ctypes.c_void_p(ctypes.addressof(kargs_size)),
-        ctypes.c_void_p(HIP_LAUNCH_PARAM_END),
-    )
-
-    hip_check(hip.hipModuleLaunchKernel(
-        kernel,
-        1, 1, 1,
-        NUM_THREADS, 1, 1,
-        lds_size,
-        None,
-        None,
-        extra
-    ))
-    hip_check(hip.hipDeviceSynchronize())
-
-    h_output = bytearray(output_size)
-    hip_check(hip.hipMemcpyDtoH(h_output, d_output, output_size))
-
-    hip_check(hip.hipFree(d_input_A))
-    hip_check(hip.hipFree(d_input_B))
-    hip_check(hip.hipFree(d_output))
-    hip_check(hip.hipModuleUnload(module))
-
-    return bytes(h_output)
 
 
 # ---------------------------------------------------------------------------
