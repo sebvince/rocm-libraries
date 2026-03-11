@@ -157,7 +157,7 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
     """Generate a complete kernel using production GR/LR code paths."""
     init_rocisa()
 
-    writer, kernel, tileInfoA, tileInfoB, named_sgprs = create_writer_for_subtile_test(cfg)
+    writer, kernel, tileInfoA, tileInfoB = create_writer_for_subtile_test(cfg)
 
     # GRA + LRA offset computation
     gra_module = graTileAssignment(writer, kernel, useSwizzling=True)
@@ -185,7 +185,7 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
     export_asm, _next_v = generate_export_asm(wave_id, tileInfoA, tileInfoB)
 
     # Build inner_asm: SRD setup + production code + export
-    srd_setup = generate_srd_setup(named_sgprs)
+    srd_setup = generate_srd_setup(writer.sgprs)
     production_asm = "\n".join([
         str(gra_module),
         str(lra_module),
@@ -208,7 +208,7 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
 """
 
     lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
-    set_directives = generate_set_directives(named_sgprs)
+    set_directives = generate_set_directives(writer.sgprs)
 
     kernel_asm = generate_kernel_asm(inner_asm, lds_size, set_directives)
 
@@ -217,7 +217,7 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
     total_tiles = num_tiles_a + num_tiles_b
     output_size = total_tiles * WAVESIZE * 16
 
-    return kernel_asm, writer, kernel, tileInfoA, tileInfoB, named_sgprs, output_size
+    return kernel_asm, writer, kernel, tileInfoA, tileInfoB, output_size
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +339,7 @@ class TestGraLraIntegrationV2:
         sys.stdout.flush()
 
         # 1. Generate kernel assembly
-        kernel_asm, writer, kernel, tileInfoA, tileInfoB, named_sgprs, output_size = \
+        kernel_asm, writer, kernel, tileInfoA, tileInfoB, output_size = \
             generate_integration_kernel_v2(cfg, wave_id=wave_id)
 
         # 2. Assemble
@@ -407,7 +407,7 @@ if __name__ == "__main__":
             total_tests += 1
             print(f"\n  --- Wave {wave_id} ---")
 
-            kernel_asm, writer, kernel, tileInfoA, tileInfoB, named_sgprs, output_size = \
+            kernel_asm, writer, kernel, tileInfoA, tileInfoB, output_size = \
                 generate_integration_kernel_v2(cfg, wave_id=wave_id)
 
             num_tiles_a = len(tileInfoA.vgprTiles)

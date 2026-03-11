@@ -145,6 +145,7 @@ def create_writer_for_gpu(cfg):
                                     defaultPreventOverflow=False, printRP=False)
     writer.sgprPool = RegisterPool(0, RegisterType.Sgpr,
                                     defaultPreventOverflow=False, printRP=False)
+    writer.sgprs = {}
 
     # Reserve v0 for Serial (hardware workitem_id)
     writer.vgprPool.checkOut(1)
@@ -153,6 +154,8 @@ def create_writer_for_gpu(cfg):
     # s[0:1]=kernarg, s2=workgroup_id_x, s3=pad,
     # s[4:5]=input_A, s[6:7]=input_B, s[8:9]=output, s10=strideA, s11=strideB
     writer.sgprPool.checkOut(12)
+    writer.sgprs["StrideA0I"] = 10
+    writer.sgprs["StrideB1J"] = 11
 
     # Build kernel and TileInfo
     kernel = _create_kernel(cfg)
@@ -181,19 +184,19 @@ def create_writer_for_subtile_test(cfg):
       - ldsStartOffset{A,B} for emitSubtileBufferLoad m0 calculations
       - vgprTile registers allocated via TileInfo.allocVgprTileRegisters
 
+    Sgpr name→index mappings are stored in writer.sgprs (like production
+    KernelWriter.defineSgpr), so callers can generate .set directives from it.
+
     Returns:
-        (writer, kernel, tileInfoA, tileInfoB, named_sgprs)
-        named_sgprs maps symbolic names to allocated sgpr indices for .set directives.
+        (writer, kernel, tileInfoA, tileInfoB)
     """
     writer, kernel, tileInfoA, tileInfoB = create_writer_for_gpu(cfg)
 
-    # Allocate SrdA: 4 sgprs, 4-aligned
-    srdA = writer.sgprPool.checkOutAligned(4, 4, "SrdA", preventOverflow=False)
-    # Allocate SrdB: 4 sgprs, 4-aligned
-    srdB = writer.sgprPool.checkOutAligned(4, 4, "SrdB", preventOverflow=False)
-    # Allocate LocalWriteBaseAddr and LocalWriteDTLOffset
-    lwba = writer.sgprPool.checkOut(1, "LocalWriteBaseAddr", preventOverflow=False)
-    lwdtl = writer.sgprPool.checkOut(1, "LocalWriteDTLOffset", preventOverflow=False)
+    # Allocate named sgprs (mirroring KernelWriter.defineSgpr)
+    writer.sgprs["SrdA"] = writer.sgprPool.checkOutAligned(4, 4, "SrdA", preventOverflow=False)
+    writer.sgprs["SrdB"] = writer.sgprPool.checkOutAligned(4, 4, "SrdB", preventOverflow=False)
+    writer.sgprs["LocalWriteBaseAddr"] = writer.sgprPool.checkOut(1, "LocalWriteBaseAddr", preventOverflow=False)
+    writer.sgprs["LocalWriteDTLOffset"] = writer.sgprPool.checkOut(1, "LocalWriteDTLOffset", preventOverflow=False)
 
     # Set LDS start offsets used by emitSubtileBufferLoad
     writer.ldsStartOffsetA = 0
@@ -203,16 +206,7 @@ def create_writer_for_subtile_test(cfg):
     tileInfoA.allocVgprTileRegisters(writer, kernel)
     tileInfoB.allocVgprTileRegisters(writer, kernel)
 
-    named_sgprs = {
-        "SrdA": srdA,
-        "SrdB": srdB,
-        "StrideA0I": 10,
-        "StrideB1J": 11,
-        "LocalWriteBaseAddr": lwba,
-        "LocalWriteDTLOffset": lwdtl,
-    }
-
-    return writer, kernel, tileInfoA, tileInfoB, named_sgprs
+    return writer, kernel, tileInfoA, tileInfoB
 
 
 def init_rocisa():
