@@ -25,7 +25,7 @@ from gpu_test_helpers import (
     create_writer_for_subtile_test,
     init_rocisa,
     assemble_kernel,
-    generate_integration_kernel_asm,
+    generate_kernel_asm,
     run_integration_on_gpu,
 )
 
@@ -210,7 +210,7 @@ def generate_integration_kernel_v2(cfg, wave_id=0):
     lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
     set_directives = generate_set_directives(named_sgprs)
 
-    kernel_asm = generate_integration_kernel_asm(inner_asm, lds_size, set_directives)
+    kernel_asm = generate_kernel_asm(inner_asm, lds_size, set_directives)
 
     num_tiles_a = len(tileInfoA.vgprTiles)
     num_tiles_b = len(tileInfoB.vgprTiles)
