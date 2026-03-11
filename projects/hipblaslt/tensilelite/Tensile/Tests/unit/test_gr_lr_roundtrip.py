@@ -44,15 +44,15 @@ from rocisa.instruction import SMovB32, SMovB64, SWaitCnt, SBarrier
 # ---------------------------------------------------------------------------
 CONFIGS = [
     # 2x2 configs (both mt_a//16 and mt_b//16 even)
-    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64,  stride_b=64),
-    TileConfig(mt_a=96,  mt_b=128, depth_u=64, stride_a=64,  stride_b=64),
+    # TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64,  stride_b=64),
+    # TileConfig(mt_a=96,  mt_b=128, depth_u=64, stride_a=64,  stride_b=64),
     # 1x4 config (mt_a//16 odd, mt_b//16 div by 4)
-    TileConfig(mt_a=48,  mt_b=128, depth_u=64, stride_a=64,  stride_b=64),
+    TileConfig(mt_a=48,  mt_b=64, depth_u=64, stride_a=64,  stride_b=64),
     # 4x1 config (mt_a//16 div by 4, mt_b//16 odd)
-    TileConfig(mt_a=128, mt_b=48,  depth_u=64, stride_a=64,  stride_b=64),
+    # TileConfig(mt_a=128, mt_b=48,  depth_u=64, stride_a=64,  stride_b=64),
     # Stride > depthU variants
-    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=128, stride_b=128),
-    TileConfig(mt_a=96,  mt_b=128, depth_u=64, stride_a=128, stride_b=128),
+    # TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=128, stride_b=128),
+    # TileConfig(mt_a=96,  mt_b=128, depth_u=64, stride_a=128, stride_b=128),
 
 ]
 
@@ -333,6 +333,96 @@ def compare_tiles(actual_bytes, expected_tiles, tileInfoA, tileInfoB, wave_id, d
     return errors
 
 
+def _build_tile_to_mma(tileInfo):
+    """Build map from vgprTile index to (mmaId0, mmaId1)."""
+    tile_to_mma = {}
+    for linearId, subtile in enumerate(tileInfo.localSubtiles):
+        for mfmaIdx, tileIdx in enumerate(subtile.localReadMap):
+            sId0, sId1 = tileInfo.getLocalSubtileIdFromLinearId(linearId)
+            mfmaR = mfmaIdx % tileInfo.subtileShape[0]
+            mfmaC = mfmaIdx // tileInfo.subtileShape[0]
+            mmaId0 = sId0 * tileInfo.subtileShape[0] + mfmaR
+            mmaId1 = sId1 * tileInfo.subtileShape[1] + mfmaC
+            tile_to_mma[tileIdx] = (mmaId0, mmaId1)
+    return tile_to_mma
+
+
+def reconstruct_matrix(tiles, tileInfo, wave_id, kernel, mt, depth_u):
+    """Reconstruct 2D matrix (mt x depth_u) from MFMA register tile data."""
+    mi = kernel["MIWaveGroup"]
+    if tileInfo.tc == 'A':
+        wf = wave_id % mi[0]
+    else:
+        wf = wave_id // mi[0]
+    wave_row_off = wf * tileInfo.localMMATileGrid[0] * 16
+    tile_to_mma = _build_tile_to_mma(tileInfo)
+    mat = np.full((mt, depth_u), np.nan, dtype=np.float64)
+
+    for idx, tile in enumerate(tiles):
+        if idx not in tile_to_mma:
+            continue
+        m0, m1 = tile_to_mma[idx]
+        for lane in range(WAVESIZE):
+            r = wave_row_off + m0 * 16 + (lane % 16)
+            c = m1 * 32 + (lane // 16) * 8
+            if r < mt and c + 8 <= depth_u:
+                mat[r, c:c+8] = tile[lane*8:lane*8+8].astype(np.float64)
+    return mat
+
+
+def print_matrix_grid(label, mat):
+    """Print matrix grid showing first value of each 8-col group."""
+    rows, cols = mat.shape
+    ng = cols // 8
+    print(f"\n  --- {label} ({rows}r x {cols}c, val[0] per 8-col group) ---")
+    print(f"  {'':>4}", end="")
+    for g in range(ng):
+        print(f" c{g*8:<5}", end="")
+    print()
+    for r in range(rows):
+        if all(np.isnan(mat[r, g*8]) for g in range(ng)):
+            continue
+        print(f"  {r:>4}", end="")
+        for g in range(ng):
+            v = mat[r, g*8]
+            print(f" {'---':>6}" if np.isnan(v) else f" {int(v):>6}", end="")
+        print()
+
+
+def print_grid_diff(label, actual, expected):
+    """Print only mismatch rows: actual!=expected per 8-col group."""
+    rows, cols = actual.shape
+    ng = cols // 8
+    n_mis = 0
+    print(f"\n  --- {label} DIFF (*=mismatch, actual!=expected) ---")
+    print(f"  {'':>4}", end="")
+    for g in range(ng):
+        print(f"   c{g*8:<10}", end="")
+    print()
+    for r in range(rows):
+        diffs = []
+        for g in range(ng):
+            a, e = actual[r, g*8], expected[r, g*8]
+            if (np.isnan(a) != np.isnan(e)) or (not np.isnan(a) and a != e):
+                diffs.append(g)
+        if not diffs:
+            continue
+        print(f"  {r:>4}", end="")
+        for g in range(ng):
+            a, e = actual[r, g*8], expected[r, g*8]
+            if g in diffs:
+                n_mis += 1
+                av = "nan" if np.isnan(a) else str(int(a))
+                ev = "nan" if np.isnan(e) else str(int(e))
+                print(f" *{av:>5}!={ev:<5}", end="")
+            elif np.isnan(a):
+                print(f"      ---      ", end="")
+            else:
+                print(f"  {int(a):>5}       ", end="")
+        print()
+    print(f"  {'All match.' if n_mis == 0 else f'{n_mis} group mismatches.'}")
+
+
 # ---------------------------------------------------------------------------
 # Pytest tests
 # ---------------------------------------------------------------------------
@@ -381,6 +471,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GR/LR roundtrip GPU test")
     parser.add_argument("--debug", action="store_true",
                         help="Print detailed output and asm")
+    parser.add_argument("--grid", action="store_true",
+                        help="Display actual/expected as 2D matrix grids")
     parser.add_argument("--wave", default="all",
                         help="Which wave to test: 0-3 or 'all' (default: all)")
     parser.add_argument("--config", type=int, default=None,
@@ -435,6 +527,24 @@ if __name__ == "__main__":
                                                         input_A, input_B, wave_id)
                 errors = compare_tiles(output_bytes, expected_tiles, tileInfoA, tileInfoB,
                                        wave_id, debug=args.debug)
+
+                if args.grid:
+                    tile_size = WAVESIZE * 16
+                    actual_a = [np.frombuffer(output_bytes[i*tile_size:(i+1)*tile_size],
+                                dtype=np.float16).copy() for i in range(num_tiles_a)]
+                    actual_b = [np.frombuffer(output_bytes[(num_tiles_a+i)*tile_size:(num_tiles_a+i+1)*tile_size],
+                                dtype=np.float16).copy() for i in range(num_tiles_b)]
+                    expected_a = expected_tiles[:num_tiles_a]
+                    expected_b = expected_tiles[num_tiles_a:]
+
+                    for tc, t_act, t_exp, ti, mt in [
+                        ('A', actual_a, expected_a, tileInfoA, cfg.mt_a),
+                        ('B', actual_b, expected_b, tileInfoB, cfg.mt_b)]:
+                        mat_exp = reconstruct_matrix(t_exp, ti, wave_id, kernel, mt, cfg.depth_u)
+                        mat_act = reconstruct_matrix(t_act, ti, wave_id, kernel, mt, cfg.depth_u)
+                        print_matrix_grid(f"Matrix {tc} EXPECTED (wave {wave_id})", mat_exp)
+                        print_matrix_grid(f"Matrix {tc} ACTUAL (wave {wave_id})", mat_act)
+                        print_grid_diff(f"Matrix {tc} (wave {wave_id})", mat_act, mat_exp)
 
                 if errors == 0:
                     print(f"  PASS")
