@@ -504,6 +504,7 @@ def _applyWavePartitionLROffset(module, writer, kernel, tileInfo, waveId):
 
   elif tileInfo.loadRatioGR == 0.5:
     MT0 = tileInfo.globalMMATileGrid[0] * tileInfo.mmaTileShape[0]
+    # 48x64x64- ?
     module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0 * depthUBytes // 4), comment="%s: interleave stride"%tc))
     module.add(VAndB32(dst=vgpr(tmp1), src0=hex(1), src1=vgpr(waveId), comment="%s: waveId & 1"%tc))
     module.add(VMulLOU32(dst=vgpr(tmp1), src1=vgpr(tmp1), src0=sgpr(tmpSgpr), comment="%s: interleave offset"%tc))
@@ -949,6 +950,8 @@ def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
         offset = (sId0//2)*2*tileInfo.subtileSize
         if sId0%2 == 1:
           offset += 512
+      elif tileInfo.loadRatioGR == 0.5:
+        offset = sId0*4*tileInfo.subtileSize#?TODO: need to verify this calculation, depends on how the wave partitioning is applied
       else:
         offset = sId0*2*tileInfo.subtileSize
       
