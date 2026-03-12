@@ -214,7 +214,7 @@ def generate_roundtrip_kernel(cfg, wave_id=0):
         str(wait_lr),
         str(export_asm)
     ])
-
+    print(inner_asm)
     args = (
         ("input_A_ptr", 8, "global_buffer", "f16"),
         ("input_B_ptr", 8, "global_buffer", "f16"),

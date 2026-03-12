@@ -435,8 +435,7 @@ class TileInfo:
 
 
 def _applySplitOffset(module, writer, kernel, tileInfo, lane16):
-  tc = tileInfo.tc
-  if tileInfo.loadRatioGR <= 1.0:
+    tc = tileInfo.tc
     wavesize = kernel["WavefrontSize"]
     depthUBytes = kernel["DepthU"] * tileInfo.bpe
     loadWidth = tileInfo.mmaTileShape[0] * tileInfo.mmaTileShape[1] * tileInfo.bpe // wavesize
@@ -935,6 +934,7 @@ def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
   linearId = tileInfo.getLocalSubtileLinearId(sId0, sId1)
   subtileInfo = tileInfo.localSubtiles[linearId]
 
+
   for mfmaC in range(tileInfo.subtileShape[1]):
     for mfmaR in range(tileInfo.subtileShape[0]):
       mfmaId = tileInfo.getSubtileShapeLinearId(mfmaC, mfmaR)
@@ -942,7 +942,14 @@ def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
       dstTile = tileInfo.vgprTiles[subtileInfo.localReadMap[mfmaId]]
       dstVgpr = dstTile.regList.regValues[0]
       numRegs = len(dstTile.regList.regValues)
-      offset = sId0*2*tileInfo.subtileSize
+
+      if tileInfo.loadRatioGR == 2.0:
+        offset = (sId0//2)*2*tileInfo.subtileSize
+        if sId0%2 == 1:
+          offset += 512
+      else:
+        offset = sId0*2*tileInfo.subtileSize
+      
       module.add(DSLoadB128(dst=vgpr(dstVgpr, numRegs), src=vgpr(addrVgpr), ds=DSModifiers(offset=offset),
                             comment="Subtile%s[%u,%u] mfmaId=[%u,%u]"%(tileInfo.tc, sId0, sId1, mfmaR, mfmaC)))
 
