@@ -61,6 +61,38 @@ CONFIGS = [
 # Assembly generation using production code paths
 # ---------------------------------------------------------------------------
 
+def generate_lds_zero_init(lds_size):
+    """Generate assembly to zero-init LDS.
+
+    Each thread writes dwordx4 (16 bytes) per iteration, looping until
+    the entire LDS region is zeroed.
+    """
+    bytes_per_thread = 16  # ds_write_b128
+    total_threads = NUM_THREADS
+    bytes_per_iter = bytes_per_thread * total_threads
+    num_iters = (lds_size + bytes_per_iter - 1) // bytes_per_iter
+
+    lines = []
+    lines.append("  // ---- LDS zero init ----")
+    # Use v[2:5] as zero data (must be even-aligned for ds_write_b128), v1 as offset
+    lines.append("  v_mov_b32 v2, 0")
+    lines.append("  v_mov_b32 v3, 0")
+    lines.append("  v_mov_b32 v4, 0")
+    lines.append("  v_mov_b32 v5, 0")
+    # Base offset = threadId * 16
+    lines.append(f"  v_lshlrev_b32 v1, 4, v0  // threadId * 16")
+
+    for i in range(num_iters):
+        iter_offset = i * bytes_per_iter
+        if iter_offset == 0:
+            lines.append(f"  ds_write_b128 v1, v[2:5]")
+        else:
+            lines.append(f"  ds_write_b128 v1, v[2:5] offset:{iter_offset}")
+    lines.append("  s_waitcnt lgkmcnt(0)")
+    lines.append("  s_barrier")
+    return "\n".join(lines)
+
+
 def generate_srd_setup():
     """Generate SRD buffer descriptor setup for A and B using rocisa instructions."""
     module = Module("SRD setup")
@@ -162,9 +194,10 @@ def generate_roundtrip_kernel(cfg, wave_id=0):
     writer.sgprs["LocalWriteBaseAddr"] = writer.sgprPool.checkOut(1, "LocalWriteBaseAddr", preventOverflow=False)
     writer.sgprs["LocalWriteDTLOffset"] = writer.sgprPool.checkOut(1, "LocalWriteDTLOffset", preventOverflow=False)
     writer.ldsStartOffsetA = 0
-    writer.ldsStartOffsetB = cfg.mt_a * cfg.depth_u * BPE
+    writer.ldsStartOffsetB = (cfg.mt_a)* cfg.depth_u * BPE
     tileInfoA.allocVgprTileRegisters(writer, kernel)
     tileInfoB.allocVgprTileRegisters(writer, kernel)
+    print(tileInfoA)
 
     # GRA + LRA offset computation
     gra_module = graTileAssignment(writer, kernel, useSwizzling=True)
@@ -197,15 +230,18 @@ def generate_roundtrip_kernel(cfg, wave_id=0):
         (8, 4, 0x10, "output_ptr + strideA + strideB"),
     ])
     srd_module = generate_srd_setup()
+    lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
+    lds_init = generate_lds_zero_init(lds_size)
 
     # Put everyting together
     inner_asm = "\n".join([
         str(prologue),
         str(srd_module),
+        lds_init,
         str(gra_module),
         str(lra_module),
         str(dtl_module),
-        str(gr_a_module),
+        # str(gr_a_module),
         str(gr_b_module),
         str(wait_gr),
         str(barrier),
@@ -223,7 +259,6 @@ def generate_roundtrip_kernel(cfg, wave_id=0):
         ("strideB",     4, "by_value",      "u32"),
     )
 
-    lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
     kernel_asm = generate_kernel_asm(inner_asm, writer, args, lds_size)
 
     num_tiles_a = len(tileInfoA.vgprTiles)

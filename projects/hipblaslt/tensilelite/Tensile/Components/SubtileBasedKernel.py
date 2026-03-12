@@ -545,6 +545,9 @@ def setExecMask(module, writer, maskLo, maskHi):
   module.add(SMovB64(dst=EXEC(), src=sgpr(tmpSgpr, 2), comment="Set exec mask"))
   writer.sgprPool.checkIn(tmpSgpr)
 
+def clearExecMask(module, writer):
+  module.add(SMovB64(dst=EXEC(), src=-1, comment="clear exec mask"))
+
 ##################################################
 # Subroutine to generate LR offset calculation code
 #
@@ -866,7 +869,7 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
 ##################################################
 # Subroutine to generate GR load code
 #
-def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
+def emitSubtileBufferLoad(tc, writer, kernel, subtileId, isSingleSubtileLoad):
   module = Module()
   sId0 = subtileId[0]
   sId1 = subtileId[1]
@@ -898,7 +901,13 @@ def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
     useSgpr = subtileInfo.useSgpr
     soffset = sgpr(regList.regValues[0]) if len(regList) > 0 and useSgpr else 0
     voff = tileInfo.sharedVgprGROffset[i] if useSgpr or len(regList) == 0 else regList.regValues[i]
-    module.add(BufferLoadB128(dst=None, vaddr=vgpr(voff), saddr=sgpr("Srd%s"%tc, 4), soffset=soffset, mubuf=mubuf, comment=""))
+    if isSingleSubtileLoad:
+      setExecMask(module, writer, -1 , 0)
+      module.add(BufferLoadB128(dst=None, vaddr=vgpr(voff), saddr=sgpr("Srd%s"%tc, 4), soffset=soffset, mubuf=mubuf, comment="Partial subtile load with exec mask"))
+      clearExecMask(module, writer)
+    else:
+      module.add(BufferLoadB128(dst=None, vaddr=vgpr(voff), saddr=sgpr("Srd%s"%tc, 4), soffset=soffset, mubuf=mubuf, comment=""))
+      
 
   return module
 
@@ -911,6 +920,12 @@ def globalReadDoSubtile(tc, writer, kernel):
 
   tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
 
+  # When loading 2x subtiles, mask 2nd subtile for odd number of subtiles in the 1st dimension to avoid OOB
+  # We could use LDS padding to avoid doing this.
+  maskLastSubtile = False
+  if tileInfo.loadRatioGR == 2.0 and tileInfo.localSubtileGrid[0] % 2 != 0:
+    maskLastSubtile = True
+
   grTracker = set()
   for i in range(tileInfo.localSubtileGrid[0]):
     for j in range(tileInfo.localSubtileGrid[1]):
@@ -919,7 +934,7 @@ def globalReadDoSubtile(tc, writer, kernel):
         for grId in grIds:
           grTracker.add(grId)
         module.addComment0("Emit load for %s subtile: [%u, %u]"%(tc, i, j))
-        module.add(emitSubtileBufferLoad(tc, writer, kernel, [i, j]))
+        module.add(emitSubtileBufferLoad(tc, writer, kernel, [i, j], maskLastSubtile and i==tileInfo.localSubtileGrid[0]-1))
       else:
         module.addComment0("Emit load for %s subtile: [%u, %u] - already covered"%(tc, i, j))
 
@@ -986,6 +1001,7 @@ def globalReadDTLInitCommonSgpr(writer, kernel):
   module.add(SNop(waitState=0, comment="Wait for VGPR to be ready"))
   module.add(VReadfirstlaneB32(dst=sgpr("LocalWriteBaseAddr"), src=vgpr(vgprWaveId), comment="Store base LDS offset, will be modified"))
   module.add(VReadfirstlaneB32(dst=sgpr("LocalWriteDTLOffset"), src=vgpr(vgprWaveId), comment="Store DTL wave-specific offset, this will not be modified"))
+  module.add(SNop(waitState=0, comment="Wait for VGPR to be ready"))
   writer.vgprPool.checkIn(vgprWaveId)
   return module
 
