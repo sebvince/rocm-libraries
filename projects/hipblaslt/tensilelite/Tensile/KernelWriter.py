@@ -4651,6 +4651,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
       aTileInfo = self.states.a.tileInfo
       numASubtiles = aTileInfo.globalSubtileGrid[0] * aTileInfo.globalSubtileGrid[1]
       self.ldsStartOffsetB = numASubtiles * aTileInfo.subtileSize
+      
+      #TODO. Make sure it's in sync with metadata
+      # Padding for DTL 2xsubtile reads.
+      self.ldsStartOffsetB = ((self.ldsStartOffsetB +32-1)// 32)*32
 
 
     #print(self.states.a.tileInfo.getLocalSubtileId(1,0))

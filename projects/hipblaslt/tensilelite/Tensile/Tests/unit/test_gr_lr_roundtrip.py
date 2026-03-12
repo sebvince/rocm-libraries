@@ -162,7 +162,7 @@ def generate_roundtrip_kernel(cfg, wave_id=0):
     writer.sgprs["LocalWriteBaseAddr"] = writer.sgprPool.checkOut(1, "LocalWriteBaseAddr", preventOverflow=False)
     writer.sgprs["LocalWriteDTLOffset"] = writer.sgprPool.checkOut(1, "LocalWriteDTLOffset", preventOverflow=False)
     writer.ldsStartOffsetA = 0
-    writer.ldsStartOffsetB = cfg.mt_a * cfg.depth_u * BPE
+    writer.ldsStartOffsetB = roundUp(cfg.mt_a,32) * cfg.depth_u * BPE
     tileInfoA.allocVgprTileRegisters(writer, kernel)
     tileInfoB.allocVgprTileRegisters(writer, kernel)
 
@@ -422,7 +422,8 @@ def print_grid_diff(label, actual, expected):
         print()
     print(f"  {'All match.' if n_mis == 0 else f'{n_mis} group mismatches.'}")
 
-
+def roundUp(x, y):
+    return ((x + y - 1) // y) * y
 # ---------------------------------------------------------------------------
 # Pytest tests
 # ---------------------------------------------------------------------------
@@ -449,7 +450,7 @@ class TestGrLrRoundtrip:
         input_A = np.arange(1, cfg.mt_a * cfg.stride_a + 1, dtype=np.float16)
         input_B = -np.arange(1, cfg.mt_b * cfg.stride_b + 1, dtype=np.float16)
 
-        lds_size = (cfg.mt_a + cfg.mt_b) * cfg.depth_u * BPE
+        lds_size = (roundUp(cfg.mt_a,32) + roundUp(cfg.mt_b,32)) * cfg.depth_u * BPE
         label = f"roundtrip_{cfg.label}_wave{wave_id}"
         output_bytes = assemble_and_run(kernel_asm, tmp_path, label, output_size,
                                         inputs=(input_A, input_B),

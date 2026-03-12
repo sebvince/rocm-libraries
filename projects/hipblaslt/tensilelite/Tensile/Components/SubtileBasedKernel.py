@@ -612,9 +612,11 @@ def lraTileAssignment(writer, kernel):
   _lraWavePartitioning(module, writer, kernel)
 
   # Apply global offset on B (B data follows A in LDS).
-  MT0A = tileInfoA.globalMMATileGrid[0] * tileInfoA.mmaTileShape[0]
+  
+
+   
   tmpSgpr = writer.sgprPool.checkOut(1)
-  module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0A*depthUBytes), comment="LDS offset for B matrix"))
+  module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(writer.ldsStartOffsetB), comment="LDS offset for B matrix"))
   for vgprId in range(len(tileInfoB.sharedVgprLROffset)):
     module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src1=sgpr(tmpSgpr), comment="B matrix offset : mt0*depthUBytes"))
   writer.sgprPool.checkIn(tmpSgpr)
