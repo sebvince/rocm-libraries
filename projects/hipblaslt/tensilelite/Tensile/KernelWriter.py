@@ -4658,6 +4658,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       sizeA = ((numASubtiles * aTileInfo.subtileSize + readSize-1) // readSize) * readSize
       sizeB = ((numBSubtiles * bTileInfo.subtileSize + readSize-1) // readSize) * readSize
       self.ldsStartOffsetB = sizeA
+      assert kernel["NumLdsBlk"] == 2, "Subtile implementation currently requires NumLdsBlk=2"
       kernel["LdsNumBytes"] = (sizeA + sizeB) * kernel["NumLdsBlk"]
 
 
