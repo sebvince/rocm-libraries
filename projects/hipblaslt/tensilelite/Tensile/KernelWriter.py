@@ -4649,13 +4649,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       self.ldsStartOffsetA = 0
       aTileInfo = self.states.a.tileInfo
+      bTileInfo = self.states.b.tileInfo
       numASubtiles = aTileInfo.globalSubtileGrid[0] * aTileInfo.globalSubtileGrid[1]
-      self.ldsStartOffsetB = numASubtiles * aTileInfo.subtileSize
-      
-      #TODO. Make sure it's in sync with metadata
+      numBSubtiles = bTileInfo.globalSubtileGrid[0] * bTileInfo.globalSubtileGrid[1]
+
       readSize = 2*aTileInfo.subtileSize
-      # Padding for DTL 2xsubtile reads.
-      self.ldsStartOffsetB = ((self.ldsStartOffsetB +readSize-1)// readSize)*readSize
+      # Align A and B sizes to readSize for DTL 2xsubtile reads
+      sizeA = ((numASubtiles * aTileInfo.subtileSize + readSize-1) // readSize) * readSize
+      sizeB = ((numBSubtiles * bTileInfo.subtileSize + readSize-1) // readSize) * readSize
+      self.ldsStartOffsetB = sizeA
+      kernel["LdsNumBytes"] = (sizeA + sizeB) * kernel["NumLdsBlk"]
 
 
     #print(self.states.a.tileInfo.getLocalSubtileId(1,0))

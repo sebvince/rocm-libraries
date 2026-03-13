@@ -160,9 +160,8 @@ def create_writer(cfg):
         b=SimpleNamespace(tileInfo=tileInfoB),
         regCaps={"MaxSgpr": 106, "MaxVgpr": 256},
     )
-    readSize = LOAD_WIDTH * WAVESIZE* NUM_WAVES
-
-    # LDS layout: A subtiles followed by B subtiles 
+    # LDS layout: A subtiles followed by B subtiles, aligned to readSize
+    readSize = 2 * tileInfoA.subtileSize
     numASubtiles = tileInfoA.globalSubtileGrid[0] * tileInfoA.globalSubtileGrid[1]
     writer.ldsStartOffsetA = 0
     writer.ldsStartOffsetB = ((numASubtiles * tileInfoA.subtileSize + readSize-1) // readSize) * readSize
