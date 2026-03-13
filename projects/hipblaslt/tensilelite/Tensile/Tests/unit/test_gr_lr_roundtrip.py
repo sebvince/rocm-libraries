@@ -168,8 +168,6 @@ def generate_roundtrip_kernel(cfg, wave_id=0):
     writer.sgprs["SrdB"] = writer.sgprPool.checkOutAligned(4, 4, "SrdB", preventOverflow=False)
     writer.sgprs["LocalWriteBaseAddr"] = writer.sgprPool.checkOut(1, "LocalWriteBaseAddr", preventOverflow=False)
     writer.sgprs["LocalWriteDTLOffset"] = writer.sgprPool.checkOut(1, "LocalWriteDTLOffset", preventOverflow=False)
-    writer.ldsStartOffsetA = 0
-    writer.ldsStartOffsetB = roundUp(cfg.mt_a,32) * cfg.depth_u * BPE
     tileInfoA.allocVgprTileRegisters(writer, kernel)
     tileInfoB.allocVgprTileRegisters(writer, kernel)
 

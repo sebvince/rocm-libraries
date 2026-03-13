@@ -74,7 +74,7 @@ def export_register(writer, test_asm, export_reg, is_sgpr, cfg, tmp_path, label)
 
 # ---- Reference implementations ----
 
-def compute_expected_lr_offset(thread_id, cfg, tileInfo):
+def compute_expected_lr_offset(thread_id, cfg, tileInfo, ldsStartOffsetB=None):
     """Python reference implementation for LR (Local Read) offset computation.
     """
     depthUBytes = cfg.depth_u * BPE
@@ -87,11 +87,8 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
     numMFMACols = tileInfo.mmaTileShape[1]*tileInfo.bpe // LOAD_WIDTH
     laneId = thread_id % WAVESIZE
 
-    # Contiguous rows for loadRatioGR == 2.0, interleaved rows for loadRatioGR <= 1.0
-    if tileInfo.loadRatioGR == 2.0:
-        splitOffset = 0
-    else:
-        splitOffset = ((laneId % 16) // numRowsPerHalfWave)*(waveReadSize//2)
+    # Split wave offset: always applied (GPU kernel calls _applySplitOffset unconditionally)
+    splitOffset = ((laneId % 16) // numRowsPerHalfWave)*(waveReadSize//2)
 
     enableSwizzling = True
     if enableSwizzling:
@@ -145,20 +142,21 @@ def compute_expected_lr_offset(thread_id, cfg, tileInfo):
     # W1
     # W2
     # W3
-    # 1st buffer load (i, i + MT/2)
-    # 2nd buffer load (i+MT/4, i + MT/2 + MT/4)
-    # offset W2/W3 by numRowsPerHalfWave*depthUBytes to get i + MT/2
-    # offset W1/W3 by MT*depthUBytes//4 to get i + MT/4
+    # Wave pair offset (waveId // 2) * bytes_loaded//2
+    # Interleave offset (waveId & 1)  * MT*depthUBytes//2
     elif tileInfo.loadRatioGR == 0.5:
         if (waveId // 2) % 2 == 1:
             partitionOffset += numRowsPerHalfWave*depthUBytes
         if waveId % 2 == 1:
-            partitionOffset += MT * depthUBytes // 4
+            partitionOffset += MT * depthUBytes // 2
     elif tileInfo.loadRatioGR > 2.0:
         raise NotImplementedError("Unsupported loadRatioGR > 2.0 in reference implementation")
 
     if tileInfo.tc == 'B':
-        partitionOffset+= cfg.mt_a * depthUBytes # B is after A in memory
+        if ldsStartOffsetB is not None:
+            partitionOffset += ldsStartOffsetB
+        else:
+            partitionOffset += cfg.mt_a * depthUBytes
     for id in range(len(offsets)):
         offsets[id] += partitionOffset
 
@@ -258,7 +256,8 @@ class TestLraTileAssignmentGPU:
                                       cfg, lra_env.tmp_path, f"lr_offsetA_v{reg}_{cfg.label}")
 
             for tid in range(NUM_THREADS):
-                expected = compute_expected_lr_offset(tid, cfg, lra_env.tileInfoA)
+                expected = compute_expected_lr_offset(tid, cfg, lra_env.tileInfoA,
+                                                      lra_env.writer.ldsStartOffsetB)
                 assert results[tid] == expected[idx], \
                     f"[{cfg.label}] A LR offset[{idx}] v{reg} mismatch at tid={tid}: " \
                     f"got {results[tid]}, expected {expected[idx]}"
@@ -271,7 +270,8 @@ class TestLraTileAssignmentGPU:
                                       cfg, lra_env.tmp_path, f"lr_offsetB_v{reg}_{cfg.label}")
 
             for tid in range(NUM_THREADS):
-                expected = compute_expected_lr_offset(tid, cfg, lra_env.tileInfoB)
+                expected = compute_expected_lr_offset(tid, cfg, lra_env.tileInfoB,
+                                                      lra_env.writer.ldsStartOffsetB)
                 assert results[tid] == expected[idx], \
                     f"[{cfg.label}] B LR offset[{idx}] v{reg} mismatch at tid={tid}: " \
                     f"got {results[tid]}, expected {expected[idx]}"
@@ -324,7 +324,7 @@ if __name__ == "__main__":
                                               results, WAVESIZE, NUM_WAVES)
 
                             if args.debug:
-                                expected = [compute_expected_lr_offset(tid, cfg, tileInfo)[idx]
+                                expected = [compute_expected_lr_offset(tid, cfg, tileInfo, writer.ldsStartOffsetB)[idx]
                                             for tid in range(NUM_THREADS)]
                                 print_offset_grid(f"Matrix {tc} LR EXPECTED offset[{idx}] ({cfg.label})",
                                                   expected, WAVESIZE, NUM_WAVES)
@@ -345,7 +345,7 @@ if __name__ == "__main__":
 
                         errors = 0
                         for tid in range(NUM_THREADS):
-                            exp = compute_expected_lr_offset(tid, cfg, tileInfo)[idx]
+                            exp = compute_expected_lr_offset(tid, cfg, tileInfo, writer.ldsStartOffsetB)[idx]
                             if results[tid] != exp:
                                 errors += 1
                                 if not args.grid:
