@@ -44,15 +44,21 @@ from rocisa.instruction import SMovB32, SMovB64, SWaitCnt, SBarrier
 # ---------------------------------------------------------------------------
 CONFIGS = [
     # 2x2 configs (both mt_a//16 and mt_b//16 even)
-    # TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64,  stride_b=64),
-    # TileConfig(mt_a=96,  mt_b=128, depth_u=64, stride_a=64,  stride_b=64),
+    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=64,  stride_b=64),
+    TileConfig(mt_a=96,  mt_b=128, depth_u=64, stride_a=64,  stride_b=64),
     # 1x4 config (mt_a//16 odd, mt_b//16 div by 4)
     TileConfig(mt_a=48,  mt_b=64, depth_u=64, stride_a=64,  stride_b=64),
+    TileConfig(mt_a=48,  mt_b=128, depth_u=64, stride_a=64,  stride_b=64),
     # 4x1 config (mt_a//16 div by 4, mt_b//16 odd)
-    # TileConfig(mt_a=128, mt_b=48,  depth_u=64, stride_a=64,  stride_b=64),
+    TileConfig(mt_a=128, mt_b=48,  depth_u=64, stride_a=64,  stride_b=64),
+    TileConfig(mt_a=64,  mt_b=48, depth_u=64, stride_a=64,  stride_b=64),
     # Stride > depthU variants
-    # TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=128, stride_b=128),
-    # TileConfig(mt_a=96,  mt_b=128, depth_u=64, stride_a=128, stride_b=128),
+    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=128, stride_b=128),
+    TileConfig(mt_a=96,  mt_b=128, depth_u=64, stride_a=128, stride_b=128),
+
+    TileConfig(mt_a=128, mt_b=48,  depth_u=64, stride_a=64,  stride_b=64),
+    TileConfig(mt_a=256, mt_b=240,  depth_u=64, stride_a=64,  stride_b=64),
+    TileConfig(mt_a=240, mt_b=256,  depth_u=64, stride_a=64,  stride_b=64),
 
 ]
 
@@ -148,6 +154,7 @@ def generate_roundtrip_kernel(cfg, wave_id=0):
     init_rocisa()
 
     writer, kernel, tileInfoA, tileInfoB = create_writer(cfg)
+    print(tileInfoA)
 
     # Reserve s0-s11 for hardware regs + kernarg loads
     writer.sgprPool.checkOut(12)

@@ -504,8 +504,8 @@ def _applyWavePartitionLROffset(module, writer, kernel, tileInfo, waveId):
 
   elif tileInfo.loadRatioGR == 0.5:
     MT0 = tileInfo.globalMMATileGrid[0] * tileInfo.mmaTileShape[0]
-    # 48x64x64- ?
-    module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0 * depthUBytes // 4), comment="%s: interleave stride"%tc))
+    # Interleave stride is MT0 // 4 multiplied by 2 as split wave interleave 2 subtiles together.
+    module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(MT0 * depthUBytes // 2), comment="%s: interleave stride"%tc))
     module.add(VAndB32(dst=vgpr(tmp1), src0=hex(1), src1=vgpr(waveId), comment="%s: waveId & 1"%tc))
     module.add(VMulLOU32(dst=vgpr(tmp1), src1=vgpr(tmp1), src0=sgpr(tmpSgpr), comment="%s: interleave offset"%tc))
 
@@ -731,7 +731,6 @@ def _grComputeOffset(module, writer, tileInfo, col_id, row_id, split_id):
   module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprGROffset[0]), src0=vgpr(tmpVgpr), src1=vgpr(tmpVgpr+1), comment="%s: GR offset = row_offset + split_wave_offset"%tc))
 
   if len(tileInfo.sharedVgprGROffset)>1:
-    module.add(SMovB32(dst=sgpr(sHalfOffset), src=(MT0 * bpe) // 4, comment="%s: 2nd GR offset calc : + %u rows"%(tc,MT0 // 4)))
     module.add(SMulI32(dst=sgpr(sHalfOffset), src0=sgpr(strideRef), src1=(MT0 * bpe) // 4, comment="%s: 2nd GR offset calc : + %u rows"%(tc,MT0 // 4)))
     module.add(VAddU32(dst=vgpr(tileInfo.sharedVgprGROffset[1]), src0=vgpr(tileInfo.sharedVgprGROffset[0]), src1=sgpr(sHalfOffset), comment="%s: GR offset for 2nd subtile = GR offset + subtile row offset"%tc))
 
@@ -889,9 +888,16 @@ def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
 
   grBaseId = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, sId1)].globalReadMap[0]
 
+  # hacky fix. TODO. fix tracking subtile - GR - LDS location.
+  # when tileInfo.numGRPerSubtile>1 (loadRatioGR == 0.5), we load i,i+MT//2 and i + N, i+N+MT//2 with N localSubtileGrid[0] 
+  # It means we don't write to LDS contiguously.
+  subtileStride = 1
+  if tileInfo.numGRPerSubtile>1:
+    subtileStride = tileInfo.localSubtileGrid[0]
+    grBaseId=grBaseId//2
   # Emit number of buffer loads equal to number of loads needed to load a subtile
   for i in range(tileInfo.numGRPerSubtile):
-    module.add(SAddU32(dst=mgpr(0), src0=sgpr("LocalWriteBaseAddr"), src1=(m0Offset + (grBaseId + i) * numBytesPerLoadWG - offset)))
+    module.add(SAddU32(dst=mgpr(0), src0=sgpr("LocalWriteBaseAddr"), src1=(m0Offset + (grBaseId + i*subtileStride) * numBytesPerLoadWG - offset)))
     mubuf = MUBUFModifiers(offen=True, offset12=offset, glc=False, slc=False, nt=False, lds=True)
 
     # Check if the subtile specific registers is SGPR or VGPR
@@ -901,7 +907,7 @@ def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
     useSgpr = subtileInfo.useSgpr
     soffset = sgpr(regList.regValues[0]) if len(regList) > 0 and useSgpr else 0
     voff = tileInfo.sharedVgprGROffset[i] if useSgpr or len(regList) == 0 else regList.regValues[i]
-    module.add(BufferLoadB128(dst=None, vaddr=vgpr(voff), saddr=sgpr("Srd%s"%tc, 4), soffset=soffset, mubuf=mubuf, comment=""))
+    module.add(BufferLoadB128(dst=None, vaddr=vgpr(voff), saddr=sgpr("Srd%s"%tc, 4), soffset=soffset, mubuf=mubuf, comment=" grBaseId = %u, offset= %u, i= %u"%(grBaseId, offset, i)))
 
   return module
 
@@ -936,7 +942,8 @@ def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
 
   linearId = tileInfo.getLocalSubtileLinearId(sId0, sId1)
   subtileInfo = tileInfo.localSubtiles[linearId]
-
+  loadWidth = 16
+  waveLoadSize = kernel["WavefrontSize"] * loadWidth
 
   for mfmaC in range(tileInfo.subtileShape[1]):
     for mfmaR in range(tileInfo.subtileShape[0]):
@@ -946,12 +953,13 @@ def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
       dstVgpr = dstTile.regList.regValues[0]
       numRegs = len(dstTile.regList.regValues)
 
+      # TileInfo.loadRatioGR == 2.0:
+      # We read i,i+1.
+      # for odd value we offset by waveLoadSize // 2
       if tileInfo.loadRatioGR == 2.0:
         offset = (sId0//2)*2*tileInfo.subtileSize
         if sId0%2 == 1:
-          offset += 512
-      elif tileInfo.loadRatioGR == 0.5:
-        offset = sId0*4*tileInfo.subtileSize#?TODO: need to verify this calculation, depends on how the wave partitioning is applied
+          offset += waveLoadSize // 2 #half wave
       else:
         offset = sId0*2*tileInfo.subtileSize
       
