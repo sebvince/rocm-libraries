@@ -403,6 +403,34 @@ class MFMAScheduler:
             if step.conflict:
                 print(f"    *** CONFLICT: USE/LOAD share VGPRTile IDs {step.conflict} — needs unrolling ***")
 
+        # Buffer loads summary per group (subtile IDs -> LDS)
+        # Groups 0..last-1 load for macrotile n+1 (delta, skip already-loaded subtiles)
+        # Last group wraps around and loads Group 0's full subtiles for macrotile n+2
+        numGroups = len(self.groups)
+        loadedA = set(self.groups[0].tileAIndices)
+        loadedB = set(self.groups[0].tileBIndices)
+        print()
+        print("Buffer loads per group (subtile IDs -> LDS):")
+        for gi in range(numGroups):
+            targetGi = (gi + 1) % numGroups
+            targetGroup = self.groups[targetGi]
+            isWrapAround = (gi == numGroups - 1)
+            if isWrapAround:
+                # Wrap-around: different macrotile (n+2), must reload all
+                bufLoadA = sorted(targetGroup.tileAIndices)
+                bufLoadB = sorted(targetGroup.tileBIndices)
+                mtLabel = "n+2"
+            else:
+                # Same macrotile (n+1): skip already-loaded subtiles
+                needA = set(targetGroup.tileAIndices)
+                needB = set(targetGroup.tileBIndices)
+                bufLoadA = sorted(needA - loadedA)
+                bufLoadB = sorted(needB - loadedB)
+                loadedA |= needA
+                loadedB |= needB
+                mtLabel = "n+1"
+            print(f"  Group {gi} -> buffer_load for Group {targetGi} (MT {mtLabel}):  A: {bufLoadA}  B: {bufLoadB}")
+
 
 if __name__ == "__main__":
     class MockTileInfo:
