@@ -29,6 +29,24 @@ class SchedulerConfig:
     ordering: SubgroupOrdering = SubgroupOrdering.SNAKE_COLUMN_MAJOR
 
 
+@dataclass
+class SubtileGroup:
+    """A rectangle (sizeA x sizeB) of subtiles processed together."""
+    groupId: int
+    sizeA: int
+    sizeB: int
+    subtiles: List[Tuple[int, int]] = field(default_factory=list)
+
+    @property
+    def tileAIndices(self) -> List[int]:
+        return sorted(set(t[0] for t in self.subtiles))
+
+    @property
+    def tileBIndices(self) -> List[int]:
+        return sorted(set(t[1] for t in self.subtiles))
+
+
+
 # Key type for allocator: (tileIdx, duIdx)
 AllocKey = Tuple[int, int]
 
@@ -85,22 +103,6 @@ class VGPRAllocator:
         return self._peak
 
 
-@dataclass
-class SubtileGroup:
-    """A rectangle (sizeA x sizeB) of subtiles processed together."""
-    groupId: int
-    sizeA: int
-    sizeB: int
-    subtiles: List[Tuple[int, int]] = field(default_factory=list)
-
-    @property
-    def tileAIndices(self) -> List[int]:
-        return sorted(set(t[0] for t in self.subtiles))
-
-    @property
-    def tileBIndices(self) -> List[int]:
-        return sorted(set(t[1] for t in self.subtiles))
-
 
 @dataclass
 class ScheduleStep:
@@ -112,6 +114,7 @@ class ScheduleStep:
     loadA: Dict[int, int] = field(default_factory=dict)
     loadB: Dict[int, int] = field(default_factory=dict)
     conflict: Set[int] = field(default_factory=set)
+    isWrapLoad: bool = False
 
 
 class MFMAScheduler:
@@ -224,6 +227,7 @@ class MFMAScheduler:
                 # LOAD: determined by prefetch mode
                 loadATiles, loadBTiles, loadDU = self._getLoadTargets(gi, du, numGroups)
                 isWrapAround = self._isWrapAroundLoad(gi, du, numGroups)
+                step.isWrapLoad = isWrapAround
                 curA = set(group.tileAIndices)
                 curB = set(group.tileBIndices)
                 if du == 0:
@@ -398,8 +402,11 @@ class MFMAScheduler:
 
         for step in self._schedule:
             print(f"  Group {step.groupId}, DU={step.duIndex}:")
+            mfmas = [(a, b) for a in sorted(step.useA.keys()) for b in sorted(step.useB.keys())]
+            print(f"    MFMAs: {mfmas}")
+            mtLoad = "n+1" if step.isWrapLoad else "n"
             print(f"    USE  A: {step.useA}  B: {step.useB}")
-            print(f"    LOAD A: {step.loadA}  B: {step.loadB}")
+            print(f"    LOAD (MT {mtLoad}) A: {step.loadA}  B: {step.loadB}")
             if step.conflict:
                 print(f"    *** CONFLICT: USE/LOAD share VGPRTile IDs {step.conflict} — needs unrolling ***")
 
@@ -430,6 +437,36 @@ class MFMAScheduler:
                 loadedB |= needB
                 mtLabel = "n+1"
             print(f"  Group {gi} -> buffer_load for Group {targetGi} (MT {mtLabel}):  A: {bufLoadA}  B: {bufLoadB}")
+
+        # Double-buffer LDS dependency: MT n+2 buffer_loads vs MT n ds_reads
+        # Find last ds_read (LOAD step) for each subtile that the last group buffer_loads
+        if numGroups > 1:
+            wrapGroup = self.groups[0]
+            wrapSubtilesA = set(wrapGroup.tileAIndices)
+            wrapSubtilesB = set(wrapGroup.tileBIndices)
+            # lastRead[tc][tileIdx] = (groupId, duIndex) of last LOAD referencing it
+            lastReadA = {t: ("bootstrap", -1) for t in wrapSubtilesA}
+            lastReadB = {t: ("bootstrap", -1) for t in wrapSubtilesB}
+            for step in self._schedule:
+                if step.isWrapLoad:
+                    continue  # wrap LOADs are MT n+1, not MT n reads
+                for tA in step.loadA:
+                    if tA in wrapSubtilesA:
+                        lastReadA[tA] = (step.groupId, step.duIndex)
+                for tB in step.loadB:
+                    if tB in wrapSubtilesB:
+                        lastReadB[tB] = (step.groupId, step.duIndex)
+
+            lastGroupId = self.groups[-1].groupId
+            print()
+            print(f"Double-buffer LDS dependency (MT n+2 writes vs MT n reads):")
+            print(f"  buffer_load at Group {lastGroupId} must wait for last ds_read of same subtile:")
+            for tA in sorted(wrapSubtilesA):
+                g, d = lastReadA[tA]
+                print(f"    A[{tA}]: last read at {f'Group {g}, DU={d}' if g != 'bootstrap' else 'bootstrap'}")
+            for tB in sorted(wrapSubtilesB):
+                g, d = lastReadB[tB]
+                print(f"    B[{tB}]: last read at {f'Group {g}, DU={d}' if g != 'bootstrap' else 'bootstrap'}")
 
 
 if __name__ == "__main__":
