@@ -40,11 +40,15 @@ class VGPRAllocator:
         self._nextId: int = 0
         self._peak: int = 0
         self._freeList: List[int] = []
-        self._allocMapA: Dict[AllocKey, int] = {}  # (tileA, du) -> vgprTileId
-        self._allocMapB: Dict[AllocKey, int] = {}  # (tileB, du) -> vgprTileId
+        self._allocMapA: Dict[AllocKey, int] = {}
+        self._allocMapB: Dict[AllocKey, int] = {}
 
     def _allocMap(self, tc: str) -> Dict[AllocKey, int]:
         return self._allocMapA if tc == 'A' else self._allocMapB
+
+    def _updatePeak(self):
+        current = len(self._allocMapA) + len(self._allocMapB)
+        self._peak = max(self._peak, current)
 
     def allocate(self, tc: str, tileIdx: int, duIdx: int) -> int:
         key = (tileIdx, duIdx)
@@ -54,7 +58,7 @@ class VGPRAllocator:
             vid = self._nextId
             self._nextId += 1
         self._allocMap(tc)[key] = vid
-        self._peak = max(self._peak, len(self._allocMapA) + len(self._allocMapB))
+        self._updatePeak()
         return vid
 
     def release(self, tc: str, tileIdx: int, duIdx: int) -> None:
@@ -78,7 +82,6 @@ class VGPRAllocator:
 
     @property
     def totalVGPRs(self) -> int:
-        """Peak number of shared VGPRTile IDs allocated simultaneously."""
         return self._peak
 
 
@@ -104,10 +107,11 @@ class ScheduleStep:
     """One DU iteration within one group."""
     groupId: int
     duIndex: int
-    useA: Dict[int, int] = field(default_factory=dict)   # tileA idx -> vgprTileId
-    useB: Dict[int, int] = field(default_factory=dict)   # tileB idx -> vgprTileId
-    loadA: Dict[int, int] = field(default_factory=dict)   # tileA idx -> vgprTileId
-    loadB: Dict[int, int] = field(default_factory=dict)   # tileB idx -> vgprTileId
+    useA: Dict[int, int] = field(default_factory=dict)
+    useB: Dict[int, int] = field(default_factory=dict)
+    loadA: Dict[int, int] = field(default_factory=dict)
+    loadB: Dict[int, int] = field(default_factory=dict)
+    conflict: Set[int] = field(default_factory=set)
 
 
 class MFMAScheduler:
@@ -135,6 +139,7 @@ class MFMAScheduler:
         self.allocator = VGPRAllocator()
         self._schedule: List[ScheduleStep] = []
         self.hasDuplicatedReads: bool = False
+        self.needsUnrolling: bool = False
 
         self._runSchedule()
 
@@ -185,13 +190,11 @@ class MFMAScheduler:
         """Allocate VGPRTile IDs for the first group before the main loop."""
         first = self.groups[0]
         if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
-            # Only DU=0 is pre-loaded
             for tA in first.tileAIndices:
                 self.allocator.allocate('A', tA, 0)
             for tB in first.tileBIndices:
                 self.allocator.allocate('B', tB, 0)
         elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
-            # Both DU=0 and DU=1 are pre-loaded
             for du in range(self.numDU):
                 for tA in first.tileAIndices:
                     self.allocator.allocate('A', tA, du)
@@ -218,56 +221,93 @@ class MFMAScheduler:
                 for tB in group.tileBIndices:
                     step.useB[tB] = self.allocator.getVGPRTileId('B', tB, du)
 
-                # WITHIN_SUBGROUP: release current group's tiles at current DU
-                # before loading, so VGPRs can be reused.
-                if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP:
-                    if du == self.numDU - 1:
-                        self._releaseGroupTiles(group)
-
                 # LOAD: determined by prefetch mode
                 loadATiles, loadBTiles, loadDU = self._getLoadTargets(gi, du, numGroups)
-                # Wrap-around: last group loads for next macrotile iteration
-                # into group 0's existing VGPRTile IDs.
                 isWrapAround = self._isWrapAroundLoad(gi, du, numGroups)
+                curA = set(group.tileAIndices)
+                curB = set(group.tileBIndices)
+                if du == 0:
+                    self._pendingRemap = []
 
                 if loadATiles is not None:
                     for tA in loadATiles:
-                        if isWrapAround and self.allocator.isAllocated('A', tA, loadDU):
-                            step.loadA[tA] = self.allocator.getVGPRTileId('A', tA, loadDU)
-                        elif not self.allocator.isAllocated('A', tA, loadDU):
-                            vid = self.allocator.allocate('A', tA, loadDU)
+                        vid = self._loadTile('A', tA, loadDU, isWrapAround, loadCountA, curA)
+                        if vid is not None:
                             step.loadA[tA] = vid
-                            key = (tA, loadDU)
-                            loadCountA[key] = loadCountA.get(key, 0) + 1
 
                 if loadBTiles is not None:
                     for tB in loadBTiles:
-                        if isWrapAround and self.allocator.isAllocated('B', tB, loadDU):
-                            step.loadB[tB] = self.allocator.getVGPRTileId('B', tB, loadDU)
-                        elif not self.allocator.isAllocated('B', tB, loadDU):
-                            vid = self.allocator.allocate('B', tB, loadDU)
+                        vid = self._loadTile('B', tB, loadDU, isWrapAround, loadCountB, curB)
+                        if vid is not None:
                             step.loadB[tB] = vid
-                            key = (tB, loadDU)
-                            loadCountB[key] = loadCountB.get(key, 0) + 1
 
-                # Assert USE and LOAD VGPRTile IDs don't overlap within a step
+                # Check USE and LOAD VGPRTile IDs don't overlap within a step
                 useIds = set(step.useA.values()) | set(step.useB.values())
                 loadIds = set(step.loadA.values()) | set(step.loadB.values())
                 overlap = useIds & loadIds
-                assert not overlap, \
-                    f"Group {step.groupId} DU={step.duIndex}: USE/LOAD VGPRTile ID conflict {overlap}. " \
-                    f"Need to implement unrolling."
+                if overlap:
+                    step.conflict = overlap
+                    self.needsUnrolling = True
 
                 self._schedule.append(step)
 
-            # ACROSS_SUBGROUP: release tiles not needed in future groups
-            if self.config.reuseStrategy == VGPRTileReUseStrategy.ACROSS_SUBGROUP:
+                # WITHIN_SUBGROUP: release current DU's USE tiles for K-dim reuse
+                # Only release tiles that were actually USEd (not tiles loaded for next group)
+                if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP:
+                    for tA, vid in step.useA.items():
+                        if self.allocator.isAllocated('A', tA, du):
+                            self.allocator.release('A', tA, du)
+                    for tB, vid in step.useB.items():
+                        if self.allocator.isAllocated('B', tB, du):
+                            self.allocator.release('B', tB, du)
+
+            # Release after group based on strategy
+            if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP:
+                # Per-DU release already freed USE tiles; just fixup shadow keys
+                for tc, tileIdx, duIdx, shadowKey in self._pendingRemap:
+                    vid = self.allocator._allocMap(tc).pop((shadowKey, duIdx))
+                    self.allocator._allocMap(tc)[(tileIdx, duIdx)] = vid
+                self._pendingRemap = []
+            elif self.config.reuseStrategy == VGPRTileReUseStrategy.ACROSS_SUBGROUP:
                 self._releaseUnusedAfterGroup(gi)
 
         self.hasDuplicatedReads = (
             any(c > 1 for c in loadCountA.values()) or
             any(c > 1 for c in loadCountB.values())
         )
+
+    def _loadTile(self, tc: str, tileIdx: int, loadDU: int,
+                  isWrapAround: bool, loadCount: Dict,
+                  currentGroupTiles: Set[int]) -> Optional[int]:
+        """Determine the VGPRTile ID for a load. Returns None if no load needed."""
+        allocated = self.allocator.isAllocated(tc, tileIdx, loadDU)
+
+        if isWrapAround and allocated:
+            # Wrap-around: reuse group 0's existing VGPRTile IDs
+            return self.allocator.getVGPRTileId(tc, tileIdx, loadDU)
+
+        if not allocated:
+            # Fresh allocation
+            vid = self.allocator.allocate(tc, tileIdx, loadDU)
+            key = (tileIdx, loadDU)
+            loadCount[key] = loadCount.get(key, 0) + 1
+            return vid
+
+        if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP \
+                and tileIdx in currentGroupTiles:
+            # Tile is allocated by the current group but will be released after it.
+            # Must allocate a new VGPR for the next group's data.
+            # Use a shadow key to avoid overwriting the current allocation.
+            shadowKey = -(tileIdx + 1)  # negative to avoid collision
+            vid = self.allocator.allocate(tc, shadowKey, loadDU)
+            # Store the real tileIdx mapping for later fixup
+            self._pendingRemap.append((tc, tileIdx, loadDU, shadowKey))
+            key = (tileIdx, loadDU)
+            loadCount[key] = loadCount.get(key, 0) + 1
+            return vid
+
+        # NONE / ACROSS_SUBGROUP: tile stays alive, reuse in place
+        return None
 
     def _isWrapAroundLoad(self, groupIdx: int, duIdx: int, numGroups: int) -> bool:
         """True when this step's load targets group 0 for the next macrotile iteration."""
@@ -293,11 +333,9 @@ class MFMAScheduler:
         Last group wraps around to group 0 (next iteration)."""
         currentGroup = self.groups[groupIdx]
         if duIdx < self.numDU - 1:
-            # Load DU=1 of the same group
             targetDU = duIdx + 1
             return (currentGroup.tileAIndices, currentGroup.tileBIndices, targetDU)
         else:
-            # Load DU=0 of the next group (wrap to group 0 for next iteration)
             nextGroup = self.groups[(groupIdx + 1) % numGroups]
             return (nextGroup.tileAIndices, nextGroup.tileBIndices, 0)
 
@@ -342,10 +380,10 @@ class MFMAScheduler:
         print(f"Prefetch: {self.config.prefetchMode.name}")
         print(f"Reuse: {self.config.reuseStrategy.name}")
         print(f"hasDuplicatedReads: {self.hasDuplicatedReads}")
+        print(f"needsUnrolling: {self.needsUnrolling}")
         print(f"totalVGPRTiles: {self.totalVGPRs} ({self.totalVGPRs * 4} VGPRs)")
         print()
 
-        # Print snake ordering grid
         grid = [[None] * self.numGroupsB for _ in range(self.numGroupsA)]
         sA = self.config.subtileGroupSizeA
         sB = self.config.subtileGroupSizeB
@@ -362,6 +400,8 @@ class MFMAScheduler:
             print(f"  Group {step.groupId}, DU={step.duIndex}:")
             print(f"    USE  A: {step.useA}  B: {step.useB}")
             print(f"    LOAD A: {step.loadA}  B: {step.loadB}")
+            if step.conflict:
+                print(f"    *** CONFLICT: USE/LOAD share VGPRTile IDs {step.conflict} — needs unrolling ***")
 
 
 if __name__ == "__main__":
@@ -374,21 +414,31 @@ if __name__ == "__main__":
     lsgA, lsgB = 8, 8
 
     configs = [
-        (f"lsg {lsgA}x{lsgB}, group 4x4, FULL_PREFETCH, NONE, COLUMN_MAJOR",
+         (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
          MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-         SchedulerConfig(4, 4, PrefetchMode.FULL_PREFETCH, VGPRTileReUseStrategy.NONE, SubgroupOrdering.COLUMN_MAJOR)),
-        # (f"lsg {lsgA}x{lsgB}, group 2x2, HALF_PREFETCH, ACROSS_SUBGROUP",
+         SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+
+         (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
+         MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
+         SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+
+
+
+        #  (f"lsg {lsgA}x{lsgB}, group 4x4, FULL_PREFETCH, NONE, COLUMN_MAJOR",
         #  MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-        #  SchedulerConfig(2, 2, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
-        # (f"lsg {lsgA}x{lsgB}, group 2x2, HALF_PREFETCH, WITHIN_SUBGROUP",
-        #  MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-        #  SchedulerConfig(2, 2, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP)),
-        # (f"lsg {lsgA}x{lsgB}, group 2x2, FULL_PREFETCH, WITHIN_SUBGROUP",
-        #  MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-        #  SchedulerConfig(2, 2, PrefetchMode.FULL_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP)),
-        # (f"lsg {lsgA}x{lsgB}, group 1x1, HALF_PREFETCH, ACROSS_SUBGROUP",
-        #  MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-        #  SchedulerConfig(1, 1, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
+        #  SchedulerConfig(8, 8, PrefetchMode.FULL_PREFETCH, VGPRTileReUseStrategy.NONE, SubgroupOrdering.COLUMN_MAJOR)),
+
+          (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, NONE, COLUMN_MAJOR",
+         MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
+         SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.NONE, SubgroupOrdering.COLUMN_MAJOR)),
+
+        # (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+        #     MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
+        #     SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+        
+        # (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
+        #     MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
+        #     SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
     ]
 
     for name, tiA, tiB, cfg in configs:
