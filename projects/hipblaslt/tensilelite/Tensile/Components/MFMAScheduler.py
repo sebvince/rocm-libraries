@@ -422,7 +422,25 @@ class MFMAScheduler:
                 loadedB |= needB
             bufferLoadsPerGroup[gi] = (bufA, bufB)
 
-        # Print steps with WAIT tracking
+        # Determine which DU each group's buffer_load goes in
+        # DU=0 unless buffer_load subtiles overlap with DU=0's LOAD (LDS conflict)
+        bufferLoadDU = {}  # gi -> 0 or 1
+        du0Steps = {step.groupId: step for step in self._schedule if step.duIndex == 0}
+        for gi in range(numGroups):
+            bufA, bufB = bufferLoadsPerGroup[gi]
+            if not bufA and not bufB:
+                bufferLoadDU[gi] = 0
+                continue
+            du0 = du0Steps.get(gi)
+            if du0:
+                du0LoadA = set(du0.loadA.keys())
+                du0LoadB = set(du0.loadB.keys())
+                hasConflict = bool((bufA & du0LoadA) or (bufB & du0LoadB))
+            else:
+                hasConflict = False
+            bufferLoadDU[gi] = 1 if hasConflict else 0
+
+        # Print steps with WAIT tracking and inline buffer_loads
         pendingA = set()
         pendingB = set()
         currentGroup = -1
@@ -440,6 +458,13 @@ class MFMAScheduler:
             duLabel = f", DU {step.loadDU}" if step.loadDU >= 0 else ""
             print(f"    USE  A: {step.useA}  B: {step.useB}")
 
+            # Show buffer_load at the assigned DU
+            bufA, bufB = bufferLoadsPerGroup[step.groupId]
+            if (bufA or bufB) and step.duIndex == bufferLoadDU[step.groupId]:
+                targetGi = (step.groupId + 1) % numGroups
+                bufMtLabel = "n+2" if step.groupId == numGroups - 1 else "n+1"
+                print(f"    BUFFER_LOAD (MT {bufMtLabel}) for Group {targetGi}:  A: {sorted(bufA)}  B: {sorted(bufB)}")
+
             # Check if LOAD needs a WAIT for pending buffer_loads
             # buffer_load writes DU 0 before DU 1, so only DU 0 reads need a WAIT
             waitA = set()
@@ -455,15 +480,6 @@ class MFMAScheduler:
             print(f"    LOAD (MT {mtLoad}{duLabel}) A: {step.loadA}  B: {step.loadB}")
             if step.conflict:
                 print(f"    *** CONFLICT: USE/LOAD share VGPRTile IDs {step.conflict} — needs unrolling ***")
-
-        # Buffer loads summary per group
-        print()
-        print("Buffer loads per group (subtile IDs -> LDS):")
-        for gi in range(numGroups):
-            targetGi = (gi + 1) % numGroups
-            bufA, bufB = bufferLoadsPerGroup[gi]
-            mtLabel = "n+2" if gi == numGroups - 1 else "n+1"
-            print(f"  Group {gi} -> buffer_load for Group {targetGi} (MT {mtLabel}):  A: {sorted(bufA)}  B: {sorted(bufB)}")
 
         # Double-buffer LDS dependency: MT n+2 buffer_loads vs MT n ds_reads
         # Find last ds_read (LOAD step) for each subtile that the last group buffer_loads
