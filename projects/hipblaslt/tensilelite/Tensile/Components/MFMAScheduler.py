@@ -448,7 +448,7 @@ class MFMAScheduler:
                 waitA = set(step.loadA.keys()) & pendingA
                 waitB = set(step.loadB.keys()) & pendingB
             if waitA or waitB:
-                print(f"    WAIT A: {sorted(waitA)}  B: {sorted(waitB)}")
+                print(f"    WAIT (MT {mtLoad}) A: {sorted(waitA)}  B: {sorted(waitB)}")
                 pendingA -= waitA
                 pendingB -= waitB
 
