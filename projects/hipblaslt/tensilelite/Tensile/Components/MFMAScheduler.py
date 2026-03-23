@@ -115,6 +115,7 @@ class ScheduleStep:
     loadB: Dict[int, int] = field(default_factory=dict)
     conflict: Set[int] = field(default_factory=set)
     isWrapLoad: bool = False
+    loadDU: int = -1
 
 
 class MFMAScheduler:
@@ -228,6 +229,7 @@ class MFMAScheduler:
                 loadATiles, loadBTiles, loadDU = self._getLoadTargets(gi, du, numGroups)
                 isWrapAround = self._isWrapAroundLoad(gi, du, numGroups)
                 step.isWrapLoad = isWrapAround
+                step.loadDU = loadDU
                 curA = set(group.tileAIndices)
                 curB = set(group.tileBIndices)
                 if du == 0:
@@ -405,8 +407,9 @@ class MFMAScheduler:
             mfmas = [(a, b) for a in sorted(step.useA.keys()) for b in sorted(step.useB.keys())]
             print(f"    MFMAs: {mfmas}")
             mtLoad = "n+1" if step.isWrapLoad else "n"
+            duLabel = f", DU {step.loadDU}" if step.loadDU >= 0 else ""
             print(f"    USE  A: {step.useA}  B: {step.useB}")
-            print(f"    LOAD (MT {mtLoad}) A: {step.loadA}  B: {step.loadB}")
+            print(f"    LOAD (MT {mtLoad}{duLabel}) A: {step.loadA}  B: {step.loadB}")
             if step.conflict:
                 print(f"    *** CONFLICT: USE/LOAD share VGPRTile IDs {step.conflict} — needs unrolling ***")
 
