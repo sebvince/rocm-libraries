@@ -402,44 +402,68 @@ class MFMAScheduler:
             print("  " + "  ".join(f"{v:2d}" if v is not None else "  " for v in row))
         print()
 
+        # Compute buffer_load sets per group
+        numGroups = len(self.groups)
+        bufferLoadsPerGroup = {}  # gi -> (set of A subtiles, set of B subtiles)
+        loadedA = set(self.groups[0].tileAIndices)
+        loadedB = set(self.groups[0].tileBIndices)
+        for gi in range(numGroups):
+            targetGi = (gi + 1) % numGroups
+            targetGroup = self.groups[targetGi]
+            if gi == numGroups - 1:
+                bufA = set(targetGroup.tileAIndices)
+                bufB = set(targetGroup.tileBIndices)
+            else:
+                needA = set(targetGroup.tileAIndices)
+                needB = set(targetGroup.tileBIndices)
+                bufA = needA - loadedA
+                bufB = needB - loadedB
+                loadedA |= needA
+                loadedB |= needB
+            bufferLoadsPerGroup[gi] = (bufA, bufB)
+
+        # Print steps with WAIT tracking
+        pendingA = set()
+        pendingB = set()
+        currentGroup = -1
         for step in self._schedule:
+            if step.groupId != currentGroup:
+                currentGroup = step.groupId
+                bufA, bufB = bufferLoadsPerGroup[currentGroup]
+                pendingA |= bufA
+                pendingB |= bufB
+
             print(f"  Group {step.groupId}, DU={step.duIndex}:")
             mfmas = [(a, b) for a in sorted(step.useA.keys()) for b in sorted(step.useB.keys())]
             print(f"    MFMAs: {mfmas}")
             mtLoad = "n+1" if step.isWrapLoad else "n"
             duLabel = f", DU {step.loadDU}" if step.loadDU >= 0 else ""
             print(f"    USE  A: {step.useA}  B: {step.useB}")
+
+            # Check if LOAD needs a WAIT for pending buffer_loads
+            # buffer_load writes DU 0 before DU 1, so only DU 0 reads need a WAIT
+            waitA = set()
+            waitB = set()
+            if step.loadDU == 0:
+                waitA = set(step.loadA.keys()) & pendingA
+                waitB = set(step.loadB.keys()) & pendingB
+            if waitA or waitB:
+                print(f"    WAIT A: {sorted(waitA)}  B: {sorted(waitB)}")
+                pendingA -= waitA
+                pendingB -= waitB
+
             print(f"    LOAD (MT {mtLoad}{duLabel}) A: {step.loadA}  B: {step.loadB}")
             if step.conflict:
                 print(f"    *** CONFLICT: USE/LOAD share VGPRTile IDs {step.conflict} — needs unrolling ***")
 
-        # Buffer loads summary per group (subtile IDs -> LDS)
-        # Groups 0..last-1 load for macrotile n+1 (delta, skip already-loaded subtiles)
-        # Last group wraps around and loads Group 0's full subtiles for macrotile n+2
-        numGroups = len(self.groups)
-        loadedA = set(self.groups[0].tileAIndices)
-        loadedB = set(self.groups[0].tileBIndices)
+        # Buffer loads summary per group
         print()
         print("Buffer loads per group (subtile IDs -> LDS):")
         for gi in range(numGroups):
             targetGi = (gi + 1) % numGroups
-            targetGroup = self.groups[targetGi]
-            isWrapAround = (gi == numGroups - 1)
-            if isWrapAround:
-                # Wrap-around: different macrotile (n+2), must reload all
-                bufLoadA = sorted(targetGroup.tileAIndices)
-                bufLoadB = sorted(targetGroup.tileBIndices)
-                mtLabel = "n+2"
-            else:
-                # Same macrotile (n+1): skip already-loaded subtiles
-                needA = set(targetGroup.tileAIndices)
-                needB = set(targetGroup.tileBIndices)
-                bufLoadA = sorted(needA - loadedA)
-                bufLoadB = sorted(needB - loadedB)
-                loadedA |= needA
-                loadedB |= needB
-                mtLabel = "n+1"
-            print(f"  Group {gi} -> buffer_load for Group {targetGi} (MT {mtLabel}):  A: {bufLoadA}  B: {bufLoadB}")
+            bufA, bufB = bufferLoadsPerGroup[gi]
+            mtLabel = "n+2" if gi == numGroups - 1 else "n+1"
+            print(f"  Group {gi} -> buffer_load for Group {targetGi} (MT {mtLabel}):  A: {sorted(bufA)}  B: {sorted(bufB)}")
 
         # Double-buffer LDS dependency: MT n+2 buffer_loads vs MT n ds_reads
         # Find last ds_read (LOAD step) for each subtile that the last group buffer_loads
