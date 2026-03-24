@@ -1,7 +1,9 @@
 from enum import Enum, auto
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Set, Optional, Union
-
+from Tensile.Components.SubtileBasedKernel import TileInfo
+from Tensile.Components.SubtileBasedKernel import emitMfmaInstruction
+from rocisa.code import Module
 
 class PrefetchMode(Enum):
     NO = auto()
@@ -99,7 +101,7 @@ class VGPRTileAllocator:
             self._freeList.append(vid)
 
     @property
-    def totalVGPRs(self) -> int:
+    def totalVGPRTiles(self) -> int:
         return self._peak
 
 
@@ -194,8 +196,8 @@ class MFMAScheduler:
     # ── Outputs ──────────────────────────────────────────────
 
     @property
-    def totalVGPRs(self) -> int:
-        return self.allocator.totalVGPRs
+    def totalVGPRTiles(self) -> int:
+        return self.allocator.totalVGPRTiles
 
     # ── Partition construction ─────────────────────────────────
 
@@ -646,7 +648,7 @@ class MFMAScheduler:
         print(f"Reuse: {self.config.reuseStrategy.name}")
         print(f"hasDuplicatedReads: {self.hasDuplicatedReads}")
         print(f"needsUnrolling: {self.needsUnrolling}")
-        print(f"totalVGPRTiles: {self.totalVGPRs} ({self.totalVGPRs * 4} VGPRs)")
+        print(f"totalVGPRTiles: {self.totalVGPRTiles} ({self.totalVGPRTiles * 4} VGPRs)")
         print()
 
         grid = [[None] * self.numPartitionsB for _ in range(self.numPartitionsA)]
@@ -694,57 +696,132 @@ class MFMAScheduler:
                 for op in dus.ops:
                     self._printOp(op, indent="      ")
 
+    # Allocate totalVGPRTiles vpgrTile
+    def allocVgprTiles(self, writer):
+        """Allocate a shared VGPR tile array for A and B, indexed by the scheduler's vgprTileId."""
+        
+        self.vgprTiles = []
+        mmaTileRegCount = self.tileInfoA.mmaTileRegCount
+        for _ in range(self.totalVGPRTiles):
+            tile = TileInfo.RegisterTileInfo(writer.vgprPool)
+            for j in range(0, mmaTileRegCount, 4):
+                vstart = writer.vgprPool.checkOutAligned(4, 4)
+                for k in range(4):
+                    tile.append(vstart + k)
+            self.vgprTiles.append(tile)
+
+    def emitMFMAs(self, writer, kernel, steps, dtileInfo):
+        """Emit MFMA instructions for a list of PartitionSchedules."""
+
+        module = Module()
+        for pss in steps:
+            for dus in pss.duSteps:
+                for op in dus.ops:
+                    if not isinstance(op, MFMAOp):
+                        continue
+                    for (a, b) in op.subtiles:
+                        aTile = self.vgprTiles[op.vgprTileMapA[a]]
+                        bTile = self.vgprTiles[op.vgprTileMapB[b]]
+                        dTile = dtileInfo.vgprTiles[a + b * dtileInfo.localMMATileGrid[0]]
+                        module.add(emitMfmaInstruction(
+                            writer, kernel, aTile, bTile, dTile, dTile,
+                            f"MFMA C[{a},{b}] += A[{a},DU{op.duIndex}] * B[{b},DU{op.duIndex}]"))
+        return module
+
+    def generateCode(self, writer, kernel):
+        dtileInfo = writer.states.d.tileInfo
+        self.allocVgprTiles(writer)
+
+        for label, steps in [("MAINLOOP", self.mainloopSteps),
+                             ("NGLL", self.ngllSteps),
+                             ("NLL", self.nllSteps)]:
+            print(f"\n{label}:")
+            for pss in steps:
+                print(f"  Partition {pss.partitionId}:")
+                for dus in pss.duSteps:
+                    print(f"    DU={dus.duIndex}:")
+                    module = self.emitMFMAs(writer, kernel, [PartitionSchedule(
+                        partitionId=pss.partitionId,
+                        duSteps=[dus])], dtileInfo)
+                    print(module)
+
 
 if __name__ == "__main__":
-    class MockTileInfo:
-        def __init__(self, localSubtileGrid, subtileShape):
-            self.localSubtileGrid = localSubtileGrid
-            self.subtileShape = subtileShape
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from Tensile.Components.SubtileBasedKernel import TileInfo
+    from rocisa import rocIsa
+    from rocisa.register import RegisterPool
+    from rocisa.enum import RegisterType
 
-    # MTA=256, MTB=256 -> localSubtileGrid[0] = 8 for each
-    lsgA, lsgB = 8, 8
+    # Initialize rocIsa for gfx950
+    ri = rocIsa.getInstance()
+    if not ri.isInit():
+        import shutil
+        asmpath = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asmpath)
+    ri.setKernel((9, 5, 0), 64)
+
+    def _mock_dtype(num_bytes=2):
+        mock = MagicMock()
+        mock.numBytes.return_value = num_bytes
+        return mock
+
+    def create_mock_writer(kernel):
+        writer = SimpleNamespace()
+        writer.vgprPool = RegisterPool(0, RegisterType.Vgpr, False)
+        writer.agprPool = RegisterPool(0, RegisterType.Accvgpr, False)
+        writer.sgprPool = RegisterPool(0, RegisterType.Sgpr, False)
+        writer.states = SimpleNamespace(
+            regCaps={"MaxSgpr": 106, "MaxVgpr": 256, "PhysicalMaxVgpr": 512},
+        )
+        # Allocate D tileInfo (same as KernelWriter line 3843)
+        dTileInfo = TileInfo('D', kernel)
+        dTileInfo.allocVgprTileRegisters(writer, kernel)
+        writer.states.d = SimpleNamespace(tileInfo=dTileInfo)
+        return writer
+
+    dtype = _mock_dtype(2)
+    problemType = {
+        "DataTypeA": dtype,
+        "DataTypeB": dtype,
+        "ComputeDataType": _mock_dtype(4),
+    }
+    kernel = {
+        "DepthU": 64,
+        "MacroTileA": 256,
+        "MacroTileB": 256,
+        "MacroTile0": 256,
+        "MacroTile1": 256,
+        "MatrixInstM": 16,
+        "MatrixInstN": 16,
+        "MatrixInstK": 32,
+        "MIWaveGroup": [2, 2],
+        "WavefrontSize": 64,
+        "SourceSwap": False,
+        "MIArchVgpr": False,
+        "ProblemType": problemType,
+    }
+
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    lsgA = tiA.localSubtileGrid[0]
+    lsgB = tiB.localSubtileGrid[0]
 
     configs = [
          (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-         MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
          SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
 
-        (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
-            MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-            SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
-
-        #  (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
-        #  MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-        #  SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
-
-
-        # Needs unrolling.
-        #  (f"lsg {lsgA}x{lsgB}, group 4x4, FULL_PREFETCH, NONE, COLUMN_MAJOR",
-        #  MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-        #  SchedulerConfig(8, 8, PrefetchMode.FULL_PREFETCH, VGPRTileReUseStrategy.NONE, SubgroupOrdering.COLUMN_MAJOR)),
-
-    #       (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, NONE, COLUMN_MAJOR",
-    #      MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-    #      SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.NONE, SubgroupOrdering.COLUMN_MAJOR)),
-
-    #     (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-    #         MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-    #         SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
-        
-    #     (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
-    #         MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-    #         SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
-
-
-    #     (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
-    #         MockTileInfo([10, 1], [1, 2]), MockTileInfo([10, 1], [1, 2]),
-    #         SchedulerConfig(2, 10, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
-
-
+        (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+            SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
     ]
 
-    for name, tiA, tiB, cfg in configs:
+    for name, cfg in configs:
         print(f"=== {name} ===")
         s = MFMAScheduler(tiA, tiB, cfg)
         s.printSchedule()
+        writer = create_mock_writer(kernel)
+        s.generateCode(writer, kernel)
         print()
