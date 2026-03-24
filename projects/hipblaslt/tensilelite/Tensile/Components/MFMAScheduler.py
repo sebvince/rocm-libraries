@@ -423,13 +423,21 @@ class MFMAScheduler:
             bufferLoadsPerGroup[gi] = (bufA, bufB)
 
         # Determine which DU each group's buffer_load goes in
-        # DU=0 unless buffer_load subtiles overlap with DU=0's LOAD (LDS conflict)
+        # DU=0 unless:
+        #   1) buffer_load subtiles overlap with DU=0's LOAD (subtile conflict), or
+        #   2) GR is MT n+2 (last group) — can't coexist with LR (MT n) at DU=0
+        #      because LDS is double-buffered (n+2 aliases the same buffer as n).
         bufferLoadDU = {}  # gi -> 0 or 1
         du0Steps = {step.groupId: step for step in self._schedule if step.duIndex == 0}
         for gi in range(numGroups):
             bufA, bufB = bufferLoadsPerGroup[gi]
             if not bufA and not bufB:
                 bufferLoadDU[gi] = 0
+                continue
+            # Last group GR is MT n+2, which aliases MT n in double-buffered LDS.
+            # Must go to DU=1 where LR is MT n+1 (wrap load, different LDS buffer).
+            if gi == numGroups - 1:
+                bufferLoadDU[gi] = 1
                 continue
             du0 = du0Steps.get(gi)
             if du0:
@@ -472,6 +480,50 @@ class MFMAScheduler:
                     total += cnt
             return total
 
+        # === PRELOOP ===
+        # The mainloop is steady-state: it expects some data to already be in LDS
+        # and VGPRs at entry. The preloop loads that initial data.
+        #
+        # GR: if the first mainloop GR is MT n+k, preloop needs GR(MT 0)..GR(MT k-1)
+        # LR: preloop needs to load into VGPRs what the first MFMAs will USE.
+        #     For HALF_PREFETCH, the first LR is at DU 1, so preloop needs LR(MT 0, DU 0).
+        #     For FULL_PREFETCH, all DUs are bootstrapped, so preloop needs LR for all DUs.
+        allA = list(range(self.MTA))
+        allB = list(range(self.MTB))
+
+        # Determine preloop GR depth from mainloop's highest MT label
+        # Last group's GR is MT n+2, others are MT n+1
+        hasGRn2 = any(gi == numGroups - 1 for _, gi, _, _, _, _ in grEvents)
+        numPreloadMTs = 2 if hasGRn2 else (1 if grEvents else 1)
+
+        # For MT 1 preload: the mainloop's MT n+1 GRs will load some subtiles
+        # during the first iteration, so the preloop only needs the complement.
+        # That complement is exactly the last group's MT n+2 GR subtiles.
+        mt1_coveredA = set()
+        mt1_coveredB = set()
+        for _, gi, _, _, grA, grB in grEvents:
+            if gi != numGroups - 1:  # MT n+1 GRs (non-last groups)
+                mt1_coveredA |= grA
+                mt1_coveredB |= grB
+        preloadMT1_A = sorted(set(allA) - mt1_coveredA)
+        preloadMT1_B = sorted(set(allB) - mt1_coveredB)
+
+        # Determine preloop LR depth
+        if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
+            numPreloadDUs = 1  # just DU 0
+        elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
+            numPreloadDUs = self.numDU  # all DUs
+
+        print("PRELOOP:")
+        print(f"  GR (MT 0):  A: {allA}  B: {allB}")
+        if numPreloadMTs > 1:
+            print(f"  GR (MT 1):  A: {preloadMT1_A}  B: {preloadMT1_B}")
+        for du in range(numPreloadDUs):
+            print(f"  LR (MT 0, DU {du}) A: {self._schedule[du].useA}  B: {self._schedule[du].useB}")
+        print()
+
+        # === MAINLOOP ===
+        print("MAINLOOP:")
         # Print steps with WAIT tracking and inline buffer_loads
         pendingA = set()
         pendingB = set()
@@ -560,6 +612,10 @@ if __name__ == "__main__":
          MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
          SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
 
+        (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
+            MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
+            SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+
         #  (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
         #  MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
         #  SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
@@ -587,9 +643,7 @@ if __name__ == "__main__":
     #         MockTileInfo([10, 1], [1, 2]), MockTileInfo([10, 1], [1, 2]),
     #         SchedulerConfig(2, 10, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
 
-    #     (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
-    #         MockTileInfo([10, 1], [1, 2]), MockTileInfo([10, 1], [1, 2]),
-    #         SchedulerConfig(2, 10, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+
     ]
 
     for name, tiA, tiB, cfg in configs:
