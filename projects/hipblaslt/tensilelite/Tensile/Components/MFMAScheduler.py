@@ -312,19 +312,25 @@ class MFMAScheduler:
         elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
             numPreloadDUs = self.numDU
 
-        # Allocate VGPRs for first group
+        # Allocate VGPRs for first group and build LR maps
+        lrOps = []
         for du in range(numPreloadDUs):
+            loadA = {}
+            loadB = {}
             for tA in first.tileAIndices:
-                self.allocator.allocate('A', tA, du)
+                loadA[tA] = self.allocator.allocate('A', tA, du)
             for tB in first.tileBIndices:
-                self.allocator.allocate('B', tB, du)
+                loadB[tB] = self.allocator.allocate('B', tB, du)
+            lrOps.append(LROp(mtIteration="0", duIndex=du,
+                              loadA=loadA, loadB=loadB))
 
-        # Build preloop GR ops (LR ops added later once _schedule is populated)
+        # Build preloop ops: GR(MT 0), GR(MT 1), then LR(MT 0) per DU
         self.preloopOps: List[ScheduleOp] = []
         self.preloopOps.append(GROp(mtIteration="0",
                                     subtileA=allA, subtileB=allB))
         self.preloopOps.append(GROp(mtIteration="1",
                                     subtileA=preloadMT1_A, subtileB=preloadMT1_B))
+        self.preloopOps.extend(lrOps)
 
         return set(preloadMT1_A), set(preloadMT1_B)
 
@@ -405,16 +411,6 @@ class MFMAScheduler:
             any(c > 1 for c in loadCountA.values()) or
             any(c > 1 for c in loadCountB.values())
         )
-
-        # Finalize preloop: add LR ops now that _schedule is populated
-        if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
-            numPreloadDUs = 1
-        elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
-            numPreloadDUs = self.numDU
-        for du in range(numPreloadDUs):
-            self.preloopOps.append(LROp(mtIteration="0", duIndex=du,
-                                        loadA=self._schedule[du].useA,
-                                        loadB=self._schedule[du].useB))
 
         self._buildMainloop(numGroups)
 
