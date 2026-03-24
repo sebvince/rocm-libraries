@@ -22,17 +22,17 @@ class SubgroupOrdering(Enum):
 
 @dataclass
 class SchedulerConfig:
-    subtileGroupSizeA: int
-    subtileGroupSizeB: int
+    partitionSizeA: int
+    partitionSizeB: int
     prefetchMode: PrefetchMode
     reuseStrategy: VGPRTileReUseStrategy
     ordering: SubgroupOrdering = SubgroupOrdering.COLUMN_MAJOR
 
 
 @dataclass
-class SubtileGroup:
+class Partition:
     """A rectangle (sizeA x sizeB) of subtiles processed together."""
-    groupId: int
+    partitionId: int
     sizeA: int
     sizeB: int
     subtiles: List[Tuple[int, int]] = field(default_factory=list)
@@ -140,26 +140,26 @@ ScheduleOp = Union[MFMAOp, GROp, WaitOp, LROp]
 
 
 @dataclass
-class GroupGR:
-    """Describes the GR (Global Read) issued by a group during the mainloop."""
+class PartitionGR:
+    """Describes the GR (Global Read) issued by a partition during the mainloop."""
     mtIteration: str       # "n+1" or "n+2"
-    targetGroupId: int     # which group's subtiles we're loading for
+    targetPartitionId: int # which partition's subtiles we're loading for
     subtileA: Set[int]     # actual subtiles to load (after dedup)
     subtileB: Set[int]
 
 
 @dataclass
 class DUSchedule:
-    """Ops for one DU iteration within a group."""
+    """Ops for one DU iteration within a partition."""
     duIndex: int
     ops: List[ScheduleOp] = field(default_factory=list)
     conflict: Set[int] = field(default_factory=set)
 
 
 @dataclass
-class SubtileGroupSchedule:
-    """Display schedule for one subtile group — contains all DU iterations."""
-    groupId: int
+class PartitionSchedule:
+    """Schedule for one subtile partition — contains all DU iterations."""
+    partitionId: int
     duSteps: List[DUSchedule] = field(default_factory=list)
 
 
@@ -172,19 +172,19 @@ class MFMAScheduler:
         self.MTA = tileInfoA.localSubtileGrid[0]
         self.MTB = tileInfoB.localSubtileGrid[0]
 
-        assert self.MTA % config.subtileGroupSizeA == 0, \
-            f"MTA ({self.MTA}) must be divisible by subtileGroupSizeA ({config.subtileGroupSizeA})"
-        assert self.MTB % config.subtileGroupSizeB == 0, \
-            f"MTB ({self.MTB}) must be divisible by subtileGroupSizeB ({config.subtileGroupSizeB})"
+        assert self.MTA % config.partitionSizeA == 0, \
+            f"MTA ({self.MTA}) must be divisible by partitionSizeA ({config.partitionSizeA})"
+        assert self.MTB % config.partitionSizeB == 0, \
+            f"MTB ({self.MTB}) must be divisible by partitionSizeB ({config.partitionSizeB})"
 
-        self.numGroupsA = self.MTA // config.subtileGroupSizeA
-        self.numGroupsB = self.MTB // config.subtileGroupSizeB
+        self.numPartitionsA = self.MTA // config.partitionSizeA
+        self.numPartitionsB = self.MTB // config.partitionSizeB
 
         self.numDU = tileInfoA.subtileShape[1]
         assert self.numDU == tileInfoB.subtileShape[1], \
             "A and B must have same subtileShape[1]"
 
-        self.groups: List[SubtileGroup] = self._buildGroups()
+        self.partitions: List[Partition] = self._buildPartitions()
         self.allocator = VGPRTileAllocator()
         self.hasDuplicatedReads: bool = False
         self.needsUnrolling: bool = False
@@ -197,82 +197,81 @@ class MFMAScheduler:
     def totalVGPRs(self) -> int:
         return self.allocator.totalVGPRs
 
-    # ── Group construction ───────────────────────────────────
+    # ── Partition construction ─────────────────────────────────
 
     def _generateOrder(self) -> List[Tuple[int, int]]:
         order = []
         if self.config.ordering == SubgroupOrdering.COLUMN_MAJOR:
-            for col in range(self.numGroupsB):
-                for row in range(self.numGroupsA):
+            for col in range(self.numPartitionsB):
+                for row in range(self.numPartitionsA):
                     order.append((row, col))
         elif self.config.ordering == SubgroupOrdering.SNAKE_COLUMN_MAJOR:
-            for col in range(self.numGroupsB):
+            for col in range(self.numPartitionsB):
                 if col % 2 == 0:
-                    for row in range(self.numGroupsA):
+                    for row in range(self.numPartitionsA):
                         order.append((row, col))
                 else:
-                    for row in range(self.numGroupsA - 1, -1, -1):
+                    for row in range(self.numPartitionsA - 1, -1, -1):
                         order.append((row, col))
         return order
 
-    # Build SubtileGroups based on the specified ordering and group sizes
-    def _buildGroups(self) -> List[SubtileGroup]:
+    def _buildPartitions(self) -> List[Partition]:
         order = self._generateOrder()
-        sA = self.config.subtileGroupSizeA
-        sB = self.config.subtileGroupSizeB
-        groups = []
-        for groupId, (gA, gB) in enumerate(order):
+        sA = self.config.partitionSizeA
+        sB = self.config.partitionSizeB
+        partitions = []
+        for partitionId, (pA, pB) in enumerate(order):
             subtiles = []
-            for a in range(gA * sA, (gA + 1) * sA):
-                for b in range(gB * sB, (gB + 1) * sB):
+            for a in range(pA * sA, (pA + 1) * sA):
+                for b in range(pB * sB, (pB + 1) * sB):
                     subtiles.append((a, b))
-            groups.append(SubtileGroup(groupId=groupId, sizeA=sA, sizeB=sB, subtiles=subtiles))
-        return groups
+            partitions.append(Partition(partitionId=partitionId, sizeA=sA, sizeB=sB, subtiles=subtiles))
+        return partitions
 
     # ── Scheduling core ──────────────────────────────────────
 
-    def _computeGroupGRs(self, preloadedMTn1_A: Set[int], preloadedMTn1_B: Set[int]) -> Dict[int, GroupGR]:
-        """Compute each group's GR target (mtIteration, targetGroup, subtiles).
+    def _computePartitionGRs(self, preloadedMTn1_A: Set[int], preloadedMTn1_B: Set[int]) -> Dict[int, PartitionGR]:
+        """Compute each partition's GR target (mtIteration, targetPartition, subtiles).
 
         Args:
             preloadedMTn1_A/B: MT n+1 subtiles already loaded by the preloop's GR(MT 1).
                 These are excluded from mainloop MT n+1 GRs (dedup).
         """
-        numGroups = len(self.groups)
-        groupGRs = {}
+        numPartitions = len(self.partitions)
+        partitionGRs = {}
         loadedA = set(preloadedMTn1_A)
         loadedB = set(preloadedMTn1_B)
-        for gi in range(numGroups):
-            targetGi = (gi + 1) % numGroups
-            targetGroup = self.groups[targetGi]
-            if gi == numGroups - 1:
-                # Last group wraps to next macrotile iteration
-                bufA = set(targetGroup.tileAIndices)
-                bufB = set(targetGroup.tileBIndices)
+        for pi in range(numPartitions):
+            targetPi = (pi + 1) % numPartitions
+            targetPartition = self.partitions[targetPi]
+            if pi == numPartitions - 1:
+                # Last partition wraps to next macrotile iteration
+                bufA = set(targetPartition.tileAIndices)
+                bufB = set(targetPartition.tileBIndices)
                 mtIter = "n+2"
             else:
-                needA = set(targetGroup.tileAIndices)
-                needB = set(targetGroup.tileBIndices)
+                needA = set(targetPartition.tileAIndices)
+                needB = set(targetPartition.tileBIndices)
                 bufA = needA - loadedA
                 bufB = needB - loadedB
                 loadedA |= needA
                 loadedB |= needB
                 mtIter = "n+1"
-            groupGRs[gi] = GroupGR(mtIteration=mtIter, targetGroupId=targetGi,
-                                   subtileA=bufA, subtileB=bufB)
-        return groupGRs
+            partitionGRs[pi] = PartitionGR(mtIteration=mtIter, targetPartitionId=targetPi,
+                                            subtileA=bufA, subtileB=bufB)
+        return partitionGRs
 
     def _buildPreloop(self) -> Tuple[Set[int], Set[int]]:
-        """Allocate VGPRTile IDs for the first group and build preloop GR ops.
+        """Allocate VGPRTile IDs for the first partition and build preloop GR ops.
 
         Preloop loads:
           - GR(MT 0): all subtiles
-          - GR(MT 1): first group's subtiles (1 group worth of MT 1 data)
+          - GR(MT 1): first partition's subtiles (1 partition worth of MT 1 data)
 
         Returns (preloadedMT1_A, preloadedMT1_B): what was preloaded for MT 1,
-        so _computeGroupGRs can use it as the initial loaded state.
+        so _computePartitionGRs can use it as the initial loaded state.
         """
-        first = self.groups[0]
+        first = self.partitions[0]
         allA = list(range(self.MTA))
         allB = list(range(self.MTB))
         preloadMT1_A = list(first.tileAIndices)
@@ -311,14 +310,14 @@ class MFMAScheduler:
             raise NotImplementedError("PrefetchMode.NO is not yet supported")
 
         preloadedMT1_A, preloadedMT1_B = self._buildPreloop()
-        self.groupGRs = self._computeGroupGRs(preloadedMT1_A, preloadedMT1_B)
+        self.partitionGRs = self._computePartitionGRs(preloadedMT1_A, preloadedMT1_B)
 
-        numGroups = len(self.groups)
-        self.mainloopSteps: List[SubtileGroupSchedule] = []
+        numPartitions = len(self.partitions)
+        self.mainloopSteps: List[PartitionSchedule] = []
 
-        for gi, group in enumerate(self.groups):
-            gss = SubtileGroupSchedule(groupId=group.groupId)
-            gr = self.groupGRs[gi]
+        for pi, partition in enumerate(self.partitions):
+            pss = PartitionSchedule(partitionId=partition.partitionId)
+            gr = self.partitionGRs[pi]
             du0LoadAKeys: Set[int] = set()
             du0LoadBKeys: Set[int] = set()
 
@@ -327,16 +326,16 @@ class MFMAScheduler:
                 # MFMA: map subtile indices to VGPR tile IDs
                 vgprTileMapA = {}
                 vgprTileMapB = {}
-                for tA in group.tileAIndices:
+                for tA in partition.tileAIndices:
                     vgprTileMapA[tA] = self.allocator.getVGPRTileId('A', tA, du)
-                for tB in group.tileBIndices:
+                for tB in partition.tileBIndices:
                     vgprTileMapB[tB] = self.allocator.getVGPRTileId('B', tB, du)
 
                 # LOAD: determined by prefetch mode
-                loadATiles, loadBTiles, loadDU = self._getLoadTargets(gi, du, numGroups)
-                isWrapAround = self._isWrapAroundLoad(gi, du, numGroups)
-                curA = set(group.tileAIndices)
-                curB = set(group.tileBIndices)
+                loadATiles, loadBTiles, loadDU = self._getLoadTargets(pi, du, numPartitions)
+                isWrapAround = self._isWrapAroundLoad(pi, du, numPartitions)
+                curA = set(partition.tileAIndices)
+                curB = set(partition.tileBIndices)
                 if du == 0:
                     self._pendingRemap = []
 
@@ -373,7 +372,7 @@ class MFMAScheduler:
                 dus.ops.append(LROp(mtIteration=mtLoad, duIndex=loadDU,
                                     lrLoadA=lrLoadA, lrLoadB=lrLoadB))
                 dus.conflict = conflict
-                gss.duSteps.append(dus)
+                pss.duSteps.append(dus)
 
                 # save subtiles for DU=0 to check where to insert GR(n+2)
                 if du == 0:
@@ -396,33 +395,33 @@ class MFMAScheduler:
                 else:
                     hasConflict = bool((gr.subtileA & du0LoadAKeys) or (gr.subtileB & du0LoadBKeys))
                     bfDU = 1 if hasConflict else 0
-                gss.duSteps[bfDU].ops.insert(1, GROp(
+                pss.duSteps[bfDU].ops.insert(1, GROp(
                     mtIteration=gr.mtIteration,
                     subtileA=sorted(gr.subtileA),
                     subtileB=sorted(gr.subtileB)))
 
-            self.mainloopSteps.append(gss)
+            self.mainloopSteps.append(pss)
 
-            # Release after group based on strategy
+            # Release after partition based on strategy
             if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP:
                 for tc, tileIdx, duIdx, shadowKey in self._pendingRemap:
                     vid = self.allocator._allocMap(tc).pop((shadowKey, duIdx))
                     self.allocator._allocMap(tc)[(tileIdx, duIdx)] = vid
                 self._pendingRemap = []
             elif self.config.reuseStrategy == VGPRTileReUseStrategy.ACROSS_SUBGROUP:
-                self._releaseUnusedAfterGroup(gi)
+                self._releaseUnusedAfterPartition(pi)
 
-        self._insertWaitsAndDeps(numGroups)
+        self._insertWaitsAndDeps(numPartitions)
         self._checkDuplicatedReads()
 
     def _loadTile(self, tc: str, tileIdx: int, loadDU: int,
                   isWrapAround: bool,
-                  currentGroupTiles: Set[int]) -> Optional[int]:
+                  currentPartitionTiles: Set[int]) -> Optional[int]:
         """Determine the VGPRTile ID for a load. Returns None if no load needed."""
         allocated = self.allocator.isAllocated(tc, tileIdx, loadDU)
 
         if isWrapAround and allocated:
-            # Wrap-around: reuse group 0's existing VGPRTile IDs
+            # Wrap-around: reuse partition 0's existing VGPRTile IDs
             return self.allocator.getVGPRTileId(tc, tileIdx, loadDU)
 
         if not allocated:
@@ -430,9 +429,9 @@ class MFMAScheduler:
             return self.allocator.allocate(tc, tileIdx, loadDU)
 
         if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP \
-                and tileIdx in currentGroupTiles:
-            # Tile is allocated by the current group but will be released after it.
-            # Must allocate a new VGPR for the next group's data.
+                and tileIdx in currentPartitionTiles:
+            # Tile is allocated by the current partition but will be released after it.
+            # Must allocate a new VGPR for the next partition's data.
             # Use a shadow key to avoid overwriting the current allocation.
             shadowKey = -(tileIdx + 1)  # negative to avoid collision
             vid = self.allocator.allocate(tc, shadowKey, loadDU)
@@ -443,78 +442,78 @@ class MFMAScheduler:
         # NONE / ACROSS_SUBGROUP: tile stays alive, reuse in place
         return None
 
-    def _isWrapAroundLoad(self, groupIdx: int, duIdx: int, numGroups: int) -> bool:
-        """True when this step's load targets group 0 for the next macrotile iteration."""
+    def _isWrapAroundLoad(self, partitionIdx: int, duIdx: int, numPartitions: int) -> bool:
+        """True when this step's load targets partition 0 for the next macrotile iteration."""
         if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
-            return groupIdx == numGroups - 1 and duIdx == self.numDU - 1
+            return partitionIdx == numPartitions - 1 and duIdx == self.numDU - 1
         elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
-            return groupIdx == numGroups - 1
+            return partitionIdx == numPartitions - 1
         return False
 
     # ── Prefetch modes ───────────────────────────────────────
 
-    def _getLoadTargets(self, groupIdx: int, duIdx: int,
-                        numGroups: int) -> Tuple[Optional[List[int]], Optional[List[int]], int]:
+    def _getLoadTargets(self, partitionIdx: int, duIdx: int,
+                        numPartitions: int) -> Tuple[Optional[List[int]], Optional[List[int]], int]:
         """Returns (loadATiles, loadBTiles, targetDU)."""
         if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
-            return self._loadTargetsHalfPrefetch(groupIdx, duIdx, numGroups)
+            return self._loadTargetsHalfPrefetch(partitionIdx, duIdx, numPartitions)
         elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
-            return self._loadTargetsFullPrefetch(groupIdx, duIdx, numGroups)
+            return self._loadTargetsFullPrefetch(partitionIdx, duIdx, numPartitions)
         return (None, None, 0)
 
-    def _loadTargetsHalfPrefetch(self, groupIdx, duIdx, numGroups):
-        """HALF: DU=0 loads same-group DU=1, DU=last loads next-group DU=0.
-        Last group wraps around to group 0 (next iteration)."""
-        currentGroup = self.groups[groupIdx]
+    def _loadTargetsHalfPrefetch(self, partitionIdx, duIdx, numPartitions):
+        """HALF: DU=0 loads same-partition DU=1, DU=last loads next-partition DU=0.
+        Last partition wraps around to partition 0 (next iteration)."""
+        currentPartition = self.partitions[partitionIdx]
         if duIdx < self.numDU - 1:
             targetDU = duIdx + 1
-            return (currentGroup.tileAIndices, currentGroup.tileBIndices, targetDU)
+            return (currentPartition.tileAIndices, currentPartition.tileBIndices, targetDU)
         else:
-            nextGroup = self.groups[(groupIdx + 1) % numGroups]
-            return (nextGroup.tileAIndices, nextGroup.tileBIndices, 0)
+            nextPartition = self.partitions[(partitionIdx + 1) % numPartitions]
+            return (nextPartition.tileAIndices, nextPartition.tileBIndices, 0)
 
-    def _loadTargetsFullPrefetch(self, groupIdx, duIdx, numGroups):
-        """FULL: DU=0 loads next-group DU=0, DU=1 loads next-group DU=1.
-        Last group wraps around to group 0 (next iteration)."""
-        nextGroup = self.groups[(groupIdx + 1) % numGroups]
-        return (nextGroup.tileAIndices, nextGroup.tileBIndices, duIdx)
+    def _loadTargetsFullPrefetch(self, partitionIdx, duIdx, numPartitions):
+        """FULL: DU=0 loads next-partition DU=0, DU=1 loads next-partition DU=1.
+        Last partition wraps around to partition 0 (next iteration)."""
+        nextPartition = self.partitions[(partitionIdx + 1) % numPartitions]
+        return (nextPartition.tileAIndices, nextPartition.tileBIndices, duIdx)
 
     # ── Reuse strategies ─────────────────────────────────────
 
-    def _releaseUnusedAfterGroup(self, groupIdx: int):
-        """ACROSS_SUBGROUP: release tiles not appearing in any future group."""
-        currentGroup = self.groups[groupIdx]
+    def _releaseUnusedAfterPartition(self, partitionIdx: int):
+        """ACROSS_SUBGROUP: release tiles not appearing in any future partition."""
+        currentPartition = self.partitions[partitionIdx]
 
         futureA: Set[int] = set()
         futureB: Set[int] = set()
-        for gi in range(groupIdx + 1, len(self.groups)):
-            futureA.update(self.groups[gi].tileAIndices)
-            futureB.update(self.groups[gi].tileBIndices)
+        for pi in range(partitionIdx + 1, len(self.partitions)):
+            futureA.update(self.partitions[pi].tileAIndices)
+            futureB.update(self.partitions[pi].tileBIndices)
 
-        for tA in currentGroup.tileAIndices:
+        for tA in currentPartition.tileAIndices:
             if tA not in futureA:
                 self.allocator.releaseAllForTile('A', tA)
-        for tB in currentGroup.tileBIndices:
+        for tB in currentPartition.tileBIndices:
             if tB not in futureB:
                 self.allocator.releaseAllForTile('B', tB)
 
-    def _releaseGroupTiles(self, group: SubtileGroup):
-        """WITHIN_SUBGROUP: release all tiles (all DUs) of this group."""
-        for tA in group.tileAIndices:
+    def _releasePartitionTiles(self, partition: Partition):
+        """WITHIN_SUBGROUP: release all tiles (all DUs) of this partition."""
+        for tA in partition.tileAIndices:
             self.allocator.releaseAllForTile('A', tA)
-        for tB in group.tileBIndices:
+        for tB in partition.tileBIndices:
             self.allocator.releaseAllForTile('B', tB)
 
-    def _insertWaitsAndDeps(self, numGroups: int):
+    def _insertWaitsAndDeps(self, numPartitions: int):
         """Insert WAIT ops into mainloop ops."""
         # Build ordered GR events for inflight counting
         grEvents = []
         si = 0
-        for gss in self.mainloopSteps:
-            for dus in gss.duSteps:
+        for pss in self.mainloopSteps:
+            for dus in pss.duSteps:
                 grOp = next((op for op in dus.ops if isinstance(op, GROp)), None)
                 if grOp:
-                    grEvents.append((si, gss.groupId, dus.duIndex,
+                    grEvents.append((si, pss.partitionId, dus.duIndex,
                                      len(grOp.subtileA) + len(grOp.subtileB),
                                      set(grOp.subtileA), set(grOp.subtileB)))
                 si += 1
@@ -538,12 +537,12 @@ class MFMAScheduler:
         pendingA = set()
         pendingB = set()
         si = 0
-        for gss in self.mainloopSteps:
-            gr = self.groupGRs[gss.groupId]
+        for pss in self.mainloopSteps:
+            gr = self.partitionGRs[pss.partitionId]
             pendingA |= gr.subtileA
             pendingB |= gr.subtileB
 
-            for dus in gss.duSteps:
+            for dus in pss.duSteps:
                 lrOp = dus.ops[-1]
                 assert isinstance(lrOp, LROp)
 
@@ -578,8 +577,8 @@ class MFMAScheduler:
                     key = (tB, op.duIndex)
                     seenB[key] = seenB.get(key, 0) + 1
         # Count mainloop LR loads (skip wrap-around which reuses existing allocations)
-        for gss in self.mainloopSteps:
-            for dus in gss.duSteps:
+        for pss in self.mainloopSteps:
+            for dus in pss.duSteps:
                 for op in dus.ops:
                     if isinstance(op, LROp) and op.mtIteration != "n+1":
                         for tA in op.lrLoadA:
@@ -612,8 +611,8 @@ class MFMAScheduler:
 
     def printSchedule(self):
         print(f"SubtileGridA={self.MTA}, SubtileGridB={self.MTB}")
-        print(f"Group grid: {self.numGroupsA} x {self.numGroupsB}")
-        print(f"Group size: {self.config.subtileGroupSizeA} x {self.config.subtileGroupSizeB}")
+        print(f"Partition grid: {self.numPartitionsA} x {self.numPartitionsB}")
+        print(f"Partition size: {self.config.partitionSizeA} x {self.config.partitionSizeB}")
         print(f"Prefetch: {self.config.prefetchMode.name}")
         print(f"Reuse: {self.config.reuseStrategy.name}")
         print(f"hasDuplicatedReads: {self.hasDuplicatedReads}")
@@ -621,13 +620,13 @@ class MFMAScheduler:
         print(f"totalVGPRTiles: {self.totalVGPRs} ({self.totalVGPRs * 4} VGPRs)")
         print()
 
-        grid = [[None] * self.numGroupsB for _ in range(self.numGroupsA)]
-        sA = self.config.subtileGroupSizeA
-        sB = self.config.subtileGroupSizeB
-        for group in self.groups:
-            gA = group.subtiles[0][0] // sA
-            gB = group.subtiles[0][1] // sB
-            grid[gA][gB] = group.groupId
+        grid = [[None] * self.numPartitionsB for _ in range(self.numPartitionsA)]
+        sA = self.config.partitionSizeA
+        sB = self.config.partitionSizeB
+        for partition in self.partitions:
+            pA = partition.subtiles[0][0] // sA
+            pB = partition.subtiles[0][1] // sB
+            grid[pA][pB] = partition.partitionId
         print(f"Ordering grid ({self.config.ordering.name}):")
         for row in grid:
             print("  " + "  ".join(f"{v:2d}" if v is not None else "  " for v in row))
@@ -639,9 +638,9 @@ class MFMAScheduler:
         print()
 
         print("MAINLOOP:")
-        for group in self.mainloopSteps:
-            print(f"  Group {group.groupId}:")
-            for dus in group.duSteps:
+        for partition in self.mainloopSteps:
+            print(f"  Partition {partition.partitionId}:")
+            for dus in partition.duSteps:
                 print(f"    DU={dus.duIndex}:")
                 for op in dus.ops:
                     self._printOp(op, indent="      ")
@@ -662,7 +661,7 @@ if __name__ == "__main__":
     configs = [
          (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
          MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-         SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+         SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
 
         (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
             MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
