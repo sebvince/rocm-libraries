@@ -1,6 +1,6 @@
 from enum import Enum, auto
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Set, Optional
+from typing import List, Tuple, Dict, Set, Optional, Union
 
 
 class PrefetchMode(Enum):
@@ -26,7 +26,7 @@ class SchedulerConfig:
     subtileGroupSizeB: int
     prefetchMode: PrefetchMode
     reuseStrategy: VGPRTileReUseStrategy
-    ordering: SubgroupOrdering = SubgroupOrdering.SNAKE_COLUMN_MAJOR
+    ordering: SubgroupOrdering = SubgroupOrdering.COLUMN_MAJOR
 
 
 @dataclass
@@ -106,7 +106,7 @@ class VGPRAllocator:
 
 @dataclass
 class ScheduleStep:
-    """One DU iteration within one group."""
+    """One DU iteration within one group (internal allocation representation)."""
     groupId: int
     duIndex: int
     useA: Dict[int, int] = field(default_factory=dict)
@@ -116,6 +116,59 @@ class ScheduleStep:
     conflict: Set[int] = field(default_factory=set)
     isWrapLoad: bool = False
     loadDU: int = -1
+
+
+# ── Display-oriented schedule ops ────────────────────────
+
+@dataclass
+class MFMAOp:
+    mtLabel: str  # e.g. "n"
+    subtiles: List[Tuple[int, int]]
+    useA: Dict[int, int]
+    useB: Dict[int, int]
+
+
+@dataclass
+class GROp:
+    mtLabel: str  # e.g. "n+1", "n+2", "0", "1"
+    targetGroupId: Optional[int]  # None for preloop
+    subtileA: List[int]
+    subtileB: List[int]
+
+
+@dataclass
+class WaitOp:
+    mtLabel: str  # e.g. "n", "n+1"
+    subtileA: List[int]
+    subtileB: List[int]
+    inflightGRCount: Optional[int] = None
+
+
+@dataclass
+class LROp:
+    mtLabel: str  # e.g. "n", "n+1", "0"
+    duIndex: int
+    loadA: Dict[int, int]
+    loadB: Dict[int, int]
+
+
+@dataclass
+class DoubleBufferDep:
+    lastGroupId: int
+    lastReadA: Dict[int, Tuple]  # subtileIdx -> (groupId or "bootstrap", duIndex)
+    lastReadB: Dict[int, Tuple]
+
+
+ScheduleOp = Union[MFMAOp, GROp, WaitOp, LROp]
+
+
+@dataclass
+class SubtileGroupSchedule:
+    """Display schedule for one (group, DU) step — ordered list of ops."""
+    groupId: int
+    duIndex: int
+    ops: List[ScheduleOp] = field(default_factory=list)
+    conflict: Set[int] = field(default_factory=set)
 
 
 class MFMAScheduler:
@@ -146,6 +199,7 @@ class MFMAScheduler:
         self.needsUnrolling: bool = False
 
         self._runSchedule()
+        self._buildDisplaySchedule()
 
     # ── Outputs ──────────────────────────────────────────────
 
@@ -175,6 +229,7 @@ class MFMAScheduler:
                         order.append((row, col))
         return order
 
+    # Build SubtileGroups based on the specified ordering and group sizes
     def _buildGroups(self) -> List[SubtileGroup]:
         order = self._generateOrder()
         sA = self.config.subtileGroupSizeA
@@ -377,33 +432,13 @@ class MFMAScheduler:
         for tB in group.tileBIndices:
             self.allocator.releaseAllForTile('B', tB)
 
-    # ── Debug ────────────────────────────────────────────────
+    # ── Display schedule building ────────────────────────────
 
-    def printSchedule(self):
-        print(f"SubtileGridA={self.MTA}, SubtileGridB={self.MTB}")
-        print(f"Group grid: {self.numGroupsA} x {self.numGroupsB}")
-        print(f"Group size: {self.config.subtileGroupSizeA} x {self.config.subtileGroupSizeB}")
-        print(f"Prefetch: {self.config.prefetchMode.name}")
-        print(f"Reuse: {self.config.reuseStrategy.name}")
-        print(f"hasDuplicatedReads: {self.hasDuplicatedReads}")
-        print(f"needsUnrolling: {self.needsUnrolling}")
-        print(f"totalVGPRTiles: {self.totalVGPRs} ({self.totalVGPRs * 4} VGPRs)")
-        print()
-
-        grid = [[None] * self.numGroupsB for _ in range(self.numGroupsA)]
-        sA = self.config.subtileGroupSizeA
-        sB = self.config.subtileGroupSizeB
-        for group in self.groups:
-            gA = group.subtiles[0][0] // sA
-            gB = group.subtiles[0][1] // sB
-            grid[gA][gB] = group.groupId
-        print(f"Ordering grid ({self.config.ordering.name}):")
-        for row in grid:
-            print("  " + "  ".join(f"{v:2d}" if v is not None else "  " for v in row))
-        print()
+    def _buildDisplaySchedule(self):
+        """Build preloop/mainloop op lists from internal ScheduleStep data."""
+        numGroups = len(self.groups)
 
         # Compute buffer_load sets per group
-        numGroups = len(self.groups)
         bufferLoadsPerGroup = {}  # gi -> (set of A subtiles, set of B subtiles)
         loadedA = set(self.groups[0].tileAIndices)
         loadedB = set(self.groups[0].tileBIndices)
@@ -434,8 +469,6 @@ class MFMAScheduler:
             if not bufA and not bufB:
                 bufferLoadDU[gi] = 0
                 continue
-            # Last group GR is MT n+2, which aliases MT n in double-buffered LDS.
-            # Must go to DU=1 where LR is MT n+1 (wrap load, different LDS buffer).
             if gi == numGroups - 1:
                 bufferLoadDU[gi] = 1
                 continue
@@ -448,20 +481,14 @@ class MFMAScheduler:
                 hasConflict = False
             bufferLoadDU[gi] = 1 if hasConflict else 0
 
-        # Build ordered list of GR events: (stepIndex, groupId, duIndex, subtileCount, setA, setB)
+        # Build ordered GR events for inflight counting
         grEvents = []
         for si, step in enumerate(self._schedule):
             bufA, bufB = bufferLoadsPerGroup[step.groupId]
             if (bufA or bufB) and step.duIndex == bufferLoadDU[step.groupId]:
                 grEvents.append((si, step.groupId, step.duIndex, len(bufA) + len(bufB), bufA, bufB))
 
-        # For a WAIT at stepIndex needing subtiles waitA/waitB,
-        # find the GR that loaded those subtiles and count inflight GRs since then.
-        # The WAIT waits for data loaded by a GR in the *previous* MT iteration,
-        # so we always wrap around the full loop: from source GR (inclusive) to
-        # end of loop, then from start of loop to WAIT (exclusive).
-        def _countInflightGR(waitStepIndex, waitA, waitB, mtLoad):
-            # Find the GR that loaded the waited-on subtiles
+        def _countInflightGR(waitStepIndex, waitA, waitB):
             sourceGRIdx = None
             for evi, (si, gi, du, cnt, grA, grB) in enumerate(grEvents):
                 if (waitA and waitA <= grA) or (waitB and waitB <= grB):
@@ -469,10 +496,6 @@ class MFMAScheduler:
                     break
             if sourceGRIdx is None:
                 return None
-            # Count all GR subtiles wrapping from source GR (inclusive) around the
-            # full loop back to the WAIT position (exclusive).
-            # Previous iteration: source GR to end of loop (inclusive)
-            # Current iteration: start of loop to WAIT (exclusive)
             total = 0
             sourceStepIdx = grEvents[sourceGRIdx][0]
             for (si, gi, du, cnt, grA, grB) in grEvents:
@@ -480,54 +503,44 @@ class MFMAScheduler:
                     total += cnt
             return total
 
-        # === PRELOOP ===
-        # The mainloop is steady-state: it expects some data to already be in LDS
-        # and VGPRs at entry. The preloop loads that initial data.
-        #
-        # GR: if the first mainloop GR is MT n+k, preloop needs GR(MT 0)..GR(MT k-1)
-        # LR: preloop needs to load into VGPRs what the first MFMAs will USE.
-        #     For HALF_PREFETCH, the first LR is at DU 1, so preloop needs LR(MT 0, DU 0).
-        #     For FULL_PREFETCH, all DUs are bootstrapped, so preloop needs LR for all DUs.
+        # === Build PRELOOP ops ===
         allA = list(range(self.MTA))
         allB = list(range(self.MTB))
 
-        # Determine preloop GR depth from mainloop's highest MT label
-        # Last group's GR is MT n+2, others are MT n+1
         hasGRn2 = any(gi == numGroups - 1 for _, gi, _, _, _, _ in grEvents)
         numPreloadMTs = 2 if hasGRn2 else (1 if grEvents else 1)
 
-        # For MT 1 preload: the mainloop's MT n+1 GRs will load some subtiles
-        # during the first iteration, so the preloop only needs the complement.
-        # That complement is exactly the last group's MT n+2 GR subtiles.
         mt1_coveredA = set()
         mt1_coveredB = set()
         for _, gi, _, _, grA, grB in grEvents:
-            if gi != numGroups - 1:  # MT n+1 GRs (non-last groups)
+            if gi != numGroups - 1:
                 mt1_coveredA |= grA
                 mt1_coveredB |= grB
         preloadMT1_A = sorted(set(allA) - mt1_coveredA)
         preloadMT1_B = sorted(set(allB) - mt1_coveredB)
 
-        # Determine preloop LR depth
         if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
-            numPreloadDUs = 1  # just DU 0
+            numPreloadDUs = 1
         elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
-            numPreloadDUs = self.numDU  # all DUs
+            numPreloadDUs = self.numDU
 
-        print("PRELOOP:")
-        print(f"  GR (MT 0):  A: {allA}  B: {allB}")
+        self.preloopOps: List[ScheduleOp] = []
+        self.preloopOps.append(GROp(mtLabel="0", targetGroupId=None,
+                                    subtileA=allA, subtileB=allB))
         if numPreloadMTs > 1:
-            print(f"  GR (MT 1):  A: {preloadMT1_A}  B: {preloadMT1_B}")
+            self.preloopOps.append(GROp(mtLabel="1", targetGroupId=None,
+                                        subtileA=preloadMT1_A, subtileB=preloadMT1_B))
         for du in range(numPreloadDUs):
-            print(f"  LR (MT 0, DU {du}) A: {self._schedule[du].useA}  B: {self._schedule[du].useB}")
-        print()
+            self.preloopOps.append(LROp(mtLabel="0", duIndex=du,
+                                        loadA=self._schedule[du].useA,
+                                        loadB=self._schedule[du].useB))
 
-        # === MAINLOOP ===
-        print("MAINLOOP:")
-        # Print steps with WAIT tracking and inline buffer_loads
+        # === Build MAINLOOP steps ===
+        self.mainloopSteps: List[SubtileGroupSchedule] = []
         pendingA = set()
         pendingB = set()
         currentGroup = -1
+
         for si, step in enumerate(self._schedule):
             if step.groupId != currentGroup:
                 currentGroup = step.groupId
@@ -535,66 +548,126 @@ class MFMAScheduler:
                 pendingA |= bufA
                 pendingB |= bufB
 
-            print(f"  Group {step.groupId}, DU={step.duIndex}:")
-            mfmas = [(a, b) for a in sorted(step.useA.keys()) for b in sorted(step.useB.keys())]
-            print(f"    MFMAs (MT n): \n\t\t\t- {mfmas}")
+            gss = SubtileGroupSchedule(groupId=step.groupId, duIndex=step.duIndex)
             mtLoad = "n+1" if step.isWrapLoad else "n"
-            duLabel = f", DU {step.loadDU}" if step.loadDU >= 0 else ""
-            print(f"\t\t\t- USING  A: {step.useA}  B: {step.useB}")
 
-            # Show buffer_load at the assigned DU
+            # MFMA
+            mfmas = [(a, b) for a in sorted(step.useA.keys()) for b in sorted(step.useB.keys())]
+            gss.ops.append(MFMAOp(mtLabel="n", subtiles=mfmas,
+                                  useA=step.useA, useB=step.useB))
+
+            # GR
             bufA, bufB = bufferLoadsPerGroup[step.groupId]
             if (bufA or bufB) and step.duIndex == bufferLoadDU[step.groupId]:
                 targetGi = (step.groupId + 1) % numGroups
                 bufMtLabel = "n+2" if step.groupId == numGroups - 1 else "n+1"
-                print(f"    GR (MT {bufMtLabel}) for Group {targetGi}:  A: {sorted(bufA)}  B: {sorted(bufB)}")
+                gss.ops.append(GROp(mtLabel=bufMtLabel, targetGroupId=targetGi,
+                                    subtileA=sorted(bufA), subtileB=sorted(bufB)))
 
-            # Check if LOAD needs a WAIT for pending buffer_loads
-            # buffer_load writes DU 0 before DU 1, so only DU 0 reads need a WAIT
+            # WAIT
             waitA = set()
             waitB = set()
             if step.loadDU == 0:
                 waitA = set(step.loadA.keys()) & pendingA
                 waitB = set(step.loadB.keys()) & pendingB
             if waitA or waitB:
-                inflightCount = _countInflightGR(si, waitA, waitB, mtLoad)
-                inflightStr = f" — {inflightCount} inflight GRs" if inflightCount is not None else ""
-                print(f"    WAIT (MT {mtLoad}) A: {sorted(waitA)}  B: {sorted(waitB)}{inflightStr}")
+                inflightCount = _countInflightGR(si, waitA, waitB)
+                gss.ops.append(WaitOp(mtLabel=mtLoad, subtileA=sorted(waitA),
+                                      subtileB=sorted(waitB), inflightGRCount=inflightCount))
                 pendingA -= waitA
                 pendingB -= waitB
 
-            print(f"    LR (MT {mtLoad}{duLabel}) A: {step.loadA}  B: {step.loadB}")
-            if step.conflict:
-                print(f"    *** CONFLICT: USE/LOAD share VGPRTile IDs {step.conflict} — needs unrolling ***")
+            # LR
+            gss.ops.append(LROp(mtLabel=mtLoad, duIndex=step.loadDU,
+                                loadA=step.loadA, loadB=step.loadB))
 
-        # Double-buffer LDS dependency: MT n+2 buffer_loads vs MT n ds_reads
-        # Find last ds_read (LOAD step) for each subtile that the last group buffer_loads
+            gss.conflict = step.conflict
+            self.mainloopSteps.append(gss)
+
+        # === Build double-buffer dependency ===
+        self.doubleBufferDep: Optional[DoubleBufferDep] = None
         if numGroups > 1:
             wrapGroup = self.groups[0]
             wrapSubtilesA = set(wrapGroup.tileAIndices)
             wrapSubtilesB = set(wrapGroup.tileBIndices)
-            # lastRead[tc][tileIdx] = (groupId, duIndex) of last LOAD referencing it
             lastReadA = {t: ("bootstrap", -1) for t in wrapSubtilesA}
             lastReadB = {t: ("bootstrap", -1) for t in wrapSubtilesB}
             for step in self._schedule:
                 if step.isWrapLoad:
-                    continue  # wrap LOADs are MT n+1, not MT n reads
+                    continue
                 for tA in step.loadA:
                     if tA in wrapSubtilesA:
                         lastReadA[tA] = (step.groupId, step.duIndex)
                 for tB in step.loadB:
                     if tB in wrapSubtilesB:
                         lastReadB[tB] = (step.groupId, step.duIndex)
+            self.doubleBufferDep = DoubleBufferDep(
+                lastGroupId=self.groups[-1].groupId,
+                lastReadA=lastReadA, lastReadB=lastReadB)
 
-            lastGroupId = self.groups[-1].groupId
+    # ── Debug ────────────────────────────────────────────────
+
+    @staticmethod
+    def _printOp(op: ScheduleOp, indent: str = ""):
+        if isinstance(op, MFMAOp):
+            print(f"{indent}MFMAs (MT {op.mtLabel}): \n\t\t\t- {op.subtiles}")
+            print(f"\t\t\t- USING  A: {op.useA}  B: {op.useB}")
+        elif isinstance(op, GROp):
+            target = f" for Group {op.targetGroupId}" if op.targetGroupId is not None else ""
+            print(f"{indent}GR (MT {op.mtLabel}){target}:  A: {op.subtileA}  B: {op.subtileB}")
+        elif isinstance(op, WaitOp):
+            inflight = f" — {op.inflightGRCount} inflight GRs" if op.inflightGRCount is not None else ""
+            print(f"{indent}WAIT (MT {op.mtLabel}) A: {op.subtileA}  B: {op.subtileB}{inflight}")
+        elif isinstance(op, LROp):
+            duLabel = f", DU {op.duIndex}" if op.duIndex >= 0 else ""
+            print(f"{indent}LR (MT {op.mtLabel}{duLabel}) A: {op.loadA}  B: {op.loadB}")
+
+    def printSchedule(self):
+        print(f"SubtileGridA={self.MTA}, SubtileGridB={self.MTB}")
+        print(f"Group grid: {self.numGroupsA} x {self.numGroupsB}")
+        print(f"Group size: {self.config.subtileGroupSizeA} x {self.config.subtileGroupSizeB}")
+        print(f"Prefetch: {self.config.prefetchMode.name}")
+        print(f"Reuse: {self.config.reuseStrategy.name}")
+        print(f"hasDuplicatedReads: {self.hasDuplicatedReads}")
+        print(f"needsUnrolling: {self.needsUnrolling}")
+        print(f"totalVGPRTiles: {self.totalVGPRs} ({self.totalVGPRs * 4} VGPRs)")
+        print()
+
+        grid = [[None] * self.numGroupsB for _ in range(self.numGroupsA)]
+        sA = self.config.subtileGroupSizeA
+        sB = self.config.subtileGroupSizeB
+        for group in self.groups:
+            gA = group.subtiles[0][0] // sA
+            gB = group.subtiles[0][1] // sB
+            grid[gA][gB] = group.groupId
+        print(f"Ordering grid ({self.config.ordering.name}):")
+        for row in grid:
+            print("  " + "  ".join(f"{v:2d}" if v is not None else "  " for v in row))
+        print()
+
+        print("PRELOOP:")
+        for op in self.preloopOps:
+            self._printOp(op, indent="  ")
+        print()
+
+        print("MAINLOOP:")
+        for step in self.mainloopSteps:
+            print(f"  Group {step.groupId}, DU={step.duIndex}:")
+            for op in step.ops:
+                self._printOp(op, indent="    ")
+            if step.conflict:
+                print(f"    *** CONFLICT: USE/LOAD share VGPRTile IDs {step.conflict} — needs unrolling ***")
+
+        if self.doubleBufferDep:
+            dep = self.doubleBufferDep
             print()
             print(f"Double-buffer LDS dependency (MT n+2 writes vs MT n reads):")
-            print(f"  buffer_load at Group {lastGroupId} must wait for last ds_read of same subtile:")
-            for tA in sorted(wrapSubtilesA):
-                g, d = lastReadA[tA]
+            print(f"  buffer_load at Group {dep.lastGroupId} must wait for last ds_read of same subtile:")
+            for tA in sorted(dep.lastReadA.keys()):
+                g, d = dep.lastReadA[tA]
                 print(f"    A[{tA}]: last read at {f'Group {g}, DU={d}' if g != 'bootstrap' else 'bootstrap'}")
-            for tB in sorted(wrapSubtilesB):
-                g, d = lastReadB[tB]
+            for tB in sorted(dep.lastReadB.keys()):
+                g, d = dep.lastReadB[tB]
                 print(f"    B[{tB}]: last read at {f'Group {g}, DU={d}' if g != 'bootstrap' else 'bootstrap'}")
 
 
