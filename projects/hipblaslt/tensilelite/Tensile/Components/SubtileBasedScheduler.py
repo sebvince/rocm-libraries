@@ -412,6 +412,8 @@ class MFMAScheduler:
                 self._releaseUnusedAfterPartition(pi)
 
         self._insertWaitsAndDeps(numPartitions)
+        self.ngllSteps = self._buildNGLL()
+        self.nllSteps = self._buildNLL()
         self._checkDuplicatedReads()
 
     def _loadTile(self, tc: str, tileIdx: int, loadDU: int,
@@ -563,6 +565,33 @@ class MFMAScheduler:
                 si += 1
 
 
+    def _buildNGLL(self) -> List[PartitionSchedule]:
+        """NGLL (Non Global Load Loop): mainloop without GR ops."""
+        ngll = []
+        for pss in self.mainloopSteps:
+            newPss = PartitionSchedule(partitionId=pss.partitionId)
+            for dus in pss.duSteps:
+                newDus = DUSchedule(duIndex=dus.duIndex, conflict=dus.conflict)
+                newDus.ops = [op for op in dus.ops if not isinstance(op, GROp)]
+                newPss.duSteps.append(newDus)
+            ngll.append(newPss)
+        return ngll
+
+    def _buildNLL(self) -> List[PartitionSchedule]:
+        """NLL (Non Load Loop): mainloop without GR, LR(n+1), and their associated WAITs."""
+        nll = []
+        for pss in self.mainloopSteps:
+            newPss = PartitionSchedule(partitionId=pss.partitionId)
+            for dus in pss.duSteps:
+                newDus = DUSchedule(duIndex=dus.duIndex, conflict=dus.conflict)
+                newDus.ops = [op for op in dus.ops
+                              if not isinstance(op, GROp)
+                              and not (isinstance(op, LROp) and op.mtIteration == "n+1")
+                              and not (isinstance(op, WaitOp) and op.mtIteration == "n+1")]
+                newPss.duSteps.append(newDus)
+            nll.append(newPss)
+        return nll
+
     def _checkDuplicatedReads(self):
         """Detect if any (subtile, DU) pair is loaded more than once."""
         seenA: Dict[AllocKey, int] = {}
@@ -597,7 +626,7 @@ class MFMAScheduler:
     @staticmethod
     def _printOp(op: ScheduleOp, indent: str = ""):
         if isinstance(op, MFMAOp):
-            print(f"{indent}MFMAs (MT {op.mtIteration}, DU={op.duIndex}):")
+            print(f"{indent}MFMAs (MT {op.mtIteration}, DU {op.duIndex}):")
             print(f"{indent}  - {op.subtiles}")
             print(f"{indent}  - USING  A: {op.vgprTileMapA}  B: {op.vgprTileMapB}")
         elif isinstance(op, GROp):
@@ -647,6 +676,23 @@ class MFMAScheduler:
                 if dus.conflict:
                     print(f"      *** CONFLICT: USE/LOAD share VGPRTile IDs {dus.conflict} — needs unrolling ***")
 
+        print()
+        print("NGLL (No Global Load Loop):")
+        for partition in self.ngllSteps:
+            print(f"  Partition {partition.partitionId}:")
+            for dus in partition.duSteps:
+                print(f"    DU={dus.duIndex}:")
+                for op in dus.ops:
+                    self._printOp(op, indent="      ")
+
+        print()
+        print("NLL (No Load Loop):")
+        for partition in self.nllSteps:
+            print(f"  Partition {partition.partitionId}:")
+            for dus in partition.duSteps:
+                print(f"    DU={dus.duIndex}:")
+                for op in dus.ops:
+                    self._printOp(op, indent="      ")
 
 
 if __name__ == "__main__":
