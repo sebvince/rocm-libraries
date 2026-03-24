@@ -50,12 +50,12 @@ class Partition:
 
 
 
-# Key type for allocator: (subtileIdx, duIdx)
+# Key type for allocator: (subtileIdx, subIterK)
 AllocKey = Tuple[int, int]
 
 
 class VGPRTileAllocator:
-    """Maps (subtileIdx, duIdx) to shared integer VGPR tile IDs, with free-list reuse."""
+    """Maps (subtileIdx, subIterK) to shared integer VGPR tile IDs, with free-list reuse."""
 
     def __init__(self):
         self._nextId: int = 0
@@ -71,8 +71,8 @@ class VGPRTileAllocator:
         current = len(self._allocMapA) + len(self._allocMapB)
         self._peak = max(self._peak, current)
 
-    def allocate(self, tc: str, subtileIdx: int, duIdx: int) -> int:
-        key = (subtileIdx, duIdx)
+    def allocate(self, tc: str, subtileIdx: int, subIterK: int) -> int:
+        key = (subtileIdx, subIterK)
         if self._freeList:
             vid = self._freeList.pop(0)
         else:
@@ -82,19 +82,19 @@ class VGPRTileAllocator:
         self._updatePeak()
         return vid
 
-    def release(self, tc: str, subtileIdx: int, duIdx: int) -> None:
-        key = (subtileIdx, duIdx)
+    def release(self, tc: str, subtileIdx: int, subIterK: int) -> None:
+        key = (subtileIdx, subIterK)
         vid = self._allocMap(tc).pop(key)
         self._freeList.append(vid)
 
-    def isAllocated(self, tc: str, subtileIdx: int, duIdx: int) -> bool:
-        return (subtileIdx, duIdx) in self._allocMap(tc)
+    def isAllocated(self, tc: str, subtileIdx: int, subIterK: int) -> bool:
+        return (subtileIdx, subIterK) in self._allocMap(tc)
 
-    def getVGPRTileId(self, tc: str, subtileIdx: int, duIdx: int) -> int:
-        return self._allocMap(tc)[(subtileIdx, duIdx)]
+    def getVGPRTileId(self, tc: str, subtileIdx: int, subIterK: int) -> int:
+        return self._allocMap(tc)[(subtileIdx, subIterK)]
 
     def releaseAllForTile(self, tc: str, subtileIdx: int) -> None:
-        """Release all DU allocations for a given subtile index."""
+        """Release all subIterK allocations for a given subtile index."""
         allocMap = self._allocMap(tc)
         keys = [k for k in allocMap if k[0] == subtileIdx]
         for k in keys:
@@ -110,7 +110,7 @@ class VGPRTileAllocator:
 @dataclass
 class MFMAOp:
     mtIteration: str  # e.g. "n"
-    duIndex: int
+    subIterK: int
     subtiles: List[Tuple[int, int]]
     vgprTileMapA: Dict[int, int]
     vgprTileMapB: Dict[int, int]
@@ -134,7 +134,7 @@ class WaitOp:
 @dataclass
 class LROp:
     mtIteration: str  # e.g. "n", "n+1", "0"
-    duIndex: int
+    subIterK: int
     lrLoadA: Dict[int, int]
     lrLoadB: Dict[int, int]
 
@@ -152,18 +152,18 @@ class PartitionGR:
 
 
 @dataclass
-class DUSchedule:
-    """Ops for one DU iteration within a partition."""
-    duIndex: int
+class SubIterKSchedule:
+    """Ops for one subIterK iteration within a partition."""
+    subIterK: int
     ops: List[ScheduleOp] = field(default_factory=list)
     conflict: Set[int] = field(default_factory=set)
 
 
 @dataclass
 class PartitionSchedule:
-    """Schedule for one subtile partition — contains all DU iterations."""
+    """Schedule for one subtile partition — contains all subIterK iterations."""
     partitionId: int
-    duSteps: List[DUSchedule] = field(default_factory=list)
+    subIterKSteps: List[SubIterKSchedule] = field(default_factory=list)
 
 
 class MFMAScheduler:
@@ -183,8 +183,8 @@ class MFMAScheduler:
         self.numPartitionsA = self.MTA // config.partitionSizeA
         self.numPartitionsB = self.MTB // config.partitionSizeB
 
-        self.numDU = tileInfoA.subtileShape[1]
-        assert self.numDU == tileInfoB.subtileShape[1], \
+        self.numSubIterK = tileInfoA.subtileShape[1]
+        assert self.numSubIterK == tileInfoB.subtileShape[1], \
             "A and B must have same subtileShape[1]"
 
         self.partitions: List[Partition] = self._buildPartitions()
@@ -280,25 +280,25 @@ class MFMAScheduler:
         preloadMT1_A = list(first.tileAIndices)
         preloadMT1_B = list(first.tileBIndices)
 
-        # Number of DUs to preload LR for
+        # Number of subIterK to preload LR for
         if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
-            numPreloadDUs = 1
+            numPreloadSubIterKs = 1
         elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
-            numPreloadDUs = self.numDU
+            numPreloadSubIterKs = self.numSubIterK
 
         # Allocate VGPRs for first group and build LR maps
         lrOps = []
-        for du in range(numPreloadDUs):
+        for sik in range(numPreloadSubIterKs):
             lrLoadA = {}
             lrLoadB = {}
             for tA in first.tileAIndices:
-                lrLoadA[tA] = self.allocator.allocate('A', tA, du)
+                lrLoadA[tA] = self.allocator.allocate('A', tA, sik)
             for tB in first.tileBIndices:
-                lrLoadB[tB] = self.allocator.allocate('B', tB, du)
-            lrOps.append(LROp(mtIteration="0", duIndex=du,
+                lrLoadB[tB] = self.allocator.allocate('B', tB, sik)
+            lrOps.append(LROp(mtIteration="0", subIterK=sik,
                               lrLoadA=lrLoadA, lrLoadB=lrLoadB))
 
-        # Build preloop ops: GR(MT 0), GR(MT 1), then LR(MT 0) per DU
+        # Build preloop ops: GR(MT 0), GR(MT 1), then LR(MT 0) per subIterK
         self.preloopOps: List[ScheduleOp] = []
         self.preloopOps.append(GROp(mtIteration="0",
                                     subtileA=allA, subtileB=allB))
@@ -321,38 +321,38 @@ class MFMAScheduler:
         for pi, partition in enumerate(self.partitions):
             pss = PartitionSchedule(partitionId=partition.partitionId)
             gr = self.partitionGRs[pi]
-            du0LoadAKeys: Set[int] = set()
-            du0LoadBKeys: Set[int] = set()
+            subIterK0LoadAKeys: Set[int] = set()
+            subIterK0LoadBKeys: Set[int] = set()
 
-            for du in range(self.numDU):
-                # USE: current group's tiles at current DU
+            for sik in range(self.numSubIterK):
+                # USE: current group's tiles at current subIterK
                 # MFMA: map subtile indices to VGPR tile IDs
                 vgprTileMapA = {}
                 vgprTileMapB = {}
                 for tA in partition.tileAIndices:
-                    vgprTileMapA[tA] = self.allocator.getVGPRTileId('A', tA, du)
+                    vgprTileMapA[tA] = self.allocator.getVGPRTileId('A', tA, sik)
                 for tB in partition.tileBIndices:
-                    vgprTileMapB[tB] = self.allocator.getVGPRTileId('B', tB, du)
+                    vgprTileMapB[tB] = self.allocator.getVGPRTileId('B', tB, sik)
 
                 # LOAD: determined by prefetch mode
-                loadATiles, loadBTiles, loadDU = self._getLoadTargets(pi, du, numPartitions)
-                isWrapAround = self._isWrapAroundLoad(pi, du, numPartitions)
+                loadATiles, loadBTiles, loadSubIterK = self._getLoadTargets(pi, sik, numPartitions)
+                isWrapAround = self._isWrapAroundLoad(pi, sik, numPartitions)
                 curA = set(partition.tileAIndices)
                 curB = set(partition.tileBIndices)
-                if du == 0:
+                if sik == 0:
                     self._pendingRemap = []
 
                 lrLoadA = {}
                 lrLoadB = {}
                 if loadATiles is not None:
                     for tA in loadATiles:
-                        vid = self._loadTile('A', tA, loadDU, isWrapAround, curA)
+                        vid = self._loadTile('A', tA, loadSubIterK, isWrapAround, curA)
                         if vid is not None:
                             lrLoadA[tA] = vid
 
                 if loadBTiles is not None:
                     for tB in loadBTiles:
-                        vid = self._loadTile('B', tB, loadDU, isWrapAround, curB)
+                        vid = self._loadTile('B', tB, loadSubIterK, isWrapAround, curB)
                         if vid is not None:
                             lrLoadB[tB] = vid
 
@@ -365,40 +365,40 @@ class MFMAScheduler:
                     conflict = overlap
                     self.needsUnrolling = True
 
-                # Build DUSchedule with MFMA and LR ops
-                dus = DUSchedule(duIndex=du)
+                # Build SubIterKSchedule with MFMA and LR ops
+                siks = SubIterKSchedule(subIterK=sik)
                 mfmas = [(a, b) for a in sorted(vgprTileMapA.keys()) for b in sorted(vgprTileMapB.keys())]
                 mtLoad = "n+1" if isWrapAround else "n"
-                dus.ops.append(MFMAOp(mtIteration="n", duIndex=du,
+                siks.ops.append(MFMAOp(mtIteration="n", subIterK=sik,
                                       subtiles=mfmas,
                                       vgprTileMapA=vgprTileMapA, vgprTileMapB=vgprTileMapB))
-                dus.ops.append(LROp(mtIteration=mtLoad, duIndex=loadDU,
+                siks.ops.append(LROp(mtIteration=mtLoad, subIterK=loadSubIterK,
                                     lrLoadA=lrLoadA, lrLoadB=lrLoadB))
-                dus.conflict = conflict
-                pss.duSteps.append(dus)
+                siks.conflict = conflict
+                pss.subIterKSteps.append(siks)
 
-                # save subtiles for DU=0 to check where to insert GR(n+2)
-                if du == 0:
-                    du0LoadAKeys = set(lrLoadA.keys())
-                    du0LoadBKeys = set(lrLoadB.keys())
+                # save subtiles for subIterK=0 to check where to insert GR(n+2)
+                if sik == 0:
+                    subIterK0LoadAKeys = set(lrLoadA.keys())
+                    subIterK0LoadBKeys = set(lrLoadB.keys())
 
-                # WITHIN_SUBGROUP: release current DU's MFMA tiles for K-dim reuse
+                # WITHIN_SUBGROUP: release current subIterK's MFMA tiles for K-dim reuse
                 if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP:
                     for tA in vgprTileMapA:
-                        if self.allocator.isAllocated('A', tA, du):
-                            self.allocator.release('A', tA, du)
+                        if self.allocator.isAllocated('A', tA, sik):
+                            self.allocator.release('A', tA, sik)
                     for tB in vgprTileMapB:
-                        if self.allocator.isAllocated('B', tB, du):
-                            self.allocator.release('B', tB, du)
+                        if self.allocator.isAllocated('B', tB, sik):
+                            self.allocator.release('B', tB, sik)
 
-            # Insert GROp at the correct DU
+            # Insert GROp at the correct subIterK
             if gr.subtileA or gr.subtileB:
                 if gr.mtIteration == "n+2":
-                    bfDU = 1
+                    bfSubIterK = 1
                 else:
-                    hasConflict = bool((gr.subtileA & du0LoadAKeys) or (gr.subtileB & du0LoadBKeys))
-                    bfDU = 1 if hasConflict else 0
-                pss.duSteps[bfDU].ops.insert(1, GROp(
+                    hasConflict = bool((gr.subtileA & subIterK0LoadAKeys) or (gr.subtileB & subIterK0LoadBKeys))
+                    bfSubIterK = 1 if hasConflict else 0
+                pss.subIterKSteps[bfSubIterK].ops.insert(1, GROp(
                     mtIteration=gr.mtIteration,
                     subtileA=sorted(gr.subtileA),
                     subtileB=sorted(gr.subtileB)))
@@ -407,9 +407,9 @@ class MFMAScheduler:
 
             # Release after partition based on strategy
             if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP:
-                for tc, tileIdx, duIdx, shadowKey in self._pendingRemap:
-                    vid = self.allocator._allocMap(tc).pop((shadowKey, duIdx))
-                    self.allocator._allocMap(tc)[(tileIdx, duIdx)] = vid
+                for tc, tileIdx, subIterK, shadowKey in self._pendingRemap:
+                    vid = self.allocator._allocMap(tc).pop((shadowKey, subIterK))
+                    self.allocator._allocMap(tc)[(tileIdx, subIterK)] = vid
                 self._pendingRemap = []
             elif self.config.reuseStrategy == VGPRTileReUseStrategy.ACROSS_SUBGROUP:
                 self._releaseUnusedAfterPartition(pi)
@@ -419,19 +419,19 @@ class MFMAScheduler:
         self.nllSteps = self._buildNLL()
         self._checkDuplicatedReads()
 
-    def _loadTile(self, tc: str, tileIdx: int, loadDU: int,
+    def _loadTile(self, tc: str, tileIdx: int, loadSubIterK: int,
                   isWrapAround: bool,
                   currentPartitionTiles: Set[int]) -> Optional[int]:
         """Determine the VGPRTile ID for a load. Returns None if no load needed."""
-        allocated = self.allocator.isAllocated(tc, tileIdx, loadDU)
+        allocated = self.allocator.isAllocated(tc, tileIdx, loadSubIterK)
 
         if isWrapAround and allocated:
             # Wrap-around: reuse partition 0's existing VGPRTile IDs
-            return self.allocator.getVGPRTileId(tc, tileIdx, loadDU)
+            return self.allocator.getVGPRTileId(tc, tileIdx, loadSubIterK)
 
         if not allocated:
             # Fresh allocation
-            return self.allocator.allocate(tc, tileIdx, loadDU)
+            return self.allocator.allocate(tc, tileIdx, loadSubIterK)
 
         if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP \
                 and tileIdx in currentPartitionTiles:
@@ -439,49 +439,49 @@ class MFMAScheduler:
             # Must allocate a new VGPR for the next partition's data.
             # Use a shadow key to avoid overwriting the current allocation.
             shadowKey = -(tileIdx + 1)  # negative to avoid collision
-            vid = self.allocator.allocate(tc, shadowKey, loadDU)
+            vid = self.allocator.allocate(tc, shadowKey, loadSubIterK)
             # Store the real tileIdx mapping for later fixup
-            self._pendingRemap.append((tc, tileIdx, loadDU, shadowKey))
+            self._pendingRemap.append((tc, tileIdx, loadSubIterK, shadowKey))
             return vid
 
         # NONE / ACROSS_SUBGROUP: tile stays alive, reuse in place
         return None
 
-    def _isWrapAroundLoad(self, partitionIdx: int, duIdx: int, numPartitions: int) -> bool:
+    def _isWrapAroundLoad(self, partitionIdx: int, subIterK: int, numPartitions: int) -> bool:
         """True when this step's load targets partition 0 for the next macrotile iteration."""
         if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
-            return partitionIdx == numPartitions - 1 and duIdx == self.numDU - 1
+            return partitionIdx == numPartitions - 1 and subIterK == self.numSubIterK - 1
         elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
             return partitionIdx == numPartitions - 1
         return False
 
     # ── Prefetch modes ───────────────────────────────────────
 
-    def _getLoadTargets(self, partitionIdx: int, duIdx: int,
+    def _getLoadTargets(self, partitionIdx: int, subIterK: int,
                         numPartitions: int) -> Tuple[Optional[List[int]], Optional[List[int]], int]:
-        """Returns (loadATiles, loadBTiles, targetDU)."""
+        """Returns (loadATiles, loadBTiles, targetSubIterK)."""
         if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
-            return self._loadTargetsHalfPrefetch(partitionIdx, duIdx, numPartitions)
+            return self._loadTargetsHalfPrefetch(partitionIdx, subIterK, numPartitions)
         elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
-            return self._loadTargetsFullPrefetch(partitionIdx, duIdx, numPartitions)
+            return self._loadTargetsFullPrefetch(partitionIdx, subIterK, numPartitions)
         return (None, None, 0)
 
-    def _loadTargetsHalfPrefetch(self, partitionIdx, duIdx, numPartitions):
-        """HALF: DU=0 loads same-partition DU=1, DU=last loads next-partition DU=0.
+    def _loadTargetsHalfPrefetch(self, partitionIdx, subIterK, numPartitions):
+        """HALF: subIterK=0 loads same-partition subIterK=1, subIterK=last loads next-partition subIterK=0.
         Last partition wraps around to partition 0 (next iteration)."""
         currentPartition = self.partitions[partitionIdx]
-        if duIdx < self.numDU - 1:
-            targetDU = duIdx + 1
-            return (currentPartition.tileAIndices, currentPartition.tileBIndices, targetDU)
+        if subIterK < self.numSubIterK - 1:
+            targetSubIterK = subIterK + 1
+            return (currentPartition.tileAIndices, currentPartition.tileBIndices, targetSubIterK)
         else:
             nextPartition = self.partitions[(partitionIdx + 1) % numPartitions]
             return (nextPartition.tileAIndices, nextPartition.tileBIndices, 0)
 
-    def _loadTargetsFullPrefetch(self, partitionIdx, duIdx, numPartitions):
-        """FULL: DU=0 loads next-partition DU=0, DU=1 loads next-partition DU=1.
+    def _loadTargetsFullPrefetch(self, partitionIdx, subIterK, numPartitions):
+        """FULL: subIterK=0 loads next-partition subIterK=0, subIterK=1 loads next-partition subIterK=1.
         Last partition wraps around to partition 0 (next iteration)."""
         nextPartition = self.partitions[(partitionIdx + 1) % numPartitions]
-        return (nextPartition.tileAIndices, nextPartition.tileBIndices, duIdx)
+        return (nextPartition.tileAIndices, nextPartition.tileBIndices, subIterK)
 
     # ── Reuse strategies ─────────────────────────────────────
 
@@ -503,7 +503,7 @@ class MFMAScheduler:
                 self.allocator.releaseAllForTile('B', tB)
 
     def _releasePartitionTiles(self, partition: Partition):
-        """WITHIN_SUBGROUP: release all tiles (all DUs) of this partition."""
+        """WITHIN_SUBGROUP: release all tiles (all subIterK) of this partition."""
         for tA in partition.tileAIndices:
             self.allocator.releaseAllForTile('A', tA)
         for tB in partition.tileBIndices:
@@ -515,17 +515,17 @@ class MFMAScheduler:
         grEvents = []
         si = 0
         for pss in self.mainloopSteps:
-            for dus in pss.duSteps:
+            for dus in pss.subIterKSteps:
                 grOp = next((op for op in dus.ops if isinstance(op, GROp)), None)
                 if grOp:
-                    grEvents.append((si, pss.partitionId, dus.duIndex,
+                    grEvents.append((si, pss.partitionId, dus.subIterK,
                                      len(grOp.subtileA) + len(grOp.subtileB),
                                      set(grOp.subtileA), set(grOp.subtileB)))
                 si += 1
 
         def _countInflightGR(waitStepIndex, waitA, waitB):
             sourceGRIdx = None
-            for evi, (si, gi, du, cnt, grA, grB) in enumerate(grEvents):
+            for evi, (si, gi, sik, cnt, grA, grB) in enumerate(grEvents):
                 if (waitA and waitA <= grA) or (waitB and waitB <= grB):
                     sourceGRIdx = evi
                     break
@@ -533,7 +533,7 @@ class MFMAScheduler:
                 return None
             total = 0
             sourceStepIdx = grEvents[sourceGRIdx][0]
-            for (si, gi, du, cnt, grA, grB) in grEvents:
+            for (si, gi, sik, cnt, grA, grB) in grEvents:
                 if si >= sourceStepIdx or si < waitStepIndex:
                     total += cnt
             return total
@@ -547,13 +547,13 @@ class MFMAScheduler:
             pendingA |= gr.subtileA
             pendingB |= gr.subtileB
 
-            for dus in pss.duSteps:
+            for dus in pss.subIterKSteps:
                 lrOp = dus.ops[-1]
                 assert isinstance(lrOp, LROp)
 
                 waitA = set()
                 waitB = set()
-                if lrOp.duIndex == 0:
+                if lrOp.subIterK == 0:
                     waitA = set(lrOp.lrLoadA.keys()) & pendingA
                     waitB = set(lrOp.lrLoadB.keys()) & pendingB
                 if waitA or waitB:
@@ -573,10 +573,10 @@ class MFMAScheduler:
         ngll = []
         for pss in self.mainloopSteps:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
-            for dus in pss.duSteps:
-                newDus = DUSchedule(duIndex=dus.duIndex, conflict=dus.conflict)
+            for dus in pss.subIterKSteps:
+                newDus = SubIterKSchedule(subIterK=dus.subIterK, conflict=dus.conflict)
                 newDus.ops = [op for op in dus.ops if not isinstance(op, GROp)]
-                newPss.duSteps.append(newDus)
+                newPss.subIterKSteps.append(newDus)
             ngll.append(newPss)
         return ngll
 
@@ -585,39 +585,39 @@ class MFMAScheduler:
         nll = []
         for pss in self.mainloopSteps:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
-            for dus in pss.duSteps:
-                newDus = DUSchedule(duIndex=dus.duIndex, conflict=dus.conflict)
+            for dus in pss.subIterKSteps:
+                newDus = SubIterKSchedule(subIterK=dus.subIterK, conflict=dus.conflict)
                 newDus.ops = [op for op in dus.ops
                               if not isinstance(op, GROp)
                               and not (isinstance(op, LROp) and op.mtIteration == "n+1")
                               and not (isinstance(op, WaitOp) and op.mtIteration == "n+1")]
-                newPss.duSteps.append(newDus)
+                newPss.subIterKSteps.append(newDus)
             nll.append(newPss)
         return nll
 
     def _checkDuplicatedReads(self):
-        """Detect if any (subtile, DU) pair is loaded more than once."""
+        """Detect if any (subtile, subIterK) pair is loaded more than once."""
         seenA: Dict[AllocKey, int] = {}
         seenB: Dict[AllocKey, int] = {}
         # Count preloop LR loads
         for op in self.preloopOps:
             if isinstance(op, LROp):
                 for tA in op.lrLoadA:
-                    key = (tA, op.duIndex)
+                    key = (tA, op.subIterK)
                     seenA[key] = seenA.get(key, 0) + 1
                 for tB in op.lrLoadB:
-                    key = (tB, op.duIndex)
+                    key = (tB, op.subIterK)
                     seenB[key] = seenB.get(key, 0) + 1
         # Count mainloop LR loads (skip wrap-around which reuses existing allocations)
         for pss in self.mainloopSteps:
-            for dus in pss.duSteps:
+            for dus in pss.subIterKSteps:
                 for op in dus.ops:
                     if isinstance(op, LROp) and op.mtIteration != "n+1":
                         for tA in op.lrLoadA:
-                            key = (tA, op.duIndex)
+                            key = (tA, op.subIterK)
                             seenA[key] = seenA.get(key, 0) + 1
                         for tB in op.lrLoadB:
-                            key = (tB, op.duIndex)
+                            key = (tB, op.subIterK)
                             seenB[key] = seenB.get(key, 0) + 1
         self.hasDuplicatedReads = (
             any(c > 1 for c in seenA.values()) or
@@ -629,7 +629,7 @@ class MFMAScheduler:
     @staticmethod
     def _printOp(op: ScheduleOp, indent: str = ""):
         if isinstance(op, MFMAOp):
-            print(f"{indent}MFMAs (MT {op.mtIteration}, DU {op.duIndex}):")
+            print(f"{indent}MFMAs (MT {op.mtIteration}, subIterK {op.subIterK}):")
             print(f"{indent}  - {op.subtiles}")
             print(f"{indent}  - USING  A: {op.vgprTileMapA}  B: {op.vgprTileMapB}")
         elif isinstance(op, GROp):
@@ -638,8 +638,8 @@ class MFMAScheduler:
             inflight = f" — {op.inflightGRCount} inflight GRs" if op.inflightGRCount is not None else ""
             print(f"{indent}WAIT (MT {op.mtIteration}) A: {op.subtileA}  B: {op.subtileB}{inflight}")
         elif isinstance(op, LROp):
-            duLabel = f", DU {op.duIndex}" if op.duIndex >= 0 else ""
-            print(f"{indent}LR (MT {op.mtIteration}{duLabel}) A: {op.lrLoadA}  B: {op.lrLoadB}")
+            sikLabel = f", subIterK {op.subIterK}" if op.subIterK >= 0 else ""
+            print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {op.lrLoadA}  B: {op.lrLoadB}")
 
     def printSchedule(self):
         print(f"SubtileGridA={self.MTA}, SubtileGridB={self.MTB}")
@@ -672,8 +672,8 @@ class MFMAScheduler:
         print("MAINLOOP:")
         for partition in self.mainloopSteps:
             print(f"  Partition {partition.partitionId}:")
-            for dus in partition.duSteps:
-                print(f"    DU={dus.duIndex}:")
+            for dus in partition.subIterKSteps:
+                print(f"    subIterK={dus.subIterK}:")
                 for op in dus.ops:
                     self._printOp(op, indent="      ")
                 if dus.conflict:
@@ -683,8 +683,8 @@ class MFMAScheduler:
         print("NGLL (No Global Load Loop):")
         for partition in self.ngllSteps:
             print(f"  Partition {partition.partitionId}:")
-            for dus in partition.duSteps:
-                print(f"    DU={dus.duIndex}:")
+            for dus in partition.subIterKSteps:
+                print(f"    subIterK={dus.subIterK}:")
                 for op in dus.ops:
                     self._printOp(op, indent="      ")
 
@@ -692,8 +692,8 @@ class MFMAScheduler:
         print("NLL (No Load Loop):")
         for partition in self.nllSteps:
             print(f"  Partition {partition.partitionId}:")
-            for dus in partition.duSteps:
-                print(f"    DU={dus.duIndex}:")
+            for dus in partition.subIterKSteps:
+                print(f"    subIterK={dus.subIterK}:")
                 for op in dus.ops:
                     self._printOp(op, indent="      ")
 
@@ -716,7 +716,7 @@ class MFMAScheduler:
 
         module = Module()
         for pss in steps:
-            for dus in pss.duSteps:
+            for dus in pss.subIterKSteps:
                 for op in dus.ops:
                     if not isinstance(op, MFMAOp):
                         continue
@@ -726,25 +726,25 @@ class MFMAScheduler:
                         dTile = dtileInfo.vgprTiles[a + b * dtileInfo.localMMATileGrid[0]]
                         module.add(emitMfmaInstruction(
                             writer, kernel, aTile, bTile, dTile, dTile,
-                            f"MFMA C[{a},{b}] += A[{a},DU{op.duIndex}] * B[{b},DU{op.duIndex}]"))
+                            f"MFMA C[{a},{b}] += A[{a},subIterK{op.subIterK}] * B[{b},subIterK{op.subIterK}]"))
         return module
 
     def emitLRs(self, writer, kernel, steps):
         """Emit LR (Local Read) ds_load instructions for a list of PartitionSchedules."""
         module = Module()
         for pss in steps:
-            for dus in pss.duSteps:
+            for dus in pss.subIterKSteps:
                 for op in dus.ops:
                     if not isinstance(op, LROp):
                         continue
                     for tA, vgprTileId in op.lrLoadA.items():
                         dstTile = self.vgprTiles[vgprTileId]
                         module.add(emitSingleDsRead(
-                            self.tileInfoA, tA, op.duIndex, dstTile))
+                            self.tileInfoA, tA, op.subIterK, dstTile))
                     for tB, vgprTileId in op.lrLoadB.items():
                         dstTile = self.vgprTiles[vgprTileId]
                         module.add(emitSingleDsRead(
-                            self.tileInfoB, tB, op.duIndex, dstTile))
+                            self.tileInfoB, tB, op.subIterK, dstTile))
         return module
 
     def generateCode(self, writer, kernel):
@@ -757,11 +757,11 @@ class MFMAScheduler:
             print(f"\n{label}:")
             for pss in steps:
                 print(f"  Partition {pss.partitionId}:")
-                for dus in pss.duSteps:
-                    print(f"    DU={dus.duIndex}:")
+                for dus in pss.subIterKSteps:
+                    print(f"    subIterK={dus.subIterK}:")
                     oneStep = [PartitionSchedule(
                         partitionId=pss.partitionId,
-                        duSteps=[dus])]
+                        subIterKSteps=[dus])]
                     module = self.emitMFMAs(writer, kernel, oneStep, dtileInfo)
                     print(module)
                     module_lr = self.emitLRs(writer, kernel, oneStep)
@@ -833,19 +833,20 @@ if __name__ == "__main__":
     lsgB = tiB.localSubtileGrid[0]
 
     configs = [
+        (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+            SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+
          (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
          SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
 
-        (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-            SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
     ]
 
     for name, cfg in configs:
         print(f"=== {name} ===")
         s = MFMAScheduler(tiA, tiB, cfg)
         s.printSchedule()
-        writer = create_mock_writer(kernel)
-        tiA.allocOffsetRegisters(writer, kernel)
-        tiB.allocOffsetRegisters(writer, kernel)
-        s.generateCode(writer, kernel)
-        print()
+        # writer = create_mock_writer(kernel)
+        # tiA.allocOffsetRegisters(writer, kernel)
+        # tiB.allocOffsetRegisters(writer, kernel)
+        # s.generateCode(writer, kernel)
+        # print()
