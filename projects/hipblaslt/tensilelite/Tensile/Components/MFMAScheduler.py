@@ -136,13 +136,6 @@ class LROp:
     lrLoadB: Dict[int, int]
 
 
-@dataclass
-class DoubleBufferDep:
-    lastGroupId: int
-    lastReadA: Dict[int, Tuple]  # subtileIdx -> (groupId or "bootstrap", duIndex)
-    lastReadB: Dict[int, Tuple]
-
-
 ScheduleOp = Union[MFMAOp, GROp, WaitOp, LROp]
 
 
@@ -382,6 +375,7 @@ class MFMAScheduler:
                 dus.conflict = conflict
                 gss.duSteps.append(dus)
 
+                # save subtiles for DU=0 to check where to insert GR(n+2)
                 if du == 0:
                     du0LoadAKeys = set(lrLoadA.keys())
                     du0LoadBKeys = set(lrLoadB.keys())
@@ -512,7 +506,7 @@ class MFMAScheduler:
             self.allocator.releaseAllForTile('B', tB)
 
     def _insertWaitsAndDeps(self, numGroups: int):
-        """Insert WAIT ops and build double-buffer dependency from mainloop ops."""
+        """Insert WAIT ops into mainloop ops."""
         # Build ordered GR events for inflight counting
         grEvents = []
         si = 0
@@ -569,28 +563,6 @@ class MFMAScheduler:
 
                 si += 1
 
-        # Build double-buffer dependency
-        self.doubleBufferDep: Optional[DoubleBufferDep] = None
-        if numGroups > 1:
-            wrapGroup = self.groups[0]
-            wrapSubtilesA = set(wrapGroup.tileAIndices)
-            wrapSubtilesB = set(wrapGroup.tileBIndices)
-            lastReadA = {t: ("bootstrap", -1) for t in wrapSubtilesA}
-            lastReadB = {t: ("bootstrap", -1) for t in wrapSubtilesB}
-            for gss in self.mainloopSteps:
-                for dus in gss.duSteps:
-                    lrOp = next(op for op in dus.ops if isinstance(op, LROp))
-                    if lrOp.mtIteration == "n+1":
-                        continue
-                    for tA in lrOp.lrLoadA:
-                        if tA in wrapSubtilesA:
-                            lastReadA[tA] = (gss.groupId, dus.duIndex)
-                    for tB in lrOp.lrLoadB:
-                        if tB in wrapSubtilesB:
-                            lastReadB[tB] = (gss.groupId, dus.duIndex)
-            self.doubleBufferDep = DoubleBufferDep(
-                lastGroupId=self.groups[-1].groupId,
-                lastReadA=lastReadA, lastReadB=lastReadB)
 
     def _checkDuplicatedReads(self):
         """Detect if any (subtile, DU) pair is loaded more than once."""
@@ -676,17 +648,6 @@ class MFMAScheduler:
                 if dus.conflict:
                     print(f"      *** CONFLICT: USE/LOAD share VGPRTile IDs {dus.conflict} — needs unrolling ***")
 
-        if self.doubleBufferDep:
-            dep = self.doubleBufferDep
-            print()
-            print(f"Double-buffer LDS dependency (MT n+2 writes vs MT n reads):")
-            print(f"  buffer_load at Group {dep.lastGroupId} must wait for last ds_read of same subtile:")
-            for tA in sorted(dep.lastReadA.keys()):
-                g, d = dep.lastReadA[tA]
-                print(f"    A[{tA}]: last read at {f'Group {g}, DU={d}' if g != 'bootstrap' else 'bootstrap'}")
-            for tB in sorted(dep.lastReadB.keys()):
-                g, d = dep.lastReadB[tB]
-                print(f"    B[{tB}]: last read at {f'Group {g}, DU={d}' if g != 'bootstrap' else 'bootstrap'}")
 
 
 if __name__ == "__main__":
