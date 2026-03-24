@@ -154,7 +154,8 @@ def generate_roundtrip_kernel(cfg, wave_id=0):
 
     writer, kernel, tileInfoA, tileInfoB = create_writer(cfg)
     print(tileInfoA)
-
+    kernel["MatrixInstM"] = 16
+    kernel["MatrixInstN"] = 16
     # Reserve s0-s11 for hardware regs + kernarg loads
     writer.sgprPool.checkOut(12)
     writer.sgprs["StrideA0I"] = 10
@@ -167,8 +168,10 @@ def generate_roundtrip_kernel(cfg, wave_id=0):
     writer.sgprs["SrdB"] = writer.sgprPool.checkOutAligned(4, 4, "SrdB", preventOverflow=False)
     writer.sgprs["LocalWriteBaseAddrA"] = writer.sgprPool.checkOut(1, "LocalWriteBaseAddrA", preventOverflow=False)
     writer.sgprs["LocalWriteDTLOffsetA"] = writer.sgprPool.checkOut(1, "LocalWriteDTLOffsetA", preventOverflow=False)
+    writer.sgprs["LocalWriteSwapA"] = writer.sgprPool.checkOut(1, "LocalWriteSwapA", preventOverflow=False)
     writer.sgprs["LocalWriteBaseAddrB"] = writer.sgprPool.checkOut(1, "LocalWriteBaseAddrB", preventOverflow=False)
     writer.sgprs["LocalWriteDTLOffsetB"] = writer.sgprPool.checkOut(1, "LocalWriteDTLOffsetB", preventOverflow=False)
+    writer.sgprs["LocalWriteSwapB"] = writer.sgprPool.checkOut(1, "LocalWriteSwapB", preventOverflow=False)
     tileInfoA.allocVgprTileRegisters(writer, kernel)
     tileInfoB.allocVgprTileRegisters(writer, kernel)
 

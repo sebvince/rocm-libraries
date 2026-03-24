@@ -177,7 +177,11 @@ def create_writer(cfg, mi_wave_group=None):
     readSize = 2 * tileInfoA.subtileSize
     numASubtiles = tileInfoA.globalSubtileGrid[0] * tileInfoA.globalSubtileGrid[1]
     writer.ldsStartOffsetA = 0
-    writer.ldsStartOffsetB = ((numASubtiles * tileInfoA.subtileSize + readSize-1) // readSize) * readSize
+    numBSubtiles = tileInfoB.globalSubtileGrid[0] * tileInfoB.globalSubtileGrid[1]
+    sizeA = ((numASubtiles * tileInfoA.subtileSize + readSize-1) // readSize) * readSize
+    sizeB = ((numBSubtiles * tileInfoB.subtileSize + readSize-1) // readSize) * readSize
+    writer.ldsStartOffsetB = sizeA
+    writer.ldsTotalSize = sizeA + sizeB
 
     return writer, kernel, tileInfoA, tileInfoB
 
