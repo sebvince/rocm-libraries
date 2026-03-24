@@ -122,23 +122,23 @@ class ScheduleStep:
 
 @dataclass
 class MFMAOp:
-    mtLabel: str  # e.g. "n"
+    mtIteration: str  # e.g. "n"
+    duIndex: int
     subtiles: List[Tuple[int, int]]
-    useA: Dict[int, int]
-    useB: Dict[int, int]
+    vgprTileMapA: Dict[int, int]
+    vgprTileMapB: Dict[int, int]
 
 
 @dataclass
 class GROp:
-    mtLabel: str  # e.g. "n+1", "n+2", "0", "1"
-    targetGroupId: Optional[int]  # None for preloop
+    mtIteration: str  # e.g. "n+1", "n+2", "0", "1"
     subtileA: List[int]
     subtileB: List[int]
 
 
 @dataclass
 class WaitOp:
-    mtLabel: str  # e.g. "n", "n+1"
+    mtIteration: str  # e.g. "n", "n+1"
     subtileA: List[int]
     subtileB: List[int]
     inflightGRCount: Optional[int] = None
@@ -146,7 +146,7 @@ class WaitOp:
 
 @dataclass
 class LROp:
-    mtLabel: str  # e.g. "n", "n+1", "0"
+    mtIteration: str  # e.g. "n", "n+1", "0"
     duIndex: int
     loadA: Dict[int, int]
     loadB: Dict[int, int]
@@ -163,12 +163,18 @@ ScheduleOp = Union[MFMAOp, GROp, WaitOp, LROp]
 
 
 @dataclass
-class SubtileGroupSchedule:
-    """Display schedule for one (group, DU) step — ordered list of ops."""
-    groupId: int
+class DUSchedule:
+    """Ops for one DU iteration within a group."""
     duIndex: int
     ops: List[ScheduleOp] = field(default_factory=list)
     conflict: Set[int] = field(default_factory=set)
+
+
+@dataclass
+class SubtileGroupSchedule:
+    """Display schedule for one subtile group — contains all DU iterations."""
+    groupId: int
+    duSteps: List[DUSchedule] = field(default_factory=list)
 
 
 class MFMAScheduler:
@@ -525,13 +531,13 @@ class MFMAScheduler:
             numPreloadDUs = self.numDU
 
         self.preloopOps: List[ScheduleOp] = []
-        self.preloopOps.append(GROp(mtLabel="0", targetGroupId=None,
+        self.preloopOps.append(GROp(mtIteration="0",
                                     subtileA=allA, subtileB=allB))
         if numPreloadMTs > 1:
-            self.preloopOps.append(GROp(mtLabel="1", targetGroupId=None,
+            self.preloopOps.append(GROp(mtIteration="1",
                                         subtileA=preloadMT1_A, subtileB=preloadMT1_B))
         for du in range(numPreloadDUs):
-            self.preloopOps.append(LROp(mtLabel="0", duIndex=du,
+            self.preloopOps.append(LROp(mtIteration="0", duIndex=du,
                                         loadA=self._schedule[du].useA,
                                         loadB=self._schedule[du].useB))
 
@@ -539,29 +545,30 @@ class MFMAScheduler:
         self.mainloopSteps: List[SubtileGroupSchedule] = []
         pendingA = set()
         pendingB = set()
-        currentGroup = -1
+        currentGSS: Optional[SubtileGroupSchedule] = None
 
         for si, step in enumerate(self._schedule):
-            if step.groupId != currentGroup:
-                currentGroup = step.groupId
-                bufA, bufB = bufferLoadsPerGroup[currentGroup]
+            if currentGSS is None or step.groupId != currentGSS.groupId:
+                currentGSS = SubtileGroupSchedule(groupId=step.groupId)
+                self.mainloopSteps.append(currentGSS)
+                bufA, bufB = bufferLoadsPerGroup[step.groupId]
                 pendingA |= bufA
                 pendingB |= bufB
 
-            gss = SubtileGroupSchedule(groupId=step.groupId, duIndex=step.duIndex)
+            dus = DUSchedule(duIndex=step.duIndex)
             mtLoad = "n+1" if step.isWrapLoad else "n"
 
             # MFMA
             mfmas = [(a, b) for a in sorted(step.useA.keys()) for b in sorted(step.useB.keys())]
-            gss.ops.append(MFMAOp(mtLabel="n", subtiles=mfmas,
-                                  useA=step.useA, useB=step.useB))
+            dus.ops.append(MFMAOp(mtIteration="n", duIndex=step.duIndex,
+                                  subtiles=mfmas,
+                                  vgprTileMapA=step.useA, vgprTileMapB=step.useB))
 
             # GR
             bufA, bufB = bufferLoadsPerGroup[step.groupId]
             if (bufA or bufB) and step.duIndex == bufferLoadDU[step.groupId]:
-                targetGi = (step.groupId + 1) % numGroups
                 bufMtLabel = "n+2" if step.groupId == numGroups - 1 else "n+1"
-                gss.ops.append(GROp(mtLabel=bufMtLabel, targetGroupId=targetGi,
+                dus.ops.append(GROp(mtIteration=bufMtLabel,
                                     subtileA=sorted(bufA), subtileB=sorted(bufB)))
 
             # WAIT
@@ -572,17 +579,17 @@ class MFMAScheduler:
                 waitB = set(step.loadB.keys()) & pendingB
             if waitA or waitB:
                 inflightCount = _countInflightGR(si, waitA, waitB)
-                gss.ops.append(WaitOp(mtLabel=mtLoad, subtileA=sorted(waitA),
+                dus.ops.append(WaitOp(mtIteration=mtLoad, subtileA=sorted(waitA),
                                       subtileB=sorted(waitB), inflightGRCount=inflightCount))
                 pendingA -= waitA
                 pendingB -= waitB
 
             # LR
-            gss.ops.append(LROp(mtLabel=mtLoad, duIndex=step.loadDU,
+            dus.ops.append(LROp(mtIteration=mtLoad, duIndex=step.loadDU,
                                 loadA=step.loadA, loadB=step.loadB))
 
-            gss.conflict = step.conflict
-            self.mainloopSteps.append(gss)
+            dus.conflict = step.conflict
+            currentGSS.duSteps.append(dus)
 
         # === Build double-buffer dependency ===
         self.doubleBufferDep: Optional[DoubleBufferDep] = None
@@ -610,17 +617,17 @@ class MFMAScheduler:
     @staticmethod
     def _printOp(op: ScheduleOp, indent: str = ""):
         if isinstance(op, MFMAOp):
-            print(f"{indent}MFMAs (MT {op.mtLabel}): \n\t\t\t- {op.subtiles}")
-            print(f"\t\t\t- USING  A: {op.useA}  B: {op.useB}")
+            print(f"{indent}MFMAs (MT {op.mtIteration}, DU={op.duIndex}):")
+            print(f"{indent}  - {op.subtiles}")
+            print(f"{indent}  - USING  A: {op.vgprTileMapA}  B: {op.vgprTileMapB}")
         elif isinstance(op, GROp):
-            target = f" for Group {op.targetGroupId}" if op.targetGroupId is not None else ""
-            print(f"{indent}GR (MT {op.mtLabel}){target}:  A: {op.subtileA}  B: {op.subtileB}")
+            print(f"{indent}GR (MT {op.mtIteration}):  A: {op.subtileA}  B: {op.subtileB}")
         elif isinstance(op, WaitOp):
             inflight = f" — {op.inflightGRCount} inflight GRs" if op.inflightGRCount is not None else ""
-            print(f"{indent}WAIT (MT {op.mtLabel}) A: {op.subtileA}  B: {op.subtileB}{inflight}")
+            print(f"{indent}WAIT (MT {op.mtIteration}) A: {op.subtileA}  B: {op.subtileB}{inflight}")
         elif isinstance(op, LROp):
             duLabel = f", DU {op.duIndex}" if op.duIndex >= 0 else ""
-            print(f"{indent}LR (MT {op.mtLabel}{duLabel}) A: {op.loadA}  B: {op.loadB}")
+            print(f"{indent}LR (MT {op.mtIteration}{duLabel}) A: {op.loadA}  B: {op.loadB}")
 
     def printSchedule(self):
         print(f"SubtileGridA={self.MTA}, SubtileGridB={self.MTB}")
@@ -651,12 +658,14 @@ class MFMAScheduler:
         print()
 
         print("MAINLOOP:")
-        for step in self.mainloopSteps:
-            print(f"  Group {step.groupId}, DU={step.duIndex}:")
-            for op in step.ops:
-                self._printOp(op, indent="    ")
-            if step.conflict:
-                print(f"    *** CONFLICT: USE/LOAD share VGPRTile IDs {step.conflict} — needs unrolling ***")
+        for group in self.mainloopSteps:
+            print(f"  Group {group.groupId}:")
+            for dus in group.duSteps:
+                print(f"    DU={dus.duIndex}:")
+                for op in dus.ops:
+                    self._printOp(op, indent="      ")
+                if dus.conflict:
+                    print(f"      *** CONFLICT: USE/LOAD share VGPRTile IDs {dus.conflict} — needs unrolling ***")
 
         if self.doubleBufferDep:
             dep = self.doubleBufferDep
