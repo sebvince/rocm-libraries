@@ -320,8 +320,6 @@ class MFMAScheduler:
         preloadedMT1_A, preloadedMT1_B = self._buildPreloop()
         self.groupGRs = self._computeGroupGRs(preloadedMT1_A, preloadedMT1_B)
 
-        loadCountA: Dict[AllocKey, int] = {}
-        loadCountB: Dict[AllocKey, int] = {}
         numGroups = len(self.groups)
         self.mainloopSteps: List[SubtileGroupSchedule] = []
 
@@ -353,13 +351,13 @@ class MFMAScheduler:
                 lrLoadB = {}
                 if loadATiles is not None:
                     for tA in loadATiles:
-                        vid = self._loadTile('A', tA, loadDU, isWrapAround, loadCountA, curA)
+                        vid = self._loadTile('A', tA, loadDU, isWrapAround, curA)
                         if vid is not None:
                             lrLoadA[tA] = vid
 
                 if loadBTiles is not None:
                     for tB in loadBTiles:
-                        vid = self._loadTile('B', tB, loadDU, isWrapAround, loadCountB, curB)
+                        vid = self._loadTile('B', tB, loadDU, isWrapAround, curB)
                         if vid is not None:
                             lrLoadB[tB] = vid
 
@@ -420,15 +418,11 @@ class MFMAScheduler:
             elif self.config.reuseStrategy == VGPRTileReUseStrategy.ACROSS_SUBGROUP:
                 self._releaseUnusedAfterGroup(gi)
 
-        self.hasDuplicatedReads = (
-            any(c > 1 for c in loadCountA.values()) or
-            any(c > 1 for c in loadCountB.values())
-        )
-
         self._insertWaitsAndDeps(numGroups)
+        self._checkDuplicatedReads()
 
     def _loadTile(self, tc: str, tileIdx: int, loadDU: int,
-                  isWrapAround: bool, loadCount: Dict,
+                  isWrapAround: bool,
                   currentGroupTiles: Set[int]) -> Optional[int]:
         """Determine the VGPRTile ID for a load. Returns None if no load needed."""
         allocated = self.allocator.isAllocated(tc, tileIdx, loadDU)
@@ -439,10 +433,7 @@ class MFMAScheduler:
 
         if not allocated:
             # Fresh allocation
-            vid = self.allocator.allocate(tc, tileIdx, loadDU)
-            key = (tileIdx, loadDU)
-            loadCount[key] = loadCount.get(key, 0) + 1
-            return vid
+            return self.allocator.allocate(tc, tileIdx, loadDU)
 
         if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP \
                 and tileIdx in currentGroupTiles:
@@ -453,8 +444,6 @@ class MFMAScheduler:
             vid = self.allocator.allocate(tc, shadowKey, loadDU)
             # Store the real tileIdx mapping for later fixup
             self._pendingRemap.append((tc, tileIdx, loadDU, shadowKey))
-            key = (tileIdx, loadDU)
-            loadCount[key] = loadCount.get(key, 0) + 1
             return vid
 
         # NONE / ACROSS_SUBGROUP: tile stays alive, reuse in place
@@ -602,6 +591,35 @@ class MFMAScheduler:
             self.doubleBufferDep = DoubleBufferDep(
                 lastGroupId=self.groups[-1].groupId,
                 lastReadA=lastReadA, lastReadB=lastReadB)
+
+    def _checkDuplicatedReads(self):
+        """Detect if any (subtile, DU) pair is loaded more than once."""
+        seenA: Dict[AllocKey, int] = {}
+        seenB: Dict[AllocKey, int] = {}
+        # Count preloop LR loads
+        for op in self.preloopOps:
+            if isinstance(op, LROp):
+                for tA in op.lrLoadA:
+                    key = (tA, op.duIndex)
+                    seenA[key] = seenA.get(key, 0) + 1
+                for tB in op.lrLoadB:
+                    key = (tB, op.duIndex)
+                    seenB[key] = seenB.get(key, 0) + 1
+        # Count mainloop LR loads (skip wrap-around which reuses existing allocations)
+        for gss in self.mainloopSteps:
+            for dus in gss.duSteps:
+                for op in dus.ops:
+                    if isinstance(op, LROp) and op.mtIteration != "n+1":
+                        for tA in op.lrLoadA:
+                            key = (tA, op.duIndex)
+                            seenA[key] = seenA.get(key, 0) + 1
+                        for tB in op.lrLoadB:
+                            key = (tB, op.duIndex)
+                            seenB[key] = seenB.get(key, 0) + 1
+        self.hasDuplicatedReads = (
+            any(c > 1 for c in seenA.values()) or
+            any(c > 1 for c in seenB.values())
+        )
 
     # ── Debug ────────────────────────────────────────────────
 
