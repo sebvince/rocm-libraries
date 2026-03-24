@@ -132,8 +132,8 @@ class WaitOp:
 class LROp:
     mtIteration: str  # e.g. "n", "n+1", "0"
     duIndex: int
-    loadA: Dict[int, int]
-    loadB: Dict[int, int]
+    lrLoadA: Dict[int, int]
+    lrLoadB: Dict[int, int]
 
 
 @dataclass
@@ -294,14 +294,14 @@ class MFMAScheduler:
         # Allocate VGPRs for first group and build LR maps
         lrOps = []
         for du in range(numPreloadDUs):
-            loadA = {}
-            loadB = {}
+            lrLoadA = {}
+            lrLoadB = {}
             for tA in first.tileAIndices:
-                loadA[tA] = self.allocator.allocate('A', tA, du)
+                lrLoadA[tA] = self.allocator.allocate('A', tA, du)
             for tB in first.tileBIndices:
-                loadB[tB] = self.allocator.allocate('B', tB, du)
+                lrLoadB[tB] = self.allocator.allocate('B', tB, du)
             lrOps.append(LROp(mtIteration="0", duIndex=du,
-                              loadA=loadA, loadB=loadB))
+                              lrLoadA=lrLoadA, lrLoadB=lrLoadB))
 
         # Build preloop ops: GR(MT 0), GR(MT 1), then LR(MT 0) per DU
         self.preloopOps: List[ScheduleOp] = []
@@ -333,12 +333,13 @@ class MFMAScheduler:
 
             for du in range(self.numDU):
                 # USE: current group's tiles at current DU
-                useA = {}
-                useB = {}
+                # MFMA: map subtile indices to VGPR tile IDs
+                vgprTileMapA = {}
+                vgprTileMapB = {}
                 for tA in group.tileAIndices:
-                    useA[tA] = self.allocator.getVGPRTileId('A', tA, du)
+                    vgprTileMapA[tA] = self.allocator.getVGPRTileId('A', tA, du)
                 for tB in group.tileBIndices:
-                    useB[tB] = self.allocator.getVGPRTileId('B', tB, du)
+                    vgprTileMapB[tB] = self.allocator.getVGPRTileId('B', tB, du)
 
                 # LOAD: determined by prefetch mode
                 loadATiles, loadBTiles, loadDU = self._getLoadTargets(gi, du, numGroups)
@@ -348,24 +349,24 @@ class MFMAScheduler:
                 if du == 0:
                     self._pendingRemap = []
 
-                loadA = {}
-                loadB = {}
+                lrLoadA = {}
+                lrLoadB = {}
                 if loadATiles is not None:
                     for tA in loadATiles:
                         vid = self._loadTile('A', tA, loadDU, isWrapAround, loadCountA, curA)
                         if vid is not None:
-                            loadA[tA] = vid
+                            lrLoadA[tA] = vid
 
                 if loadBTiles is not None:
                     for tB in loadBTiles:
                         vid = self._loadTile('B', tB, loadDU, isWrapAround, loadCountB, curB)
                         if vid is not None:
-                            loadB[tB] = vid
+                            lrLoadB[tB] = vid
 
-                # Check USE and LOAD VGPRTile IDs don't overlap
-                useIds = set(useA.values()) | set(useB.values())
-                loadIds = set(loadA.values()) | set(loadB.values())
-                overlap = useIds & loadIds
+                # Check MFMA and LOAD VGPRTile IDs don't overlap
+                mfmaIds = set(vgprTileMapA.values()) | set(vgprTileMapB.values())
+                loadIds = set(lrLoadA.values()) | set(lrLoadB.values())
+                overlap = mfmaIds & loadIds
                 conflict = set()
                 if overlap:
                     conflict = overlap
@@ -373,26 +374,26 @@ class MFMAScheduler:
 
                 # Build DUSchedule with MFMA and LR ops
                 dus = DUSchedule(duIndex=du)
-                mfmas = [(a, b) for a in sorted(useA.keys()) for b in sorted(useB.keys())]
+                mfmas = [(a, b) for a in sorted(vgprTileMapA.keys()) for b in sorted(vgprTileMapB.keys())]
                 mtLoad = "n+1" if isWrapAround else "n"
                 dus.ops.append(MFMAOp(mtIteration="n", duIndex=du,
                                       subtiles=mfmas,
-                                      vgprTileMapA=useA, vgprTileMapB=useB))
+                                      vgprTileMapA=vgprTileMapA, vgprTileMapB=vgprTileMapB))
                 dus.ops.append(LROp(mtIteration=mtLoad, duIndex=loadDU,
-                                    loadA=loadA, loadB=loadB))
+                                    lrLoadA=lrLoadA, lrLoadB=lrLoadB))
                 dus.conflict = conflict
                 gss.duSteps.append(dus)
 
                 if du == 0:
-                    du0LoadAKeys = set(loadA.keys())
-                    du0LoadBKeys = set(loadB.keys())
+                    du0LoadAKeys = set(lrLoadA.keys())
+                    du0LoadBKeys = set(lrLoadB.keys())
 
-                # WITHIN_SUBGROUP: release current DU's USE tiles for K-dim reuse
+                # WITHIN_SUBGROUP: release current DU's MFMA tiles for K-dim reuse
                 if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP:
-                    for tA in useA:
+                    for tA in vgprTileMapA:
                         if self.allocator.isAllocated('A', tA, du):
                             self.allocator.release('A', tA, du)
-                    for tB in useB:
+                    for tB in vgprTileMapB:
                         if self.allocator.isAllocated('B', tB, du):
                             self.allocator.release('B', tB, du)
 
@@ -566,8 +567,8 @@ class MFMAScheduler:
                 waitA = set()
                 waitB = set()
                 if lrOp.duIndex == 0:
-                    waitA = set(lrOp.loadA.keys()) & pendingA
-                    waitB = set(lrOp.loadB.keys()) & pendingB
+                    waitA = set(lrOp.lrLoadA.keys()) & pendingA
+                    waitB = set(lrOp.lrLoadB.keys()) & pendingB
                 if waitA or waitB:
                     inflightCount = _countInflightGR(si, waitA, waitB)
                     dus.ops.insert(-1, WaitOp(
@@ -592,10 +593,10 @@ class MFMAScheduler:
                     lrOp = next(op for op in dus.ops if isinstance(op, LROp))
                     if lrOp.mtIteration == "n+1":
                         continue
-                    for tA in lrOp.loadA:
+                    for tA in lrOp.lrLoadA:
                         if tA in wrapSubtilesA:
                             lastReadA[tA] = (gss.groupId, dus.duIndex)
-                    for tB in lrOp.loadB:
+                    for tB in lrOp.lrLoadB:
                         if tB in wrapSubtilesB:
                             lastReadB[tB] = (gss.groupId, dus.duIndex)
             self.doubleBufferDep = DoubleBufferDep(
@@ -617,7 +618,7 @@ class MFMAScheduler:
             print(f"{indent}WAIT (MT {op.mtIteration}) A: {op.subtileA}  B: {op.subtileB}{inflight}")
         elif isinstance(op, LROp):
             duLabel = f", DU {op.duIndex}" if op.duIndex >= 0 else ""
-            print(f"{indent}LR (MT {op.mtIteration}{duLabel}) A: {op.loadA}  B: {op.loadB}")
+            print(f"{indent}LR (MT {op.mtIteration}{duLabel}) A: {op.lrLoadA}  B: {op.lrLoadB}")
 
     def printSchedule(self):
         print(f"SubtileGridA={self.MTA}, SubtileGridB={self.MTB}")
