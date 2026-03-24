@@ -47,12 +47,12 @@ class SubtileGroup:
 
 
 
-# Key type for allocator: (tileIdx, duIdx)
+# Key type for allocator: (subtileIdx, duIdx)
 AllocKey = Tuple[int, int]
 
 
-class VGPRAllocator:
-    """Maps (tileIdx, duIdx) to shared integer VGPR tile IDs, with free-list reuse."""
+class VGPRTileAllocator:
+    """Maps (subtileIdx, duIdx) to shared integer VGPR tile IDs, with free-list reuse."""
 
     def __init__(self):
         self._nextId: int = 0
@@ -68,8 +68,8 @@ class VGPRAllocator:
         current = len(self._allocMapA) + len(self._allocMapB)
         self._peak = max(self._peak, current)
 
-    def allocate(self, tc: str, tileIdx: int, duIdx: int) -> int:
-        key = (tileIdx, duIdx)
+    def allocate(self, tc: str, subtileIdx: int, duIdx: int) -> int:
+        key = (subtileIdx, duIdx)
         if self._freeList:
             vid = self._freeList.pop(0)
         else:
@@ -79,21 +79,21 @@ class VGPRAllocator:
         self._updatePeak()
         return vid
 
-    def release(self, tc: str, tileIdx: int, duIdx: int) -> None:
-        key = (tileIdx, duIdx)
+    def release(self, tc: str, subtileIdx: int, duIdx: int) -> None:
+        key = (subtileIdx, duIdx)
         vid = self._allocMap(tc).pop(key)
         self._freeList.append(vid)
 
-    def isAllocated(self, tc: str, tileIdx: int, duIdx: int) -> bool:
-        return (tileIdx, duIdx) in self._allocMap(tc)
+    def isAllocated(self, tc: str, subtileIdx: int, duIdx: int) -> bool:
+        return (subtileIdx, duIdx) in self._allocMap(tc)
 
-    def getVGPRTileId(self, tc: str, tileIdx: int, duIdx: int) -> int:
-        return self._allocMap(tc)[(tileIdx, duIdx)]
+    def getVGPRTileId(self, tc: str, subtileIdx: int, duIdx: int) -> int:
+        return self._allocMap(tc)[(subtileIdx, duIdx)]
 
-    def releaseAllForTile(self, tc: str, tileIdx: int) -> None:
-        """Release all DU allocations for a given tile index."""
+    def releaseAllForTile(self, tc: str, subtileIdx: int) -> None:
+        """Release all DU allocations for a given subtile index."""
         allocMap = self._allocMap(tc)
-        keys = [k for k in allocMap if k[0] == tileIdx]
+        keys = [k for k in allocMap if k[0] == subtileIdx]
         for k in keys:
             vid = allocMap.pop(k)
             self._freeList.append(vid)
@@ -199,7 +199,7 @@ class MFMAScheduler:
             "A and B must have same subtileShape[1]"
 
         self.groups: List[SubtileGroup] = self._buildGroups()
-        self.allocator = VGPRAllocator()
+        self.allocator = VGPRTileAllocator()
         self._schedule: List[ScheduleStep] = []
         self.hasDuplicatedReads: bool = False
         self.needsUnrolling: bool = False
@@ -251,26 +251,77 @@ class MFMAScheduler:
 
     # ── Scheduling core ──────────────────────────────────────
 
-    def _bootstrapFirstGroup(self):
-        """Allocate VGPRTile IDs for the first group before the main loop."""
+    def _computeBufferLoadsPerGroup(self) -> Dict[int, Tuple[Set[int], Set[int]]]:
+        """Compute which subtiles each group's GR loads. Returns gi -> (setA, setB)."""
+        numGroups = len(self.groups)
+        bufferLoadsPerGroup = {}
+        loadedA = set(self.groups[0].tileAIndices)
+        loadedB = set(self.groups[0].tileBIndices)
+        for gi in range(numGroups):
+            targetGi = (gi + 1) % numGroups
+            targetGroup = self.groups[targetGi]
+            if gi == numGroups - 1:
+                bufA = set(targetGroup.tileAIndices)
+                bufB = set(targetGroup.tileBIndices)
+            else:
+                needA = set(targetGroup.tileAIndices)
+                needB = set(targetGroup.tileBIndices)
+                bufA = needA - loadedA
+                bufB = needB - loadedB
+                loadedA |= needA
+                loadedB |= needB
+            bufferLoadsPerGroup[gi] = (bufA, bufB)
+        return bufferLoadsPerGroup
+
+    def _buildPreloop(self, bufferLoadsPerGroup: Dict[int, Tuple[Set[int], Set[int]]]):
+        """Allocate VGPRTile IDs for the first group and build preloop ops."""
         first = self.groups[0]
+        numGroups = len(self.groups)
+        allA = list(range(self.MTA))
+        allB = list(range(self.MTB))
+
+        # Determine how many MTs to preload
+        hasGRn2 = any(gi == numGroups - 1 for gi in bufferLoadsPerGroup
+                      if bufferLoadsPerGroup[gi][0] or bufferLoadsPerGroup[gi][1])
+        numPreloadMTs = 2 if hasGRn2 else 1
+
+        # MT 1 GR: only subtiles not covered by mainloop's non-last-group GRs
+        mt1_coveredA = set()
+        mt1_coveredB = set()
+        for gi, (grA, grB) in bufferLoadsPerGroup.items():
+            if gi != numGroups - 1:
+                mt1_coveredA |= grA
+                mt1_coveredB |= grB
+        preloadMT1_A = sorted(set(allA) - mt1_coveredA)
+        preloadMT1_B = sorted(set(allB) - mt1_coveredB)
+
+        # Number of DUs to preload LR for
         if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
-            for tA in first.tileAIndices:
-                self.allocator.allocate('A', tA, 0)
-            for tB in first.tileBIndices:
-                self.allocator.allocate('B', tB, 0)
+            numPreloadDUs = 1
         elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
-            for du in range(self.numDU):
-                for tA in first.tileAIndices:
-                    self.allocator.allocate('A', tA, du)
-                for tB in first.tileBIndices:
-                    self.allocator.allocate('B', tB, du)
+            numPreloadDUs = self.numDU
+
+        # Allocate VGPRs for first group
+        for du in range(numPreloadDUs):
+            for tA in first.tileAIndices:
+                self.allocator.allocate('A', tA, du)
+            for tB in first.tileBIndices:
+                self.allocator.allocate('B', tB, du)
+
+        # Build preloop ops: GR(MT 0), optionally GR(MT 1), then LR(MT 0) per DU
+        self.preloopOps: List[ScheduleOp] = []
+        self.preloopOps.append(GROp(mtIteration="0",
+                                    subtileA=allA, subtileB=allB))
+        if numPreloadMTs > 1:
+            self.preloopOps.append(GROp(mtIteration="1",
+                                        subtileA=preloadMT1_A, subtileB=preloadMT1_B))
 
     def _runSchedule(self):
         if self.config.prefetchMode == PrefetchMode.NO:
             raise NotImplementedError("PrefetchMode.NO is not yet supported")
 
-        self._bootstrapFirstGroup()
+        self.bufferLoadsPerGroup = self._computeBufferLoadsPerGroup()
+        self._buildPreloop(self.bufferLoadsPerGroup)
 
         loadCountA: Dict[AllocKey, int] = {}
         loadCountB: Dict[AllocKey, int] = {}
@@ -342,6 +393,16 @@ class MFMAScheduler:
             any(c > 1 for c in loadCountA.values()) or
             any(c > 1 for c in loadCountB.values())
         )
+
+        # Finalize preloop: add LR ops now that _schedule is populated
+        if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
+            numPreloadDUs = 1
+        elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
+            numPreloadDUs = self.numDU
+        for du in range(numPreloadDUs):
+            self.preloopOps.append(LROp(mtIteration="0", duIndex=du,
+                                        loadA=self._schedule[du].useA,
+                                        loadB=self._schedule[du].useB))
 
     def _loadTile(self, tc: str, tileIdx: int, loadDU: int,
                   isWrapAround: bool, loadCount: Dict,
@@ -441,27 +502,9 @@ class MFMAScheduler:
     # ── Display schedule building ────────────────────────────
 
     def _buildDisplaySchedule(self):
-        """Build preloop/mainloop op lists from internal ScheduleStep data."""
+        """Build mainloop op lists from internal ScheduleStep data."""
         numGroups = len(self.groups)
-
-        # Compute buffer_load sets per group
-        bufferLoadsPerGroup = {}  # gi -> (set of A subtiles, set of B subtiles)
-        loadedA = set(self.groups[0].tileAIndices)
-        loadedB = set(self.groups[0].tileBIndices)
-        for gi in range(numGroups):
-            targetGi = (gi + 1) % numGroups
-            targetGroup = self.groups[targetGi]
-            if gi == numGroups - 1:
-                bufA = set(targetGroup.tileAIndices)
-                bufB = set(targetGroup.tileBIndices)
-            else:
-                needA = set(targetGroup.tileAIndices)
-                needB = set(targetGroup.tileBIndices)
-                bufA = needA - loadedA
-                bufB = needB - loadedB
-                loadedA |= needA
-                loadedB |= needB
-            bufferLoadsPerGroup[gi] = (bufA, bufB)
+        bufferLoadsPerGroup = self.bufferLoadsPerGroup
 
         # Determine which DU each group's buffer_load goes in
         # DU=0 unless:
@@ -508,38 +551,6 @@ class MFMAScheduler:
                 if si >= sourceStepIdx or si < waitStepIndex:
                     total += cnt
             return total
-
-        # === Build PRELOOP ops ===
-        allA = list(range(self.MTA))
-        allB = list(range(self.MTB))
-
-        hasGRn2 = any(gi == numGroups - 1 for _, gi, _, _, _, _ in grEvents)
-        numPreloadMTs = 2 if hasGRn2 else (1 if grEvents else 1)
-
-        mt1_coveredA = set()
-        mt1_coveredB = set()
-        for _, gi, _, _, grA, grB in grEvents:
-            if gi != numGroups - 1:
-                mt1_coveredA |= grA
-                mt1_coveredB |= grB
-        preloadMT1_A = sorted(set(allA) - mt1_coveredA)
-        preloadMT1_B = sorted(set(allB) - mt1_coveredB)
-
-        if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
-            numPreloadDUs = 1
-        elif self.config.prefetchMode == PrefetchMode.FULL_PREFETCH:
-            numPreloadDUs = self.numDU
-
-        self.preloopOps: List[ScheduleOp] = []
-        self.preloopOps.append(GROp(mtIteration="0",
-                                    subtileA=allA, subtileB=allB))
-        if numPreloadMTs > 1:
-            self.preloopOps.append(GROp(mtIteration="1",
-                                        subtileA=preloadMT1_A, subtileB=preloadMT1_B))
-        for du in range(numPreloadDUs):
-            self.preloopOps.append(LROp(mtIteration="0", duIndex=du,
-                                        loadA=self._schedule[du].useA,
-                                        loadB=self._schedule[du].useB))
 
         # === Build MAINLOOP steps ===
         self.mainloopSteps: List[SubtileGroupSchedule] = []
