@@ -105,22 +105,6 @@ class VGPRTileAllocator:
 
 
 @dataclass
-class ScheduleStep:
-    """One DU iteration within one group (internal allocation representation)."""
-    groupId: int
-    duIndex: int
-    useA: Dict[int, int] = field(default_factory=dict)
-    useB: Dict[int, int] = field(default_factory=dict)
-    loadA: Dict[int, int] = field(default_factory=dict)
-    loadB: Dict[int, int] = field(default_factory=dict)
-    conflict: Set[int] = field(default_factory=set)
-    isWrapLoad: bool = False
-    loadDU: int = -1
-
-
-# ── Display-oriented schedule ops ────────────────────────
-
-@dataclass
 class MFMAOp:
     mtIteration: str  # e.g. "n"
     duIndex: int
@@ -209,7 +193,6 @@ class MFMAScheduler:
 
         self.groups: List[SubtileGroup] = self._buildGroups()
         self.allocator = VGPRTileAllocator()
-        self._schedule: List[ScheduleStep] = []
         self.hasDuplicatedReads: bool = False
         self.needsUnrolling: bool = False
 
@@ -220,10 +203,6 @@ class MFMAScheduler:
     @property
     def totalVGPRs(self) -> int:
         return self.allocator.totalVGPRs
-
-    @property
-    def schedule(self) -> List[ScheduleStep]:
-        return self._schedule
 
     # ── Group construction ───────────────────────────────────
 
@@ -344,62 +323,95 @@ class MFMAScheduler:
         loadCountA: Dict[AllocKey, int] = {}
         loadCountB: Dict[AllocKey, int] = {}
         numGroups = len(self.groups)
+        self.mainloopSteps: List[SubtileGroupSchedule] = []
 
         for gi, group in enumerate(self.groups):
-            for du in range(self.numDU):
-                step = ScheduleStep(groupId=group.groupId, duIndex=du)
+            gss = SubtileGroupSchedule(groupId=group.groupId)
+            gr = self.groupGRs[gi]
+            du0LoadAKeys: Set[int] = set()
+            du0LoadBKeys: Set[int] = set()
 
+            for du in range(self.numDU):
                 # USE: current group's tiles at current DU
+                useA = {}
+                useB = {}
                 for tA in group.tileAIndices:
-                    step.useA[tA] = self.allocator.getVGPRTileId('A', tA, du)
+                    useA[tA] = self.allocator.getVGPRTileId('A', tA, du)
                 for tB in group.tileBIndices:
-                    step.useB[tB] = self.allocator.getVGPRTileId('B', tB, du)
+                    useB[tB] = self.allocator.getVGPRTileId('B', tB, du)
 
                 # LOAD: determined by prefetch mode
                 loadATiles, loadBTiles, loadDU = self._getLoadTargets(gi, du, numGroups)
                 isWrapAround = self._isWrapAroundLoad(gi, du, numGroups)
-                step.isWrapLoad = isWrapAround
-                step.loadDU = loadDU
                 curA = set(group.tileAIndices)
                 curB = set(group.tileBIndices)
                 if du == 0:
                     self._pendingRemap = []
 
+                loadA = {}
+                loadB = {}
                 if loadATiles is not None:
                     for tA in loadATiles:
                         vid = self._loadTile('A', tA, loadDU, isWrapAround, loadCountA, curA)
                         if vid is not None:
-                            step.loadA[tA] = vid
+                            loadA[tA] = vid
 
                 if loadBTiles is not None:
                     for tB in loadBTiles:
                         vid = self._loadTile('B', tB, loadDU, isWrapAround, loadCountB, curB)
                         if vid is not None:
-                            step.loadB[tB] = vid
+                            loadB[tB] = vid
 
-                # Check USE and LOAD VGPRTile IDs don't overlap within a step
-                useIds = set(step.useA.values()) | set(step.useB.values())
-                loadIds = set(step.loadA.values()) | set(step.loadB.values())
+                # Check USE and LOAD VGPRTile IDs don't overlap
+                useIds = set(useA.values()) | set(useB.values())
+                loadIds = set(loadA.values()) | set(loadB.values())
                 overlap = useIds & loadIds
+                conflict = set()
                 if overlap:
-                    step.conflict = overlap
+                    conflict = overlap
                     self.needsUnrolling = True
 
-                self._schedule.append(step)
+                # Build DUSchedule with MFMA and LR ops
+                dus = DUSchedule(duIndex=du)
+                mfmas = [(a, b) for a in sorted(useA.keys()) for b in sorted(useB.keys())]
+                mtLoad = "n+1" if isWrapAround else "n"
+                dus.ops.append(MFMAOp(mtIteration="n", duIndex=du,
+                                      subtiles=mfmas,
+                                      vgprTileMapA=useA, vgprTileMapB=useB))
+                dus.ops.append(LROp(mtIteration=mtLoad, duIndex=loadDU,
+                                    loadA=loadA, loadB=loadB))
+                dus.conflict = conflict
+                gss.duSteps.append(dus)
+
+                if du == 0:
+                    du0LoadAKeys = set(loadA.keys())
+                    du0LoadBKeys = set(loadB.keys())
 
                 # WITHIN_SUBGROUP: release current DU's USE tiles for K-dim reuse
-                # Only release tiles that were actually USEd (not tiles loaded for next group)
                 if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP:
-                    for tA, vid in step.useA.items():
+                    for tA in useA:
                         if self.allocator.isAllocated('A', tA, du):
                             self.allocator.release('A', tA, du)
-                    for tB, vid in step.useB.items():
+                    for tB in useB:
                         if self.allocator.isAllocated('B', tB, du):
                             self.allocator.release('B', tB, du)
 
+            # Insert GROp at the correct DU
+            if gr.subtileA or gr.subtileB:
+                if gr.mtIteration == "n+2":
+                    bfDU = 1
+                else:
+                    hasConflict = bool((gr.subtileA & du0LoadAKeys) or (gr.subtileB & du0LoadBKeys))
+                    bfDU = 1 if hasConflict else 0
+                gss.duSteps[bfDU].ops.insert(1, GROp(
+                    mtIteration=gr.mtIteration,
+                    subtileA=sorted(gr.subtileA),
+                    subtileB=sorted(gr.subtileB)))
+
+            self.mainloopSteps.append(gss)
+
             # Release after group based on strategy
             if self.config.reuseStrategy == VGPRTileReUseStrategy.WITHIN_SUBGROUP:
-                # Per-DU release already freed USE tiles; just fixup shadow keys
                 for tc, tileIdx, duIdx, shadowKey in self._pendingRemap:
                     vid = self.allocator._allocMap(tc).pop((shadowKey, duIdx))
                     self.allocator._allocMap(tc)[(tileIdx, duIdx)] = vid
@@ -412,7 +424,7 @@ class MFMAScheduler:
             any(c > 1 for c in loadCountB.values())
         )
 
-        self._buildMainloop(numGroups)
+        self._insertWaitsAndDeps(numGroups)
 
     def _loadTile(self, tc: str, tileIdx: int, loadDU: int,
                   isWrapAround: bool, loadCount: Dict,
@@ -509,42 +521,19 @@ class MFMAScheduler:
         for tB in group.tileBIndices:
             self.allocator.releaseAllForTile('B', tB)
 
-    def _buildMainloop(self, numGroups: int):
-        """Build mainloop op lists and double-buffer dependency from schedule data."""
-        groupGRs = self.groupGRs
-
-        # Determine which DU each group's buffer_load goes in
-        # DU=0 unless:
-        #   1) buffer_load subtiles overlap with DU=0's LOAD (subtile conflict), or
-        #   2) GR is MT n+2 (last group) — can't coexist with LR (MT n) at DU=0
-        #      because LDS is double-buffered (n+2 aliases the same buffer as n).
-        bufferLoadDU = {}  # gi -> 0 or 1
-        du0Steps = {step.groupId: step for step in self._schedule if step.duIndex == 0}
-        for gi in range(numGroups):
-            gr = groupGRs[gi]
-            if not gr.subtileA and not gr.subtileB:
-                bufferLoadDU[gi] = 0
-                continue
-            if gr.mtIteration == "n+2":
-                bufferLoadDU[gi] = 1
-                continue
-            du0 = du0Steps.get(gi)
-            if du0:
-                du0LoadA = set(du0.loadA.keys())
-                du0LoadB = set(du0.loadB.keys())
-                hasConflict = bool((gr.subtileA & du0LoadA) or (gr.subtileB & du0LoadB))
-            else:
-                hasConflict = False
-            bufferLoadDU[gi] = 1 if hasConflict else 0
-
+    def _insertWaitsAndDeps(self, numGroups: int):
+        """Insert WAIT ops and build double-buffer dependency from mainloop ops."""
         # Build ordered GR events for inflight counting
         grEvents = []
-        for si, step in enumerate(self._schedule):
-            gr = groupGRs[step.groupId]
-            if (gr.subtileA or gr.subtileB) and step.duIndex == bufferLoadDU[step.groupId]:
-                grEvents.append((si, step.groupId, step.duIndex,
-                                 len(gr.subtileA) + len(gr.subtileB),
-                                 gr.subtileA, gr.subtileB))
+        si = 0
+        for gss in self.mainloopSteps:
+            for dus in gss.duSteps:
+                grOp = next((op for op in dus.ops if isinstance(op, GROp)), None)
+                if grOp:
+                    grEvents.append((si, gss.groupId, dus.duIndex,
+                                     len(grOp.subtileA) + len(grOp.subtileB),
+                                     set(grOp.subtileA), set(grOp.subtileB)))
+                si += 1
 
         def _countInflightGR(waitStepIndex, waitA, waitB):
             sourceGRIdx = None
@@ -561,56 +550,36 @@ class MFMAScheduler:
                     total += cnt
             return total
 
-        # === Build MAINLOOP steps ===
-        self.mainloopSteps: List[SubtileGroupSchedule] = []
+        # Insert WAIT ops
         pendingA = set()
         pendingB = set()
-        currentGSS: Optional[SubtileGroupSchedule] = None
+        si = 0
+        for gss in self.mainloopSteps:
+            gr = self.groupGRs[gss.groupId]
+            pendingA |= gr.subtileA
+            pendingB |= gr.subtileB
 
-        for si, step in enumerate(self._schedule):
-            gr = groupGRs[step.groupId]
-            if currentGSS is None or step.groupId != currentGSS.groupId:
-                currentGSS = SubtileGroupSchedule(groupId=step.groupId)
-                self.mainloopSteps.append(currentGSS)
-                pendingA |= gr.subtileA
-                pendingB |= gr.subtileB
+            for dus in gss.duSteps:
+                lrOp = dus.ops[-1]
+                assert isinstance(lrOp, LROp)
 
-            dus = DUSchedule(duIndex=step.duIndex)
-            mtLoad = "n+1" if step.isWrapLoad else "n"
+                waitA = set()
+                waitB = set()
+                if lrOp.duIndex == 0:
+                    waitA = set(lrOp.loadA.keys()) & pendingA
+                    waitB = set(lrOp.loadB.keys()) & pendingB
+                if waitA or waitB:
+                    inflightCount = _countInflightGR(si, waitA, waitB)
+                    dus.ops.insert(-1, WaitOp(
+                        mtIteration=lrOp.mtIteration,
+                        subtileA=sorted(waitA), subtileB=sorted(waitB),
+                        inflightGRCount=inflightCount))
+                    pendingA -= waitA
+                    pendingB -= waitB
 
-            # MFMA
-            mfmas = [(a, b) for a in sorted(step.useA.keys()) for b in sorted(step.useB.keys())]
-            dus.ops.append(MFMAOp(mtIteration="n", duIndex=step.duIndex,
-                                  subtiles=mfmas,
-                                  vgprTileMapA=step.useA, vgprTileMapB=step.useB))
+                si += 1
 
-            # GR
-            if (gr.subtileA or gr.subtileB) and step.duIndex == bufferLoadDU[step.groupId]:
-                dus.ops.append(GROp(mtIteration=gr.mtIteration,
-                                    subtileA=sorted(gr.subtileA),
-                                    subtileB=sorted(gr.subtileB)))
-
-            # WAIT
-            waitA = set()
-            waitB = set()
-            if step.loadDU == 0:
-                waitA = set(step.loadA.keys()) & pendingA
-                waitB = set(step.loadB.keys()) & pendingB
-            if waitA or waitB:
-                inflightCount = _countInflightGR(si, waitA, waitB)
-                dus.ops.append(WaitOp(mtIteration=mtLoad, subtileA=sorted(waitA),
-                                      subtileB=sorted(waitB), inflightGRCount=inflightCount))
-                pendingA -= waitA
-                pendingB -= waitB
-
-            # LR
-            dus.ops.append(LROp(mtIteration=mtLoad, duIndex=step.loadDU,
-                                loadA=step.loadA, loadB=step.loadB))
-
-            dus.conflict = step.conflict
-            currentGSS.duSteps.append(dus)
-
-        # === Build double-buffer dependency ===
+        # Build double-buffer dependency
         self.doubleBufferDep: Optional[DoubleBufferDep] = None
         if numGroups > 1:
             wrapGroup = self.groups[0]
@@ -618,15 +587,17 @@ class MFMAScheduler:
             wrapSubtilesB = set(wrapGroup.tileBIndices)
             lastReadA = {t: ("bootstrap", -1) for t in wrapSubtilesA}
             lastReadB = {t: ("bootstrap", -1) for t in wrapSubtilesB}
-            for step in self._schedule:
-                if step.isWrapLoad:
-                    continue
-                for tA in step.loadA:
-                    if tA in wrapSubtilesA:
-                        lastReadA[tA] = (step.groupId, step.duIndex)
-                for tB in step.loadB:
-                    if tB in wrapSubtilesB:
-                        lastReadB[tB] = (step.groupId, step.duIndex)
+            for gss in self.mainloopSteps:
+                for dus in gss.duSteps:
+                    lrOp = next(op for op in dus.ops if isinstance(op, LROp))
+                    if lrOp.mtIteration == "n+1":
+                        continue
+                    for tA in lrOp.loadA:
+                        if tA in wrapSubtilesA:
+                            lastReadA[tA] = (gss.groupId, dus.duIndex)
+                    for tB in lrOp.loadB:
+                        if tB in wrapSubtilesB:
+                            lastReadB[tB] = (gss.groupId, dus.duIndex)
             self.doubleBufferDep = DoubleBufferDep(
                 lastGroupId=self.groups[-1].groupId,
                 lastReadA=lastReadA, lastReadB=lastReadB)
