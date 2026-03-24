@@ -440,11 +440,43 @@ class MFMAScheduler:
                 hasConflict = False
             bufferLoadDU[gi] = 1 if hasConflict else 0
 
+        # Build ordered list of GR events: (stepIndex, groupId, duIndex, subtileCount, setA, setB)
+        grEvents = []
+        for si, step in enumerate(self._schedule):
+            bufA, bufB = bufferLoadsPerGroup[step.groupId]
+            if (bufA or bufB) and step.duIndex == bufferLoadDU[step.groupId]:
+                grEvents.append((si, step.groupId, step.duIndex, len(bufA) + len(bufB), bufA, bufB))
+
+        # For a WAIT at stepIndex needing subtiles waitA/waitB,
+        # find the GR that loaded those subtiles and count inflight GRs since then.
+        # The WAIT waits for data loaded by a GR in the *previous* MT iteration,
+        # so we always wrap around the full loop: from source GR (inclusive) to
+        # end of loop, then from start of loop to WAIT (exclusive).
+        def _countInflightGR(waitStepIndex, waitA, waitB, mtLoad):
+            # Find the GR that loaded the waited-on subtiles
+            sourceGRIdx = None
+            for evi, (si, gi, du, cnt, grA, grB) in enumerate(grEvents):
+                if (waitA and waitA <= grA) or (waitB and waitB <= grB):
+                    sourceGRIdx = evi
+                    break
+            if sourceGRIdx is None:
+                return None
+            # Count all GR subtiles wrapping from source GR (inclusive) around the
+            # full loop back to the WAIT position (exclusive).
+            # Previous iteration: source GR to end of loop (inclusive)
+            # Current iteration: start of loop to WAIT (exclusive)
+            total = 0
+            sourceStepIdx = grEvents[sourceGRIdx][0]
+            for (si, gi, du, cnt, grA, grB) in grEvents:
+                if si >= sourceStepIdx or si < waitStepIndex:
+                    total += cnt
+            return total
+
         # Print steps with WAIT tracking and inline buffer_loads
         pendingA = set()
         pendingB = set()
         currentGroup = -1
-        for step in self._schedule:
+        for si, step in enumerate(self._schedule):
             if step.groupId != currentGroup:
                 currentGroup = step.groupId
                 bufA, bufB = bufferLoadsPerGroup[currentGroup]
@@ -453,17 +485,17 @@ class MFMAScheduler:
 
             print(f"  Group {step.groupId}, DU={step.duIndex}:")
             mfmas = [(a, b) for a in sorted(step.useA.keys()) for b in sorted(step.useB.keys())]
-            print(f"    MFMAs: {mfmas}")
+            print(f"    MFMAs (MT n): \n\t\t\t- {mfmas}")
             mtLoad = "n+1" if step.isWrapLoad else "n"
             duLabel = f", DU {step.loadDU}" if step.loadDU >= 0 else ""
-            print(f"    USE  A: {step.useA}  B: {step.useB}")
+            print(f"\t\t\t- USING  A: {step.useA}  B: {step.useB}")
 
             # Show buffer_load at the assigned DU
             bufA, bufB = bufferLoadsPerGroup[step.groupId]
             if (bufA or bufB) and step.duIndex == bufferLoadDU[step.groupId]:
                 targetGi = (step.groupId + 1) % numGroups
                 bufMtLabel = "n+2" if step.groupId == numGroups - 1 else "n+1"
-                print(f"    BUFFER_LOAD (MT {bufMtLabel}) for Group {targetGi}:  A: {sorted(bufA)}  B: {sorted(bufB)}")
+                print(f"    GR (MT {bufMtLabel}) for Group {targetGi}:  A: {sorted(bufA)}  B: {sorted(bufB)}")
 
             # Check if LOAD needs a WAIT for pending buffer_loads
             # buffer_load writes DU 0 before DU 1, so only DU 0 reads need a WAIT
@@ -473,11 +505,13 @@ class MFMAScheduler:
                 waitA = set(step.loadA.keys()) & pendingA
                 waitB = set(step.loadB.keys()) & pendingB
             if waitA or waitB:
-                print(f"    WAIT (MT {mtLoad}) A: {sorted(waitA)}  B: {sorted(waitB)}")
+                inflightCount = _countInflightGR(si, waitA, waitB, mtLoad)
+                inflightStr = f" — {inflightCount} inflight GRs" if inflightCount is not None else ""
+                print(f"    WAIT (MT {mtLoad}) A: {sorted(waitA)}  B: {sorted(waitB)}{inflightStr}")
                 pendingA -= waitA
                 pendingB -= waitB
 
-            print(f"    LOAD (MT {mtLoad}{duLabel}) A: {step.loadA}  B: {step.loadB}")
+            print(f"    LR (MT {mtLoad}{duLabel}) A: {step.loadA}  B: {step.loadB}")
             if step.conflict:
                 print(f"    *** CONFLICT: USE/LOAD share VGPRTile IDs {step.conflict} — needs unrolling ***")
 
@@ -526,9 +560,9 @@ if __name__ == "__main__":
          MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
          SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
 
-         (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
-         MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-         SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+        #  (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
+        #  MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
+        #  SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
 
 
         # Needs unrolling.
@@ -536,26 +570,26 @@ if __name__ == "__main__":
         #  MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
         #  SchedulerConfig(8, 8, PrefetchMode.FULL_PREFETCH, VGPRTileReUseStrategy.NONE, SubgroupOrdering.COLUMN_MAJOR)),
 
-          (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, NONE, COLUMN_MAJOR",
-         MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-         SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.NONE, SubgroupOrdering.COLUMN_MAJOR)),
+    #       (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, NONE, COLUMN_MAJOR",
+    #      MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
+    #      SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.NONE, SubgroupOrdering.COLUMN_MAJOR)),
 
-        (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-            MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-            SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+    #     (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+    #         MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
+    #         SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
         
-        (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
-            MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
-            SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+    #     (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
+    #         MockTileInfo([lsgA, 1], [1, 2]), MockTileInfo([lsgB, 1], [1, 2]),
+    #         SchedulerConfig(8, 8, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
 
 
-        (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
-            MockTileInfo([10, 1], [1, 2]), MockTileInfo([10, 1], [1, 2]),
-            SchedulerConfig(2, 10, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+    #     (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
+    #         MockTileInfo([10, 1], [1, 2]), MockTileInfo([10, 1], [1, 2]),
+    #         SchedulerConfig(2, 10, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.WITHIN_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
 
-        (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
-            MockTileInfo([10, 1], [1, 2]), MockTileInfo([10, 1], [1, 2]),
-            SchedulerConfig(2, 10, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+    #     (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, WITHIN_SUBGROUP, COLUMN_MAJOR",
+    #         MockTileInfo([10, 1], [1, 2]), MockTileInfo([10, 1], [1, 2]),
+    #         SchedulerConfig(2, 10, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
     ]
 
     for name, tiA, tiB, cfg in configs:
