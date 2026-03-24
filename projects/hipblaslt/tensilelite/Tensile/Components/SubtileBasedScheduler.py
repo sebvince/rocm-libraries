@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Set, Optional, Union
 from Tensile.Components.SubtileBasedKernel import TileInfo
 from Tensile.Components.SubtileBasedKernel import emitMfmaInstruction
+from Tensile.Components.SubtileBasedKernel import emitSingleDsRead
 from rocisa.code import Module
 
 class PrefetchMode(Enum):
@@ -728,6 +729,24 @@ class MFMAScheduler:
                             f"MFMA C[{a},{b}] += A[{a},DU{op.duIndex}] * B[{b},DU{op.duIndex}]"))
         return module
 
+    def emitLRs(self, writer, kernel, steps):
+        """Emit LR (Local Read) ds_load instructions for a list of PartitionSchedules."""
+        module = Module()
+        for pss in steps:
+            for dus in pss.duSteps:
+                for op in dus.ops:
+                    if not isinstance(op, LROp):
+                        continue
+                    for tA, vgprTileId in op.lrLoadA.items():
+                        dstTile = self.vgprTiles[vgprTileId]
+                        module.add(emitSingleDsRead(
+                            self.tileInfoA, tA, op.duIndex, dstTile))
+                    for tB, vgprTileId in op.lrLoadB.items():
+                        dstTile = self.vgprTiles[vgprTileId]
+                        module.add(emitSingleDsRead(
+                            self.tileInfoB, tB, op.duIndex, dstTile))
+        return module
+
     def generateCode(self, writer, kernel):
         dtileInfo = writer.states.d.tileInfo
         self.allocVgprTiles(writer)
@@ -740,10 +759,13 @@ class MFMAScheduler:
                 print(f"  Partition {pss.partitionId}:")
                 for dus in pss.duSteps:
                     print(f"    DU={dus.duIndex}:")
-                    module = self.emitMFMAs(writer, kernel, [PartitionSchedule(
+                    oneStep = [PartitionSchedule(
                         partitionId=pss.partitionId,
-                        duSteps=[dus])], dtileInfo)
+                        duSteps=[dus])]
+                    module = self.emitMFMAs(writer, kernel, oneStep, dtileInfo)
                     print(module)
+                    module_lr = self.emitLRs(writer, kernel, oneStep)
+                    print(module_lr)
 
 
 if __name__ == "__main__":
@@ -823,5 +845,7 @@ if __name__ == "__main__":
         s = MFMAScheduler(tiA, tiB, cfg)
         s.printSchedule()
         writer = create_mock_writer(kernel)
+        tiA.allocOffsetRegisters(writer, kernel)
+        tiB.allocOffsetRegisters(writer, kernel)
         s.generateCode(writer, kernel)
         print()

@@ -1220,6 +1220,36 @@ def globalReadDoSubtile(tc, writer, kernel):
 
   return module
 
+def emitSingleDsRead(tileInfo, sId0, du, dstTile):
+  """Emit a single DSLoadB128 for one MMA tile within a subtile.
+
+  Args:
+      tileInfo:  TileInfo (for subtileSize, loadRatioGR, sharedVgprLROffset, tc)
+      sId0:      Subtile row index (used for offset computation)
+      du:        DU index within the subtile (maps to mfmaC; subtileShape[0]=1 so mfmaR=0)
+      dstTile:   RegisterTileInfo — destination vgpr tile for the load
+  """
+  # du maps to mfmaC, mfmaR is always 0 (subtileShape[0]=1)
+  mfmaId = tileInfo.getSubtileShapeLinearId(du, 0)
+  addrVgpr = tileInfo.sharedVgprLROffset[mfmaId]
+
+  offsetStride = tileInfo.subtileSize
+  if tileInfo.loadRatioGR == 2.0:
+    offset = sId0 * offsetStride
+  elif tileInfo.loadRatioGR == 0.5:
+    offset = sId0 * 4 * offsetStride
+  else:
+    offset = sId0 * 2 * offsetStride
+
+  dstVgpr = dstTile.regList.regValues[0]
+  numRegs = len(dstTile.regList.regValues)
+  return DSLoadB128(
+      dst=vgpr(dstVgpr, numRegs),
+      src=vgpr(addrVgpr),
+      ds=DSModifiers(offset=offset),
+      comment="Subtile%s[%u] du=%u" % (tileInfo.tc, sId0, du))
+
+
 def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
 
   module = Module()
@@ -1228,31 +1258,11 @@ def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
 
   linearId = tileInfo.getLocalSubtileLinearId(sId0, sId1)
   subtileInfo = tileInfo.localSubtiles[linearId]
-  offsetStride = tileInfo.subtileSize
 
-  # Reads mma tiles in a subtile row-major
-  # TODO: Check if this ordering can be used for TLU=1
-  for mfmaC in range(tileInfo.subtileShape[1]):
-    for mfmaR in range(tileInfo.subtileShape[0]):
-      mfmaId = tileInfo.getSubtileShapeLinearId(mfmaC, mfmaR)
-      addrVgpr = tileInfo.sharedVgprLROffset[mfmaId]
-      dstTile = tileInfo.vgprTiles[subtileInfo.localReadMap[mfmaId]]
-      dstVgpr = dstTile.regList.regValues[0]
-      numRegs = len(dstTile.regList.regValues)
-
-      interleaved = False#True
-      if interleaved:
-        if tileInfo.loadRatioGR == 2.0:
-          offset = sId0*offsetStride
-        elif tileInfo.loadRatioGR == 0.5:
-          offset = sId0*4*offsetStride
-        else:
-          offset = sId0*2*offsetStride
-      else:
-        offset = sId0*offsetStride
-
-      module.add(DSLoadB128(dst=vgpr(dstVgpr, numRegs), src=vgpr(addrVgpr), ds=DSModifiers(offset=offset),
-                            comment="Subtile%s[%u,%u] mfmaId=[%u,%u]"%(tileInfo.tc, sId0, sId1, mfmaR, mfmaC)))
+  for du in range(tileInfo.subtileShape[1]):
+    mfmaId = tileInfo.getSubtileShapeLinearId(du, 0)
+    dstTile = tileInfo.vgprTiles[subtileInfo.localReadMap[mfmaId]]
+    module.add(emitSingleDsRead(tileInfo, sId0, du, dstTile))
 
   return module
 
