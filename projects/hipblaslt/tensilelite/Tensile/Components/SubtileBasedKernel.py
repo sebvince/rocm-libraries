@@ -1164,20 +1164,22 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
 ##################################################
 # Subroutine to generate GR load code
 #
-def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
+def emitSingleBufferLoad(tileInfo, sId0, sId1):
+  """Emit buffer_load instructions for a single subtile (sId0, sId1).
+
+  Args:
+      tileInfo: TileInfo for the tensor component
+      sId0:     Subtile row index
+      sId1:     Subtile column index (K-dimension)
+  """
   module = Module()
-  sId0 = subtileId[0]
-  sId1 = subtileId[1]
+  tc = tileInfo.tc
 
-  loadWidth = 16
-  numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
-
-  tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
   subtileInfo = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, sId1)]
   regList = tileInfo.localSubtilesRegister[subtileInfo.regListId]
 
   offsetK = sId1 * int(tileInfo.mmaTileShape[1] * tileInfo.subtileShape[1] * tileInfo.bpe)
-  grBaseId = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, sId1)].globalReadMap[0]
+  grBaseId = subtileInfo.globalReadMap[0]
 
   subtileOffset = math.ceil(tileInfo.loadRatioGR*tileInfo.subtileSize)
   WriteBaseAddr = "LocalWriteBaseAddr%s"%tc
@@ -1196,6 +1198,11 @@ def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
     module.add(BufferLoadB128(dst=None, vaddr=vgpr(voff), saddr=sgpr("Srd%s"%tc, 4), soffset=soffset, mubuf=mubuf, comment="grBaseId = %u, i= %u"%(grBaseId , i)))
 
   return module
+
+
+def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
+  tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
+  return emitSingleBufferLoad(tileInfo, subtileId[0], subtileId[1])
 
 ##################################################
 # Subroutine to generate GR load code

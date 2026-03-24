@@ -4,6 +4,7 @@ from typing import List, Tuple, Dict, Set, Optional, Union
 from Tensile.Components.SubtileBasedKernel import TileInfo
 from Tensile.Components.SubtileBasedKernel import emitMfmaInstruction
 from Tensile.Components.SubtileBasedKernel import emitSingleDsRead
+from Tensile.Components.SubtileBasedKernel import emitSingleBufferLoad
 from rocisa.code import Module
 
 class PrefetchMode(Enum):
@@ -186,6 +187,10 @@ class MFMAScheduler:
         self.numSubIterK = tileInfoA.subtileShape[1]
         assert self.numSubIterK == tileInfoB.subtileShape[1], \
             "A and B must have same subtileShape[1]"
+        assert tileInfoA.localSubtileGrid[1] == 1, \
+            f"Scheduler requires localSubtileGrid[1]==1 for A, got {tileInfoA.localSubtileGrid[1]}"
+        assert tileInfoB.localSubtileGrid[1] == 1, \
+            f"Scheduler requires localSubtileGrid[1]==1 for B, got {tileInfoB.localSubtileGrid[1]}"
 
         self.partitions: List[Partition] = self._buildPartitions()
         self.allocator = VGPRTileAllocator()
@@ -747,6 +752,28 @@ class MFMAScheduler:
                             self.tileInfoB, tB, op.subIterK, dstTile))
         return module
 
+    def emitGRs(self, writer, kernel, steps):
+        """Emit GR (Global Read) buffer_load instructions for a list of PartitionSchedules.
+
+        For each GROp, expands sId0 indices to all sId1 (K-dimension) values,
+        with deduplication via globalReadMap tracking.
+        """
+        module = Module()
+        grTracker = set()
+        for pss in steps:
+            for siks in pss.subIterKSteps:
+                for op in siks.ops:
+                    if not isinstance(op, GROp):
+                        continue
+                    for subtileList, tileInfo in [(op.subtileA, self.tileInfoA),
+                                                    (op.subtileB, self.tileInfoB)]:
+                        for sId0 in subtileList:
+                            grIds = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, 0)].globalReadMap
+                            if not set(grIds).issubset(grTracker):
+                                grTracker.update(grIds)
+                                module.add(emitSingleBufferLoad(tileInfo, sId0, 0))
+        return module
+
     def generateCode(self, writer, kernel):
         dtileInfo = writer.states.d.tileInfo
         self.allocVgprTiles(writer)
@@ -762,6 +789,8 @@ class MFMAScheduler:
                     oneStep = [PartitionSchedule(
                         partitionId=pss.partitionId,
                         subIterKSteps=[dus])]
+                    module_gr = self.emitGRs(writer, kernel, oneStep)
+                    print(module_gr)
                     module = self.emitMFMAs(writer, kernel, oneStep, dtileInfo)
                     print(module)
                     module_lr = self.emitLRs(writer, kernel, oneStep)
@@ -845,8 +874,8 @@ if __name__ == "__main__":
         print(f"=== {name} ===")
         s = MFMAScheduler(tiA, tiB, cfg)
         s.printSchedule()
-        # writer = create_mock_writer(kernel)
-        # tiA.allocOffsetRegisters(writer, kernel)
-        # tiB.allocOffsetRegisters(writer, kernel)
-        # s.generateCode(writer, kernel)
-        # print()
+        writer = create_mock_writer(kernel)
+        tiA.allocOffsetRegisters(writer, kernel)
+        tiB.allocOffsetRegisters(writer, kernel)
+        s.generateCode(writer, kernel)
+        print()
