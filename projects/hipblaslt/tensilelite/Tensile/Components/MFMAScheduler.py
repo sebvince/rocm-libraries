@@ -163,6 +163,15 @@ ScheduleOp = Union[MFMAOp, GROp, WaitOp, LROp]
 
 
 @dataclass
+class GroupGR:
+    """Describes the GR (Global Read) issued by a group during the mainloop."""
+    mtIteration: str       # "n+1" or "n+2"
+    targetGroupId: int     # which group's subtiles we're loading for
+    subtileA: Set[int]     # actual subtiles to load (after dedup)
+    subtileB: Set[int]
+
+
+@dataclass
 class DUSchedule:
     """Ops for one DU iteration within a group."""
     duIndex: int
@@ -205,7 +214,6 @@ class MFMAScheduler:
         self.needsUnrolling: bool = False
 
         self._runSchedule()
-        self._buildDisplaySchedule()
 
     # ── Outputs ──────────────────────────────────────────────
 
@@ -251,18 +259,25 @@ class MFMAScheduler:
 
     # ── Scheduling core ──────────────────────────────────────
 
-    def _computeBufferLoadsPerGroup(self) -> Dict[int, Tuple[Set[int], Set[int]]]:
-        """Compute which subtiles each group's GR loads. Returns gi -> (setA, setB)."""
+    def _computeGroupGRs(self, preloadedMTn1_A: Set[int], preloadedMTn1_B: Set[int]) -> Dict[int, GroupGR]:
+        """Compute each group's GR target (mtIteration, targetGroup, subtiles).
+
+        Args:
+            preloadedMTn1_A/B: MT n+1 subtiles already loaded by the preloop's GR(MT 1).
+                These are excluded from mainloop MT n+1 GRs (dedup).
+        """
         numGroups = len(self.groups)
-        bufferLoadsPerGroup = {}
-        loadedA = set(self.groups[0].tileAIndices)
-        loadedB = set(self.groups[0].tileBIndices)
+        groupGRs = {}
+        loadedA = set(preloadedMTn1_A)
+        loadedB = set(preloadedMTn1_B)
         for gi in range(numGroups):
             targetGi = (gi + 1) % numGroups
             targetGroup = self.groups[targetGi]
             if gi == numGroups - 1:
+                # Last group wraps to next macrotile iteration
                 bufA = set(targetGroup.tileAIndices)
                 bufB = set(targetGroup.tileBIndices)
+                mtIter = "n+2"
             else:
                 needA = set(targetGroup.tileAIndices)
                 needB = set(targetGroup.tileBIndices)
@@ -270,30 +285,26 @@ class MFMAScheduler:
                 bufB = needB - loadedB
                 loadedA |= needA
                 loadedB |= needB
-            bufferLoadsPerGroup[gi] = (bufA, bufB)
-        return bufferLoadsPerGroup
+                mtIter = "n+1"
+            groupGRs[gi] = GroupGR(mtIteration=mtIter, targetGroupId=targetGi,
+                                   subtileA=bufA, subtileB=bufB)
+        return groupGRs
 
-    def _buildPreloop(self, bufferLoadsPerGroup: Dict[int, Tuple[Set[int], Set[int]]]):
-        """Allocate VGPRTile IDs for the first group and build preloop ops."""
+    def _buildPreloop(self) -> Tuple[Set[int], Set[int]]:
+        """Allocate VGPRTile IDs for the first group and build preloop GR ops.
+
+        Preloop loads:
+          - GR(MT 0): all subtiles
+          - GR(MT 1): first group's subtiles (1 group worth of MT 1 data)
+
+        Returns (preloadedMT1_A, preloadedMT1_B): what was preloaded for MT 1,
+        so _computeGroupGRs can use it as the initial loaded state.
+        """
         first = self.groups[0]
-        numGroups = len(self.groups)
         allA = list(range(self.MTA))
         allB = list(range(self.MTB))
-
-        # Determine how many MTs to preload
-        hasGRn2 = any(gi == numGroups - 1 for gi in bufferLoadsPerGroup
-                      if bufferLoadsPerGroup[gi][0] or bufferLoadsPerGroup[gi][1])
-        numPreloadMTs = 2 if hasGRn2 else 1
-
-        # MT 1 GR: only subtiles not covered by mainloop's non-last-group GRs
-        mt1_coveredA = set()
-        mt1_coveredB = set()
-        for gi, (grA, grB) in bufferLoadsPerGroup.items():
-            if gi != numGroups - 1:
-                mt1_coveredA |= grA
-                mt1_coveredB |= grB
-        preloadMT1_A = sorted(set(allA) - mt1_coveredA)
-        preloadMT1_B = sorted(set(allB) - mt1_coveredB)
+        preloadMT1_A = list(first.tileAIndices)
+        preloadMT1_B = list(first.tileBIndices)
 
         # Number of DUs to preload LR for
         if self.config.prefetchMode == PrefetchMode.HALF_PREFETCH:
@@ -308,20 +319,21 @@ class MFMAScheduler:
             for tB in first.tileBIndices:
                 self.allocator.allocate('B', tB, du)
 
-        # Build preloop ops: GR(MT 0), optionally GR(MT 1), then LR(MT 0) per DU
+        # Build preloop GR ops (LR ops added later once _schedule is populated)
         self.preloopOps: List[ScheduleOp] = []
         self.preloopOps.append(GROp(mtIteration="0",
                                     subtileA=allA, subtileB=allB))
-        if numPreloadMTs > 1:
-            self.preloopOps.append(GROp(mtIteration="1",
-                                        subtileA=preloadMT1_A, subtileB=preloadMT1_B))
+        self.preloopOps.append(GROp(mtIteration="1",
+                                    subtileA=preloadMT1_A, subtileB=preloadMT1_B))
+
+        return set(preloadMT1_A), set(preloadMT1_B)
 
     def _runSchedule(self):
         if self.config.prefetchMode == PrefetchMode.NO:
             raise NotImplementedError("PrefetchMode.NO is not yet supported")
 
-        self.bufferLoadsPerGroup = self._computeBufferLoadsPerGroup()
-        self._buildPreloop(self.bufferLoadsPerGroup)
+        preloadedMT1_A, preloadedMT1_B = self._buildPreloop()
+        self.groupGRs = self._computeGroupGRs(preloadedMT1_A, preloadedMT1_B)
 
         loadCountA: Dict[AllocKey, int] = {}
         loadCountB: Dict[AllocKey, int] = {}
@@ -403,6 +415,8 @@ class MFMAScheduler:
             self.preloopOps.append(LROp(mtIteration="0", duIndex=du,
                                         loadA=self._schedule[du].useA,
                                         loadB=self._schedule[du].useB))
+
+        self._buildMainloop(numGroups)
 
     def _loadTile(self, tc: str, tileIdx: int, loadDU: int,
                   isWrapAround: bool, loadCount: Dict,
@@ -499,12 +513,9 @@ class MFMAScheduler:
         for tB in group.tileBIndices:
             self.allocator.releaseAllForTile('B', tB)
 
-    # ── Display schedule building ────────────────────────────
-
-    def _buildDisplaySchedule(self):
-        """Build mainloop op lists from internal ScheduleStep data."""
-        numGroups = len(self.groups)
-        bufferLoadsPerGroup = self.bufferLoadsPerGroup
+    def _buildMainloop(self, numGroups: int):
+        """Build mainloop op lists and double-buffer dependency from schedule data."""
+        groupGRs = self.groupGRs
 
         # Determine which DU each group's buffer_load goes in
         # DU=0 unless:
@@ -514,18 +525,18 @@ class MFMAScheduler:
         bufferLoadDU = {}  # gi -> 0 or 1
         du0Steps = {step.groupId: step for step in self._schedule if step.duIndex == 0}
         for gi in range(numGroups):
-            bufA, bufB = bufferLoadsPerGroup[gi]
-            if not bufA and not bufB:
+            gr = groupGRs[gi]
+            if not gr.subtileA and not gr.subtileB:
                 bufferLoadDU[gi] = 0
                 continue
-            if gi == numGroups - 1:
+            if gr.mtIteration == "n+2":
                 bufferLoadDU[gi] = 1
                 continue
             du0 = du0Steps.get(gi)
             if du0:
                 du0LoadA = set(du0.loadA.keys())
                 du0LoadB = set(du0.loadB.keys())
-                hasConflict = bool((bufA & du0LoadA) or (bufB & du0LoadB))
+                hasConflict = bool((gr.subtileA & du0LoadA) or (gr.subtileB & du0LoadB))
             else:
                 hasConflict = False
             bufferLoadDU[gi] = 1 if hasConflict else 0
@@ -533,9 +544,11 @@ class MFMAScheduler:
         # Build ordered GR events for inflight counting
         grEvents = []
         for si, step in enumerate(self._schedule):
-            bufA, bufB = bufferLoadsPerGroup[step.groupId]
-            if (bufA or bufB) and step.duIndex == bufferLoadDU[step.groupId]:
-                grEvents.append((si, step.groupId, step.duIndex, len(bufA) + len(bufB), bufA, bufB))
+            gr = groupGRs[step.groupId]
+            if (gr.subtileA or gr.subtileB) and step.duIndex == bufferLoadDU[step.groupId]:
+                grEvents.append((si, step.groupId, step.duIndex,
+                                 len(gr.subtileA) + len(gr.subtileB),
+                                 gr.subtileA, gr.subtileB))
 
         def _countInflightGR(waitStepIndex, waitA, waitB):
             sourceGRIdx = None
@@ -559,12 +572,12 @@ class MFMAScheduler:
         currentGSS: Optional[SubtileGroupSchedule] = None
 
         for si, step in enumerate(self._schedule):
+            gr = groupGRs[step.groupId]
             if currentGSS is None or step.groupId != currentGSS.groupId:
                 currentGSS = SubtileGroupSchedule(groupId=step.groupId)
                 self.mainloopSteps.append(currentGSS)
-                bufA, bufB = bufferLoadsPerGroup[step.groupId]
-                pendingA |= bufA
-                pendingB |= bufB
+                pendingA |= gr.subtileA
+                pendingB |= gr.subtileB
 
             dus = DUSchedule(duIndex=step.duIndex)
             mtLoad = "n+1" if step.isWrapLoad else "n"
@@ -576,11 +589,10 @@ class MFMAScheduler:
                                   vgprTileMapA=step.useA, vgprTileMapB=step.useB))
 
             # GR
-            bufA, bufB = bufferLoadsPerGroup[step.groupId]
-            if (bufA or bufB) and step.duIndex == bufferLoadDU[step.groupId]:
-                bufMtLabel = "n+2" if step.groupId == numGroups - 1 else "n+1"
-                dus.ops.append(GROp(mtIteration=bufMtLabel,
-                                    subtileA=sorted(bufA), subtileB=sorted(bufB)))
+            if (gr.subtileA or gr.subtileB) and step.duIndex == bufferLoadDU[step.groupId]:
+                dus.ops.append(GROp(mtIteration=gr.mtIteration,
+                                    subtileA=sorted(gr.subtileA),
+                                    subtileB=sorted(gr.subtileB)))
 
             # WAIT
             waitA = set()
