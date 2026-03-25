@@ -180,7 +180,7 @@ class PartitionSchedule:
     subIterKSteps: List[SubIterKSchedule] = field(default_factory=list)
 
 
-class MFMAScheduler:
+class SubtileBasedScheduler:
     def __init__(self, tileInfoA, tileInfoB, config: SchedulerConfig):
         self.tileInfoA = tileInfoA
         self.tileInfoB = tileInfoB
@@ -989,7 +989,7 @@ if __name__ == "__main__":
 
     for name, cfg in configs:
         print(f"=== {name} ===")
-        s = MFMAScheduler(tiA, tiB, cfg)
+        s = SubtileBasedScheduler(tiA, tiB, cfg)
         s.printSchedule()
         writer = create_mock_writer(kernel)
         writer.states.a = SimpleNamespace(tileInfo=tiA)
