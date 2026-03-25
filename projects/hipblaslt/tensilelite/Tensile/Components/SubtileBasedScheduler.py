@@ -950,6 +950,12 @@ class SubtileBasedScheduler:
                 # Insert deferred LR wait before this subIterK's MFMAs
                 if pendingLRWait:
                     module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LR to complete"))
+                    # With double LDS buffering, GR(MT n+2) overwrites the same buffer
+                    # that LR(MT n) reads from. Barrier ensures all waves finished
+                    # their LDS reads before GR starts writing.
+                    hasGRn2 = any(isinstance(op, GROp) and op.mtIteration == "n+2" for op in dus.ops)
+                    if hasGRn2:
+                        module.add(SBarrier(comment="Barrier: all waves done with LR(MT n) before GR(MT n+2) writes"))
                     pendingLRWait = False
                 module.add(subModule)
                 if hasLR:
@@ -1041,11 +1047,11 @@ if __name__ == "__main__":
     lsgB = tiB.localSubtileGrid[0]
 
     configs = [
-        (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-            SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+        # (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+        #     SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
 
-        #  (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-        #  SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
+         (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+         SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
 
         # (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
         # SchedulerConfig(2, 2, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
