@@ -609,7 +609,15 @@ class MFMAScheduler:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
             for dus in pss.subIterKSteps:
                 newDus = SubIterKSchedule(subIterK=dus.subIterK, conflict=dus.conflict)
-                newDus.ops = [op for op in dus.ops if not isinstance(op, GROp)]
+                for op in dus.ops:
+                    if isinstance(op, GROp):
+                        continue
+                    if isinstance(op, WaitOp):
+                        # No new GRs in NGLL — just draining the last inflight GR
+                        op = WaitOp(mtIteration=op.mtIteration,
+                                    subtileA=op.subtileA, subtileB=op.subtileB,
+                                    inflightLoadsA=0, inflightLoadsB=0)
+                    newDus.ops.append(op)
                 newPss.subIterKSteps.append(newDus)
             ngll.append(newPss)
         return ngll
