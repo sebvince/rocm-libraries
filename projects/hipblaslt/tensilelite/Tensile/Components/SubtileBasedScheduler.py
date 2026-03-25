@@ -759,6 +759,15 @@ class SubtileBasedScheduler:
                     tile.append(vstart + k)
             self.vgprTiles.append(tile)
 
+    def deallocVgprTiles(self, writer):
+        """Deallocate VGPR tiles allocated by allocVgprTiles."""
+        for tile in self.vgprTiles:
+            pool = tile.regList.regPool
+            for val in tile:
+                if tile.index(val) % 4 == 0:
+                    pool.checkIn(val)
+        self.vgprTiles = []
+
     def emitMFMAs(self, writer, kernel, steps, dtileInfo):
         """Emit MFMA instructions for a list of PartitionSchedules."""
 

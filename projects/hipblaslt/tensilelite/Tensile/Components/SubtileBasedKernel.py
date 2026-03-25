@@ -1675,37 +1675,47 @@ def mainLoop(writer, kernel):
   assert pgr in (0, 2), "SubtileBasedKernel only supports PGR=0 and PGR=2, got PGR=%d" % pgr
 
   if pgr == 2:
-    module.add(preLoop(writer, kernel))
+    from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler, SchedulerConfig, PrefetchMode, VGPRTileReUseStrategy
+    tiA = writer.states.a.tileInfo
+    tiB = writer.states.b.tileInfo
+    cfg = SchedulerConfig(tiA.localSubtileGrid[0], tiB.localSubtileGrid[0],
+                          PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)
+    scheduler = SubtileBasedScheduler(tiA, tiB, cfg)
+    scheduler.allocVgprTiles(writer)
 
-    skipToNLL    = Label("SkipToNLL", "")
-    skipToNGLL   = Label("SkipToNGLL", "")
+    # Preloop (includes SKIP_IF_EQ(1,NLL) and SKIP_IF_LE(2,NGLL))
+    module.add(scheduler._emitLoop(writer, kernel, "PRELOOP", scheduler.preloopSteps))
+
+    # Mainloop
     skipMainloop = Label("SkipMainloop", "")
+    loopBegin = Label("LoopBeginL", "")
+    module.addComment0("MAINLOOP")
+    module.add(loopBegin)
+    module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP", scheduler.mainloopSteps))
+    module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
+                       comment="dec counterL"))
+    module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
+                         comment="counterL == 2?"))
+    module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
+                            comment="restart mainloop"))
 
-    # Entry guards:
-    #   LoopCounter == 1 → skip mainloop + NGLL, jump to NLL
-    #   LoopCounter <= PGR → skip mainloop, jump to NGLL
-    module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=1,
-                         comment="LoopCounter == 1? (only 1 iteration, PGR=%d)" % pgr))
-    module.add(SCBranchSCC1(labelName=skipToNLL.getLabelName(),
-                            comment="skip mainloop + NGLL, jump to NLL"))
-    module.add(SCmpLeU32(src0=sgpr("LoopCounterL"), src1=pgr,
-                         comment="LoopCounter <= %d (PGR=%d)?" % (pgr, pgr)))
-    module.add(SCBranchSCC1(labelName=skipMainloop.getLabelName(),
-                            comment="skip mainloop, jump to NGLL"))
-
-  module.addComment0("MAINLOOP")
-  module.add(mainLoopImpl(writer, kernel))
-  module.addComment("")
-
-  if pgr == 2:
+    # NGLL
     module.add(skipMainloop)
     module.addComment0("NGLL")
-    module.add(noGlobalLoadLoop(writer, kernel))
-    module.addComment("")
+    module.add(Label("SkipToNGLL", ""))
+    module.add(scheduler._emitLoop(writer, kernel, "NGLL", scheduler.ngllSteps))
 
-    module.add(skipToNLL)
+    # NLL
     module.addComment0("NLL")
-    module.add(noLoadLoop(writer, kernel))
+    module.add(Label("SkipToNLL", ""))
+    module.add(scheduler._emitLoop(writer, kernel, "NLL", scheduler.nllSteps))
+
+    scheduler.deallocVgprTiles(writer)
+
+  else:
+    # PGR=0: non-pipelined
+    module.addComment0("MAINLOOP")
+    module.add(mainLoopImpl(writer, kernel))
     module.addComment("")
 
   return module
