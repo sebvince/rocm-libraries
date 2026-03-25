@@ -305,13 +305,17 @@ class MFMAScheduler:
             lrOps.append(LROp(mtIteration="0", subIterK=sik,
                               lrLoadA=lrLoadA, lrLoadB=lrLoadB))
 
-        # Build preloop ops: GR(MT 0), GR(MT 1), then LR(MT 0) per subIterK
-        self.preloopOps: List[ScheduleOp] = []
-        self.preloopOps.append(GROp(mtIteration="0",
-                                    subtileA=allA, subtileB=allB))
-        self.preloopOps.append(GROp(mtIteration="1",
-                                    subtileA=preloadMT1_A, subtileB=preloadMT1_B))
-        self.preloopOps.extend(lrOps)
+        # Build preloop steps: GR(MT 0), GR(MT 1), then LR(MT 0) per subIterK
+        preloopOps: List[ScheduleOp] = []
+        preloopOps.append(GROp(mtIteration="0",
+                               subtileA=allA, subtileB=allB))
+        preloopOps.append(GROp(mtIteration="1",
+                               subtileA=preloadMT1_A, subtileB=preloadMT1_B))
+        preloopOps.extend(lrOps)
+        preloopSik = SubIterKSchedule(subIterK=0)
+        preloopSik.ops = preloopOps
+        self.preloopSteps: List[PartitionSchedule] = [
+            PartitionSchedule(partitionId=0, subIterKSteps=[preloopSik])]
 
         return set(preloadMT1_A), set(preloadMT1_B)
 
@@ -609,14 +613,16 @@ class MFMAScheduler:
         seenA: Dict[AllocKey, int] = {}
         seenB: Dict[AllocKey, int] = {}
         # Count preloop LR loads
-        for op in self.preloopOps:
-            if isinstance(op, LROp):
-                for tA in op.lrLoadA:
-                    key = (tA, op.subIterK)
-                    seenA[key] = seenA.get(key, 0) + 1
-                for tB in op.lrLoadB:
-                    key = (tB, op.subIterK)
-                    seenB[key] = seenB.get(key, 0) + 1
+        for pss in self.preloopSteps:
+            for dus in pss.subIterKSteps:
+                for op in dus.ops:
+                    if isinstance(op, LROp):
+                        for tA in op.lrLoadA:
+                            key = (tA, op.subIterK)
+                            seenA[key] = seenA.get(key, 0) + 1
+                        for tB in op.lrLoadB:
+                            key = (tB, op.subIterK)
+                            seenB[key] = seenB.get(key, 0) + 1
         # Count mainloop LR loads (skip wrap-around which reuses existing allocations)
         for pss in self.mainloopSteps:
             for dus in pss.subIterKSteps:
@@ -674,8 +680,10 @@ class MFMAScheduler:
         print()
 
         print("PRELOOP:")
-        for op in self.preloopOps:
-            self._printOp(op, indent="  ")
+        for pss in self.preloopSteps:
+            for dus in pss.subIterKSteps:
+                for op in dus.ops:
+                    self._printOp(op, indent="  ")
         print()
 
         print("MAINLOOP:")
@@ -793,31 +801,37 @@ class MFMAScheduler:
                                 module.add(emitSingleBufferLoad(tileInfo, sId0, 0))
         return module
 
-    def generateCode(self, writer, kernel):
+    def _emitLoop(self, writer, kernel, label, steps):
+        """Emit a loop module (mainloop, NGLL, or NLL)."""
         dtileInfo = writer.states.d.tileInfo
+        module = Module(label)
+        for pss in steps:
+            for dus in pss.subIterKSteps:
+                module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
+                oneStep = [PartitionSchedule(
+                    partitionId=pss.partitionId,
+                    subIterKSteps=[dus])]
+                module.add(self.emitGRs(writer, kernel, oneStep))
+                module.add(self.emitMFMAs(writer, kernel, oneStep, dtileInfo))
+                for op in dus.ops:
+                    if isinstance(op, WaitOp):
+                        module.add(self.emitWaitLR(op.inflightGRCountA, op.inflightGRCountB))
+                module.add(self.emitLRs(writer, kernel, oneStep))
+                module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
+        return module
+
+    def generateCode(self, writer, kernel):
         self.allocVgprTiles(writer)
 
-        for label, steps in [("MAINLOOP", self.mainloopSteps),
-                             ("NGLL", self.ngllSteps),
-                             ("NLL", self.nllSteps)]:
+        preloop  = self._emitLoop(writer, kernel, "PRELOOP", self.preloopSteps)
+        mainloop = self._emitLoop(writer, kernel, "MAINLOOP", self.mainloopSteps)
+        ngll     = self._emitLoop(writer, kernel, "NGLL", self.ngllSteps)
+        nll      = self._emitLoop(writer, kernel, "NLL", self.nllSteps)
+
+        for label, module in [("PRELOOP", preloop), ("MAINLOOP", mainloop),
+                              ("NGLL", ngll), ("NLL", nll)]:
             print(f"\n{label}:")
-            for pss in steps:
-                print(f"  Partition {pss.partitionId}:")
-                for dus in pss.subIterKSteps:
-                    print(f"    subIterK={dus.subIterK}:")
-                    oneStep = [PartitionSchedule(
-                        partitionId=pss.partitionId,
-                        subIterKSteps=[dus])]
-                    module_gr = self.emitGRs(writer, kernel, oneStep)
-                    print(module_gr)
-                    module = self.emitMFMAs(writer, kernel, oneStep, dtileInfo)
-                    print(module)
-                    for op in dus.ops:
-                        if isinstance(op, WaitOp):
-                            module_wait = self.emitWaitLR(op.inflightGRCountA, op.inflightGRCountB)
-                            print(module_wait)
-                    module_lr = self.emitLRs(writer, kernel, oneStep)
-                    print(module_lr)
+            print(module)
 
 
 if __name__ == "__main__":
@@ -888,8 +902,8 @@ if __name__ == "__main__":
         (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
             SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
 
-         (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-         SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
+        #  (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+        #  SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
 
     ]
 
