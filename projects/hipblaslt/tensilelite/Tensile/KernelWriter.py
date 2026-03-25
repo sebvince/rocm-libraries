@@ -3838,20 +3838,25 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
 
     # Allocate registers for VGPR tiles
-    self.states.a.tileInfo.allocVgprTileRegisters(self, kernel)
-    self.states.b.tileInfo.allocVgprTileRegisters(self, kernel)
+    pgr = kernel["PrefetchGlobalRead"]
+    if pgr != 2:
+      # PGR=2: A/B vgprTiles are allocated by SubtileBasedScheduler in mainLoop
+      # TMP HACK to still use legacy path for PGR=0
+      self.states.a.tileInfo.allocVgprTileRegisters(self, kernel)
+      self.states.b.tileInfo.allocVgprTileRegisters(self, kernel)
     self.states.d.tileInfo.allocVgprTileRegisters(self, kernel)
     module.add(initVgprTilesToZero(self, kernel,self.states.d.tileInfo))
 
-    self.states.scheduleInfo = ScheduleInfo(self.states.a.tileInfo, self.states.b.tileInfo)
+    if pgr != 2:
+      self.states.scheduleInfo = ScheduleInfo(self.states.a.tileInfo, self.states.b.tileInfo)
 
-    for vtiles in self.states.a.tileInfo.vgprTiles:
-      regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
-      module.addComment("%ss used for A mma tile %u: %s"%(regStr, self.states.a.tileInfo.vgprTiles.index(vtiles), str(vtiles)))
+      for vtiles in self.states.a.tileInfo.vgprTiles:
+        regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
+        module.addComment("%ss used for A mma tile %u: %s"%(regStr, self.states.a.tileInfo.vgprTiles.index(vtiles), str(vtiles)))
 
-    for vtiles in self.states.b.tileInfo.vgprTiles:
-      regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
-      module.addComment("%ss used for B mma tile %u: %s"%(regStr, self.states.b.tileInfo.vgprTiles.index(vtiles), str(vtiles)))
+      for vtiles in self.states.b.tileInfo.vgprTiles:
+        regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr" # shouldn't this only be vgpr pool?
+        module.addComment("%ss used for B mma tile %u: %s"%(regStr, self.states.b.tileInfo.vgprTiles.index(vtiles), str(vtiles)))
 
     for vtiles in self.states.d.tileInfo.vgprTiles:
       regStr = "Vgpr" if vtiles.regList.regPool == self.vgprPool else "Agpr"
@@ -3875,8 +3880,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
     self.states.a.tileInfo.deallocOffsetRegisters(self, kernel)
     self.states.b.tileInfo.deallocOffsetRegisters(self, kernel)
     # Deallocate registers used for VGPR A/Btiles
-    self.states.a.tileInfo.deallocVgprTileRegisters(self, kernel)
-    self.states.b.tileInfo.deallocVgprTileRegisters(self, kernel)
+    if pgr != 2:
+      # PGR=2: A/B vgprTiles are deallocated by SubtileBasedScheduler in mainLoop
+      self.states.a.tileInfo.deallocVgprTileRegisters(self, kernel)
+      self.states.b.tileInfo.deallocVgprTileRegisters(self, kernel)
 
     # Start of post-loop code
     if 1:
