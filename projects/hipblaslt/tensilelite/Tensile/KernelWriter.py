@@ -3865,7 +3865,6 @@ class KernelWriter(metaclass=abc.ABCMeta):
     if self.do["executeToPrefetchEnd"]:
       module.add(self.functionEnd(kernel, addLabel=False))
 
-    module.add(preLoop(self, kernel))
     module.add(mainLoop(self, kernel))
 
     atileInfo = self.states.a.tileInfo
