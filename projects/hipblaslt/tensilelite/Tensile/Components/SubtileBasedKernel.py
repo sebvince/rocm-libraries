@@ -1619,6 +1619,15 @@ def preLoop(writer, kernel):
   module.add(globalReadDoSubtile('A', writer, kernel))
   module.add(globalReadDoSubtile('B', writer, kernel))
 
+
+  # Swap GR LDS buffer so GR(MT 1) writes to buffer 1
+  module.add(globalReadLDSBufferSwap('A', writer, kernel))
+  module.add(globalReadLDSBufferSwap('B', writer, kernel))
+
+  # Advance GR pointer so GR(MT 1) reads from K=DepthU
+  module.add(globalReadPtrUpdates('A', writer, kernel))
+  module.add(globalReadPtrUpdates('B', writer, kernel))
+
   # Wait for GR(MT 0) to land, barrier
   module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for GR (MT 0) to complete"))
   module.add(SBarrier(comment=""))
@@ -1628,14 +1637,6 @@ def preLoop(writer, kernel):
                        comment="LoopCounter < 2? Skip GR(MT1)"))
   module.add(SCBranchSCC1(labelName=skipGRMT1.getLabelName(),
                           comment="only 1 iteration, skip second prefetch"))
-
-  # Swap GR LDS buffer so GR(MT 1) writes to buffer 1
-  module.add(globalReadLDSBufferSwap('A', writer, kernel))
-  module.add(globalReadLDSBufferSwap('B', writer, kernel))
-
-  # Advance GR pointer so GR(MT 1) reads from K=DepthU
-  module.add(globalReadPtrUpdates('A', writer, kernel))
-  module.add(globalReadPtrUpdates('B', writer, kernel))
 
   # GR (MT 1) — second set of global reads into LDS buffer 1
   module.addComment0("GR (MT 1): load into LDS buffer 1")
@@ -1650,6 +1651,7 @@ def preLoop(writer, kernel):
   module.add(globalReadLDSBufferSwap('A', writer, kernel))
   module.add(globalReadLDSBufferSwap('B', writer, kernel))
 
+  module.add(skipGRMT1)
   # LR from buffer 0 (data from GR MT 0)
   module.addComment0("LR (MT 0): read from LDS buffer 0")
   module.add(localReadDoSubtile('A', writer, kernel))
@@ -1660,18 +1662,6 @@ def preLoop(writer, kernel):
   module.add(localReadLDSBufferSwap('A', writer, kernel))
   module.add(localReadLDSBufferSwap('B', writer, kernel))
 
-  module.add(SBranch(labelName=skipGRMT1End.getLabelName(),
-                     comment="skip single-iteration path"))
-  module.add(skipGRMT1)
-
-  # LoopCounter == 1 path: only GR(MT0) was issued
-  # LR from buffer 0 and no swap — NLL will also read from buffer 0
-  module.addComment0("LR (MT 0): read from LDS buffer 0 (single iteration)")
-  module.add(localReadDoSubtile('A', writer, kernel))
-  module.add(localReadDoSubtile('B', writer, kernel))
-  module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
-
-  module.add(skipGRMT1End)
 
   return module
 

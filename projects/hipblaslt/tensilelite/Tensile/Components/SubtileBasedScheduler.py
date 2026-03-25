@@ -5,6 +5,7 @@ from Tensile.Components.SubtileBasedKernel import TileInfo
 from Tensile.Components.SubtileBasedKernel import emitMfmaInstruction
 from Tensile.Components.SubtileBasedKernel import emitSingleDsRead
 from Tensile.Components.SubtileBasedKernel import emitSingleBufferLoad
+from Tensile.Components.SubtileBasedKernel import globalReadPtrUpdates, globalReadLDSBufferSwap, localReadLDSBufferSwap
 from rocisa.code import Module
 from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1
 from rocisa.code import Label
@@ -125,6 +126,7 @@ class GROp:
     mtIteration: str  # e.g. "n+1", "n+2", "0", "1"
     subtileA: List[int]
     subtileB: List[int]
+    lastForMT: bool = False  # True = last partition's GR for this MT → emit ptrUpdate+swap
 
 
 @dataclass
@@ -317,14 +319,17 @@ class MFMAScheduler:
         # Build preloop steps: GR(MT0), WAIT, LR(MT0), SKIP guards, GR(MT1)
         preloopOps: List[ScheduleOp] = []
         preloopOps.append(GROp(mtIteration="0",
-                               subtileA=allA, subtileB=allB))
+                               subtileA=allA, subtileB=allB,
+                               lastForMT=True))
         preloopOps.append(WaitOp(mtIteration="0",
                                  subtileA=allA, subtileB=allB,
                                  inflightLoadsA=0, inflightLoadsB=0))
         preloopOps.extend(lrOps)
         preloopOps.append(SkipOp(compare="EQ", value=1, target="NLL"))
+        mt1Complete = (set(preloadMT1_A) == set(allA) and set(preloadMT1_B) == set(allB))
         preloopOps.append(GROp(mtIteration="1",
-                               subtileA=preloadMT1_A, subtileB=preloadMT1_B))
+                               subtileA=preloadMT1_A, subtileB=preloadMT1_B,
+                               lastForMT=mt1Complete))
         preloopOps.append(SkipOp(compare="LE", value=2, target="NGLL"))
         preloopSik = SubIterKSchedule(subIterK=0)
         preloopSik.ops = preloopOps
@@ -423,10 +428,12 @@ class MFMAScheduler:
                 else:
                     hasConflict = bool((gr.subtileA & subIterK0LoadAKeys) or (gr.subtileB & subIterK0LoadBKeys))
                     bfSubIterK = 1 if hasConflict else 0
+                isLastPartition = (pi == numPartitions - 1)
                 pss.subIterKSteps[bfSubIterK].ops.insert(1, GROp(
                     mtIteration=gr.mtIteration,
                     subtileA=sorted(gr.subtileA),
-                    subtileB=sorted(gr.subtileB)))
+                    subtileB=sorted(gr.subtileB),
+                    lastForMT=isLastPartition))
 
             self.mainloopSteps.append(pss)
 
@@ -823,9 +830,12 @@ class MFMAScheduler:
 
         Emits ops in the order they appear in each SubIterKSchedule,
         preserving the schedule's intended instruction ordering.
+        Automatically inserts GR ptr updates + LDS buffer swaps on GR MT transitions,
+        and LR buffer swaps on LR MT transitions.
         """
         dtileInfo = writer.states.d.tileInfo
         module = Module(label)
+        lastLRmt = None
         for pss in steps:
             for dus in pss.subIterKSteps:
                 module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
@@ -836,6 +846,11 @@ class MFMAScheduler:
                             partitionId=pss.partitionId,
                             subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
                         module.add(self.emitGRs(writer, kernel, oneStep))
+                        if op.lastForMT:
+                            module.add(globalReadPtrUpdates('A', writer, kernel))
+                            module.add(globalReadPtrUpdates('B', writer, kernel))
+                            module.add(globalReadLDSBufferSwap('A', writer, kernel))
+                            module.add(globalReadLDSBufferSwap('B', writer, kernel))
                     elif isinstance(op, MFMAOp):
                         oneStep = [PartitionSchedule(
                             partitionId=pss.partitionId,
@@ -844,6 +859,11 @@ class MFMAScheduler:
                     elif isinstance(op, WaitOp):
                         module.add(self.emitWaitLR(op.inflightLoadsA, op.inflightLoadsB))
                     elif isinstance(op, LROp):
+                        # Swap LR buffer when transitioning to a new MT
+                        if lastLRmt is not None and op.mtIteration != lastLRmt:
+                            module.add(localReadLDSBufferSwap('A', writer, kernel))
+                            module.add(localReadLDSBufferSwap('B', writer, kernel))
+                        lastLRmt = op.mtIteration
                         oneStep = [PartitionSchedule(
                             partitionId=pss.partitionId,
                             subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
@@ -851,13 +871,13 @@ class MFMAScheduler:
                         module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
                         hasLR = True
                     elif isinstance(op, SkipOp):
-                        label = Label(f"SkipTo{op.target}", "")
+                        skipLabel = Label(f"SkipTo{op.target}", "")
                         cmpMap = {"EQ": SCmpEQU32, "LE": SCmpLeU32}
                         module.add(cmpMap[op.compare](
                             src0=sgpr("LoopCounterL"), src1=op.value,
                             comment=f"LoopCounter {op.compare} {op.value}?"))
                         module.add(SCBranchSCC1(
-                            labelName=label.getLabelName(),
+                            labelName=skipLabel.getLabelName(),
                             comment=f"skip to {op.target}"))
                 if not hasLR:
                     module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
@@ -954,6 +974,9 @@ if __name__ == "__main__":
         #  (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
         #  SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
 
+        # (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+        # SchedulerConfig(2, 2, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
+
     ]
 
     for name, cfg in configs:
@@ -961,6 +984,8 @@ if __name__ == "__main__":
         s = MFMAScheduler(tiA, tiB, cfg)
         s.printSchedule()
         writer = create_mock_writer(kernel)
+        writer.states.a = SimpleNamespace(tileInfo=tiA)
+        writer.states.b = SimpleNamespace(tileInfo=tiB)
         tiA.allocOffsetRegisters(writer, kernel)
         tiB.allocOffsetRegisters(writer, kernel)
         s.generateCode(writer, kernel)
