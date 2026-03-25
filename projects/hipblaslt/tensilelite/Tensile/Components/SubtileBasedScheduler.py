@@ -6,9 +6,8 @@ from Tensile.Components.SubtileBasedKernel import emitMfmaInstruction
 from Tensile.Components.SubtileBasedKernel import emitSingleDsRead
 from Tensile.Components.SubtileBasedKernel import emitSingleBufferLoad
 from Tensile.Components.SubtileBasedKernel import globalReadPtrUpdates, globalReadLDSBufferSwap, localReadLDSBufferSwap
-from rocisa.code import Module
-from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1
-from rocisa.code import Label
+from rocisa.code import Module, Label
+from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1, MFMAInstruction
 from rocisa.container import sgpr
 
 class PrefetchMode(Enum):
@@ -842,62 +841,132 @@ class SubtileBasedScheduler:
                                 module.add(emitSingleBufferLoad(tileInfo, sId0, 0))
         return module
 
+    def _emitSubIterK(self, writer, kernel, pss, dus, lastLRmt):
+        """Emit a single subIterK step into a Module.
+
+        Returns (module, lastLRmt) where lastLRmt tracks LR MT transitions.
+        """
+        dtileInfo = writer.states.d.tileInfo
+        module = Module()
+        module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
+        hasLR = False
+        for op in dus.ops:
+            if isinstance(op, GROp):
+                oneStep = [PartitionSchedule(
+                    partitionId=pss.partitionId,
+                    subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
+                module.add(self.emitGRs(writer, kernel, oneStep))
+                if op.lastForMT:
+                    module.add(globalReadPtrUpdates('A', writer, kernel))
+                    module.add(globalReadPtrUpdates('B', writer, kernel))
+                    module.add(globalReadLDSBufferSwap('A', writer, kernel))
+                    module.add(globalReadLDSBufferSwap('B', writer, kernel))
+            elif isinstance(op, MFMAOp):
+                oneStep = [PartitionSchedule(
+                    partitionId=pss.partitionId,
+                    subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
+                module.add(self.emitMFMAs(writer, kernel, oneStep, dtileInfo))
+            elif isinstance(op, WaitOp):
+                module.add(self.emitWaitLR(op.inflightLoadsA, op.inflightLoadsB))
+            elif isinstance(op, LROp):
+                # Swap LR buffer when transitioning to a new MT
+                if lastLRmt is not None and op.mtIteration != lastLRmt:
+                    module.add(localReadLDSBufferSwap('A', writer, kernel))
+                    module.add(localReadLDSBufferSwap('B', writer, kernel))
+                lastLRmt = op.mtIteration
+                oneStep = [PartitionSchedule(
+                    partitionId=pss.partitionId,
+                    subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
+                module.add(self.emitLRs(writer, kernel, oneStep))
+                module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
+                hasLR = True
+            elif isinstance(op, SkipOp):
+                skipLabel = Label(f"SkipTo{op.target}", "")
+                cmpMap = {"EQ": SCmpEQU32, "LE": SCmpLeU32}
+                module.add(cmpMap[op.compare](
+                    src0=sgpr("LoopCounterL"), src1=op.value,
+                    comment=f"LoopCounter {op.compare} {op.value}?"))
+                module.add(SCBranchSCC1(
+                    labelName=skipLabel.getLabelName(),
+                    comment=f"skip to {op.target}"))
+        if not hasLR:
+            module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
+        return module, lastLRmt
+
+    @staticmethod
+    def interleaveInstructions(module):
+        """Reorder instructions within fence-bounded regions to interleave MFMAs with other instructions.
+
+        Fences (s_waitcnt, s_barrier) are immovable boundaries.
+        Within each region, MFMAs are distributed evenly among non-MFMA instructions.
+        The relative order of MFMAs is preserved, and the relative order of
+        non-MFMA instructions is preserved.
+        """
+        items = module.flatitems()
+        if not items:
+            return module
+
+        def isFence(item):
+            return isinstance(item, (SWaitCnt, SBarrier))
+
+        # Split into regions separated by fences
+        regions = []
+        fences = []
+        currentRegion = []
+        for item in items:
+            if isFence(item):
+                regions.append(currentRegion)
+                fences.append(item)
+                currentRegion = []
+            else:
+                currentRegion.append(item)
+        regions.append(currentRegion)
+
+        # Interleave within each region
+        result = Module()
+        for i, region in enumerate(regions):
+            mfmas = [x for x in region if isinstance(x, MFMAInstruction)]
+            others = [x for x in region if not isinstance(x, MFMAInstruction)]
+
+            if mfmas and others:
+                # Distribute 'others' evenly into gaps between MFMAs
+                numMfmas = len(mfmas)
+                numOthers = len(others)
+                # Number of 'others' to place after each MFMA
+                baseCount = numOthers // numMfmas
+                extra = numOthers % numMfmas
+                otherIdx = 0
+                for mi, mfma in enumerate(mfmas):
+                    result.add(mfma)
+                    # Place baseCount (or baseCount+1) 'others' after this MFMA
+                    count = baseCount + (1 if mi < extra else 0)
+                    for _ in range(count):
+                        result.add(others[otherIdx])
+                        otherIdx += 1
+            else:
+                # No interleaving needed — just emit in order
+                for item in region:
+                    result.add(item)
+
+            # Emit fence
+            if i < len(fences):
+                result.add(fences[i])
+
+        return result
+
     def _emitLoop(self, writer, kernel, label, steps):
         """Emit a loop module (mainloop, NGLL, or NLL).
 
-        Emits ops in the order they appear in each SubIterKSchedule,
-        preserving the schedule's intended instruction ordering.
-        Automatically inserts GR ptr updates + LDS buffer swaps on GR MT transitions,
-        and LR buffer swaps on LR MT transitions.
+        Emits each subIterK step as a separate module, applies instruction
+        interleaving, then combines into the final loop module.
         """
-        dtileInfo = writer.states.d.tileInfo
         module = Module(label)
         lastLRmt = None
         for pss in steps:
             for dus in pss.subIterKSteps:
-                module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
-                hasLR = False
-                for op in dus.ops:
-                    if isinstance(op, GROp):
-                        oneStep = [PartitionSchedule(
-                            partitionId=pss.partitionId,
-                            subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
-                        module.add(self.emitGRs(writer, kernel, oneStep))
-                        if op.lastForMT:
-                            module.add(globalReadPtrUpdates('A', writer, kernel))
-                            module.add(globalReadPtrUpdates('B', writer, kernel))
-                            module.add(globalReadLDSBufferSwap('A', writer, kernel))
-                            module.add(globalReadLDSBufferSwap('B', writer, kernel))
-                    elif isinstance(op, MFMAOp):
-                        oneStep = [PartitionSchedule(
-                            partitionId=pss.partitionId,
-                            subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
-                        module.add(self.emitMFMAs(writer, kernel, oneStep, dtileInfo))
-                    elif isinstance(op, WaitOp):
-                        module.add(self.emitWaitLR(op.inflightLoadsA, op.inflightLoadsB))
-                    elif isinstance(op, LROp):
-                        # Swap LR buffer when transitioning to a new MT
-                        if lastLRmt is not None and op.mtIteration != lastLRmt:
-                            module.add(localReadLDSBufferSwap('A', writer, kernel))
-                            module.add(localReadLDSBufferSwap('B', writer, kernel))
-                        lastLRmt = op.mtIteration
-                        oneStep = [PartitionSchedule(
-                            partitionId=pss.partitionId,
-                            subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
-                        module.add(self.emitLRs(writer, kernel, oneStep))
-                        module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
-                        hasLR = True
-                    elif isinstance(op, SkipOp):
-                        skipLabel = Label(f"SkipTo{op.target}", "")
-                        cmpMap = {"EQ": SCmpEQU32, "LE": SCmpLeU32}
-                        module.add(cmpMap[op.compare](
-                            src0=sgpr("LoopCounterL"), src1=op.value,
-                            comment=f"LoopCounter {op.compare} {op.value}?"))
-                        module.add(SCBranchSCC1(
-                            labelName=skipLabel.getLabelName(),
-                            comment=f"skip to {op.target}"))
-                if not hasLR:
-                    module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
+                subModule, lastLRmt = self._emitSubIterK(writer, kernel, pss, dus, lastLRmt)
+                subModule = self.interleaveInstructions(subModule)
+                module.add(subModule)
         return module
 
     def generateCode(self, writer, kernel):
