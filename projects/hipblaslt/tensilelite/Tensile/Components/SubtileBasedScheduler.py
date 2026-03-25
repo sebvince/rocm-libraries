@@ -130,8 +130,8 @@ class WaitOp:
     mtIteration: str  # e.g. "n", "n+1"
     subtileA: List[int]
     subtileB: List[int]
-    inflightGRCountA: Optional[int] = None
-    inflightGRCountB: Optional[int] = None
+    inflightLoadsA: Optional[int] = None
+    inflightLoadsB: Optional[int] = None
 
 
 @dataclass
@@ -305,13 +305,16 @@ class MFMAScheduler:
             lrOps.append(LROp(mtIteration="0", subIterK=sik,
                               lrLoadA=lrLoadA, lrLoadB=lrLoadB))
 
-        # Build preloop steps: GR(MT 0), GR(MT 1), then LR(MT 0) per subIterK
+        # Build preloop steps: GR(MT 0), WAIT(MT 0), LR(MT 0), GR(MT 1)
         preloopOps: List[ScheduleOp] = []
         preloopOps.append(GROp(mtIteration="0",
                                subtileA=allA, subtileB=allB))
+        preloopOps.append(WaitOp(mtIteration="0",
+                                 subtileA=allA, subtileB=allB,
+                                 inflightLoadsA=0, inflightLoadsB=0))
+        preloopOps.extend(lrOps)
         preloopOps.append(GROp(mtIteration="1",
                                subtileA=preloadMT1_A, subtileB=preloadMT1_B))
-        preloopOps.extend(lrOps)
         preloopSik = SubIterKSchedule(subIterK=0)
         preloopSik.ops = preloopOps
         self.preloopSteps: List[PartitionSchedule] = [
@@ -574,7 +577,7 @@ class MFMAScheduler:
                     dus.ops.insert(-1, WaitOp(
                         mtIteration=lrOp.mtIteration,
                         subtileA=sorted(waitA), subtileB=sorted(waitB),
-                        inflightGRCountA=inflightCountA, inflightGRCountB=inflightCountB))
+                        inflightLoadsA=inflightCountA, inflightLoadsB=inflightCountB))
                     pendingA -= waitA
                     pendingB -= waitB
 
@@ -650,7 +653,7 @@ class MFMAScheduler:
         elif isinstance(op, GROp):
             print(f"{indent}GR (MT {op.mtIteration}):  A: {op.subtileA}  B: {op.subtileB}")
         elif isinstance(op, WaitOp):
-            inflight = f" — inflight GRs A={op.inflightGRCountA} B={op.inflightGRCountB}" if op.inflightGRCountA is not None else ""
+            inflight = f" — inflight GRs A={op.inflightLoadsA} B={op.inflightLoadsB}" if op.inflightLoadsA is not None else ""
             print(f"{indent}WAIT (MT {op.mtIteration}) A: {op.subtileA}  B: {op.subtileB}{inflight}")
         elif isinstance(op, LROp):
             sikLabel = f", subIterK {op.subIterK}" if op.subIterK >= 0 else ""
@@ -764,18 +767,18 @@ class MFMAScheduler:
                             self.tileInfoB, tB, op.subIterK, dstTile))
         return module
 
-    def emitWaitLR(self, inflightGRCountA, inflightGRCountB):
+    def emitWaitLR(self, inflightLoadsA, inflightLoadsB):
         """Emit SWaitCnt for GR (buffer_load) based on inflight GR counts.
 
         Args:
-            inflightGRCountA: Number of A GR loads still inflight.
-            inflightGRCountB: Number of B GR loads still inflight.
+            inflightLoadsA: Number of A GR loads still inflight.
+            inflightLoadsB: Number of B GR loads still inflight.
         """
         module = Module()
-        grCnt = int(inflightGRCountA / self.tileInfoA.loadRatioGR) + \
-                int(inflightGRCountB / self.tileInfoB.loadRatioGR)
+        grCnt = int(inflightLoadsA / self.tileInfoA.loadRatioGR) + \
+                int(inflightLoadsB / self.tileInfoB.loadRatioGR)
         module.add(SWaitCnt(dscnt=-1, vlcnt=grCnt, vscnt=-1,
-                            comment=f"Wait GR: A={inflightGRCountA} B={inflightGRCountB} => vlcnt={grCnt}"))
+                            comment=f"Wait GR: A={inflightLoadsA} B={inflightLoadsB} => vlcnt={grCnt}"))
         module.add(SBarrier(comment=""))
         return module
 
@@ -786,14 +789,15 @@ class MFMAScheduler:
         with deduplication via globalReadMap tracking.
         """
         module = Module()
-        grTracker = set()
+        grTrackerA = set()
+        grTrackerB = set()
         for pss in steps:
             for siks in pss.subIterKSteps:
                 for op in siks.ops:
                     if not isinstance(op, GROp):
                         continue
-                    for subtileList, tileInfo in [(op.subtileA, self.tileInfoA),
-                                                    (op.subtileB, self.tileInfoB)]:
+                    for subtileList, tileInfo, grTracker in [(op.subtileA, self.tileInfoA, grTrackerA),
+                                                            (op.subtileB, self.tileInfoB, grTrackerB)]:
                         for sId0 in subtileList:
                             grIds = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, 0)].globalReadMap
                             if not set(grIds).issubset(grTracker):
@@ -802,22 +806,39 @@ class MFMAScheduler:
         return module
 
     def _emitLoop(self, writer, kernel, label, steps):
-        """Emit a loop module (mainloop, NGLL, or NLL)."""
+        """Emit a loop module (mainloop, NGLL, or NLL).
+
+        Emits ops in the order they appear in each SubIterKSchedule,
+        preserving the schedule's intended instruction ordering.
+        """
         dtileInfo = writer.states.d.tileInfo
         module = Module(label)
         for pss in steps:
             for dus in pss.subIterKSteps:
                 module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
-                oneStep = [PartitionSchedule(
-                    partitionId=pss.partitionId,
-                    subIterKSteps=[dus])]
-                module.add(self.emitGRs(writer, kernel, oneStep))
-                module.add(self.emitMFMAs(writer, kernel, oneStep, dtileInfo))
+                hasLR = False
                 for op in dus.ops:
-                    if isinstance(op, WaitOp):
-                        module.add(self.emitWaitLR(op.inflightGRCountA, op.inflightGRCountB))
-                module.add(self.emitLRs(writer, kernel, oneStep))
-                module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
+                    if isinstance(op, GROp):
+                        oneStep = [PartitionSchedule(
+                            partitionId=pss.partitionId,
+                            subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
+                        module.add(self.emitGRs(writer, kernel, oneStep))
+                    elif isinstance(op, MFMAOp):
+                        oneStep = [PartitionSchedule(
+                            partitionId=pss.partitionId,
+                            subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
+                        module.add(self.emitMFMAs(writer, kernel, oneStep, dtileInfo))
+                    elif isinstance(op, WaitOp):
+                        module.add(self.emitWaitLR(op.inflightLoadsA, op.inflightLoadsB))
+                    elif isinstance(op, LROp):
+                        oneStep = [PartitionSchedule(
+                            partitionId=pss.partitionId,
+                            subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
+                        module.add(self.emitLRs(writer, kernel, oneStep))
+                        module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
+                        hasLR = True
+                if not hasLR:
+                    module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
         return module
 
     def generateCode(self, writer, kernel):
@@ -879,10 +900,10 @@ if __name__ == "__main__":
     }
     kernel = {
         "DepthU": 64,
-        "MacroTileA": 256,
-        "MacroTileB": 256,
-        "MacroTile0": 256,
-        "MacroTile1": 256,
+        "MacroTileA": 64,
+        "MacroTileB": 64,
+        "MacroTile0": 64,
+        "MacroTile1": 64,
         "MatrixInstM": 16,
         "MatrixInstN": 16,
         "MatrixInstK": 32,
