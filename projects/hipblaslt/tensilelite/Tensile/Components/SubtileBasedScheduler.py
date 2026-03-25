@@ -895,62 +895,37 @@ class SubtileBasedScheduler:
 
     @staticmethod
     def interleaveInstructions(module):
-        """Reorder instructions within fence-bounded regions to interleave MFMAs with other instructions.
+        """Interleave MFMAs with other instructions within a subIterK module.
 
-        Fences (s_waitcnt, s_barrier) are immovable boundaries.
-        Within each region, MFMAs are distributed evenly among non-MFMA instructions.
-        The relative order of MFMAs is preserved, and the relative order of
-        non-MFMA instructions is preserved.
+        MFMAs only depend on the previous LR being complete (handled by the
+        caller via dscnt=0 before this module). So we can freely reorder MFMAs
+        among the other instructions as long as:
+          - The relative order of non-MFMA instructions is preserved
+          - MFMAs are distributed evenly among them
         """
         items = module.flatitems()
         if not items:
             return module
 
-        def isFence(item):
-            return isinstance(item, (SWaitCnt, SBarrier))
+        mfmas = [x for x in items if isinstance(x, MFMAInstruction)]
+        others = [x for x in items if not isinstance(x, MFMAInstruction)]
 
-        # Split into regions separated by fences
-        regions = []
-        fences = []
-        currentRegion = []
-        for item in items:
-            if isFence(item):
-                regions.append(currentRegion)
-                fences.append(item)
-                currentRegion = []
-            else:
-                currentRegion.append(item)
-        regions.append(currentRegion)
+        if not mfmas or not others:
+            return module
 
-        # Interleave within each region
+        # Distribute MFMAs evenly among others
         result = Module()
-        for i, region in enumerate(regions):
-            mfmas = [x for x in region if isinstance(x, MFMAInstruction)]
-            others = [x for x in region if not isinstance(x, MFMAInstruction)]
-
-            if mfmas and others:
-                # Distribute 'others' evenly into gaps between MFMAs
-                numMfmas = len(mfmas)
-                numOthers = len(others)
-                # Number of 'others' to place after each MFMA
-                baseCount = numOthers // numMfmas
-                extra = numOthers % numMfmas
-                otherIdx = 0
-                for mi, mfma in enumerate(mfmas):
-                    result.add(mfma)
-                    # Place baseCount (or baseCount+1) 'others' after this MFMA
-                    count = baseCount + (1 if mi < extra else 0)
-                    for _ in range(count):
-                        result.add(others[otherIdx])
-                        otherIdx += 1
-            else:
-                # No interleaving needed — just emit in order
-                for item in region:
-                    result.add(item)
-
-            # Emit fence
-            if i < len(fences):
-                result.add(fences[i])
+        numMfmas = len(mfmas)
+        numOthers = len(others)
+        baseCount = numOthers // numMfmas
+        extra = numOthers % numMfmas
+        otherIdx = 0
+        for mi, mfma in enumerate(mfmas):
+            result.add(mfma)
+            count = baseCount + (1 if mi < extra else 0)
+            for _ in range(count):
+                result.add(others[otherIdx])
+                otherIdx += 1
 
         return result
 
@@ -979,9 +954,6 @@ class SubtileBasedScheduler:
                 module.add(subModule)
                 if hasLR:
                     pendingLRWait = True
-        # Flush any trailing LR wait (e.g. last subIterK has no following MFMAs)
-        if pendingLRWait:
-            module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LR to complete"))
         return module
 
     def generateCode(self, writer, kernel):
