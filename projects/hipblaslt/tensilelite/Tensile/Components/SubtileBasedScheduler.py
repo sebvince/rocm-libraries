@@ -6,7 +6,9 @@ from Tensile.Components.SubtileBasedKernel import emitMfmaInstruction
 from Tensile.Components.SubtileBasedKernel import emitSingleDsRead
 from Tensile.Components.SubtileBasedKernel import emitSingleBufferLoad
 from rocisa.code import Module
-from rocisa.instruction import SWaitCnt, SBarrier
+from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1
+from rocisa.code import Label
+from rocisa.container import sgpr
 
 class PrefetchMode(Enum):
     NO = auto()
@@ -142,7 +144,14 @@ class LROp:
     lrLoadB: Dict[int, int]
 
 
-ScheduleOp = Union[MFMAOp, GROp, WaitOp, LROp]
+@dataclass
+class SkipOp:
+    compare: str  # "EQ", "LE"
+    value: int    # LoopCounter compared against this
+    target: str   # "NLL", "NGLL"
+
+
+ScheduleOp = Union[MFMAOp, GROp, WaitOp, LROp, SkipOp]
 
 
 @dataclass
@@ -305,7 +314,7 @@ class MFMAScheduler:
             lrOps.append(LROp(mtIteration="0", subIterK=sik,
                               lrLoadA=lrLoadA, lrLoadB=lrLoadB))
 
-        # Build preloop steps: GR(MT 0), WAIT(MT 0), LR(MT 0), GR(MT 1)
+        # Build preloop steps: GR(MT0), WAIT, LR(MT0), SKIP guards, GR(MT1)
         preloopOps: List[ScheduleOp] = []
         preloopOps.append(GROp(mtIteration="0",
                                subtileA=allA, subtileB=allB))
@@ -313,8 +322,10 @@ class MFMAScheduler:
                                  subtileA=allA, subtileB=allB,
                                  inflightLoadsA=0, inflightLoadsB=0))
         preloopOps.extend(lrOps)
+        preloopOps.append(SkipOp(compare="EQ", value=1, target="NLL"))
         preloopOps.append(GROp(mtIteration="1",
                                subtileA=preloadMT1_A, subtileB=preloadMT1_B))
+        preloopOps.append(SkipOp(compare="LE", value=2, target="NGLL"))
         preloopSik = SubIterKSchedule(subIterK=0)
         preloopSik.ops = preloopOps
         self.preloopSteps: List[PartitionSchedule] = [
@@ -658,6 +669,8 @@ class MFMAScheduler:
         elif isinstance(op, LROp):
             sikLabel = f", subIterK {op.subIterK}" if op.subIterK >= 0 else ""
             print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {op.lrLoadA}  B: {op.lrLoadB}")
+        elif isinstance(op, SkipOp):
+            print(f"{indent}SKIP_IF_{op.compare}({op.value}, {op.target})")
 
     def printSchedule(self):
         print(f"SubtileGridA={self.MTA}, SubtileGridB={self.MTB}")
@@ -837,6 +850,15 @@ class MFMAScheduler:
                         module.add(self.emitLRs(writer, kernel, oneStep))
                         module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
                         hasLR = True
+                    elif isinstance(op, SkipOp):
+                        label = Label(f"SkipTo{op.target}", "")
+                        cmpMap = {"EQ": SCmpEQU32, "LE": SCmpLeU32}
+                        module.add(cmpMap[op.compare](
+                            src0=sgpr("LoopCounterL"), src1=op.value,
+                            comment=f"LoopCounter {op.compare} {op.value}?"))
+                        module.add(SCBranchSCC1(
+                            labelName=label.getLabelName(),
+                            comment=f"skip to {op.target}"))
                 if not hasLR:
                     module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
         return module
@@ -846,8 +868,14 @@ class MFMAScheduler:
 
         preloop  = self._emitLoop(writer, kernel, "PRELOOP", self.preloopSteps)
         mainloop = self._emitLoop(writer, kernel, "MAINLOOP", self.mainloopSteps)
-        ngll     = self._emitLoop(writer, kernel, "NGLL", self.ngllSteps)
-        nll      = self._emitLoop(writer, kernel, "NLL", self.nllSteps)
+
+        ngll = Module("NGLL")
+        ngll.add(Label("SkipToNGLL", ""))
+        ngll.add(self._emitLoop(writer, kernel, "NGLL", self.ngllSteps))
+
+        nll = Module("NLL")
+        nll.add(Label("SkipToNLL", ""))
+        nll.add(self._emitLoop(writer, kernel, "NLL", self.nllSteps))
 
         for label, module in [("PRELOOP", preloop), ("MAINLOOP", mainloop),
                               ("NGLL", ngll), ("NLL", nll)]:
