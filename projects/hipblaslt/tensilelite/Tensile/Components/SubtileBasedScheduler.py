@@ -6,6 +6,7 @@ from Tensile.Components.SubtileBasedKernel import emitMfmaInstruction
 from Tensile.Components.SubtileBasedKernel import emitSingleDsRead
 from Tensile.Components.SubtileBasedKernel import emitSingleBufferLoad
 from rocisa.code import Module
+from rocisa.instruction import SWaitCnt, SBarrier
 
 class PrefetchMode(Enum):
     NO = auto()
@@ -129,7 +130,8 @@ class WaitOp:
     mtIteration: str  # e.g. "n", "n+1"
     subtileA: List[int]
     subtileB: List[int]
-    inflightGRCount: Optional[int] = None
+    inflightGRCountA: Optional[int] = None
+    inflightGRCountB: Optional[int] = None
 
 
 @dataclass
@@ -535,13 +537,15 @@ class MFMAScheduler:
                     sourceGRIdx = evi
                     break
             if sourceGRIdx is None:
-                return None
-            total = 0
+                return None, None
+            totalA = 0
+            totalB = 0
             sourceStepIdx = grEvents[sourceGRIdx][0]
             for (si, gi, sik, cnt, grA, grB) in grEvents:
                 if si >= sourceStepIdx or si < waitStepIndex:
-                    total += cnt
-            return total
+                    totalA += len(grA)
+                    totalB += len(grB)
+            return totalA, totalB
 
         # Insert WAIT ops
         pendingA = set()
@@ -562,11 +566,11 @@ class MFMAScheduler:
                     waitA = set(lrOp.lrLoadA.keys()) & pendingA
                     waitB = set(lrOp.lrLoadB.keys()) & pendingB
                 if waitA or waitB:
-                    inflightCount = _countInflightGR(si, waitA, waitB)
+                    inflightCountA, inflightCountB = _countInflightGR(si, waitA, waitB)
                     dus.ops.insert(-1, WaitOp(
                         mtIteration=lrOp.mtIteration,
                         subtileA=sorted(waitA), subtileB=sorted(waitB),
-                        inflightGRCount=inflightCount))
+                        inflightGRCountA=inflightCountA, inflightGRCountB=inflightCountB))
                     pendingA -= waitA
                     pendingB -= waitB
 
@@ -640,7 +644,7 @@ class MFMAScheduler:
         elif isinstance(op, GROp):
             print(f"{indent}GR (MT {op.mtIteration}):  A: {op.subtileA}  B: {op.subtileB}")
         elif isinstance(op, WaitOp):
-            inflight = f" — {op.inflightGRCount} inflight GRs" if op.inflightGRCount is not None else ""
+            inflight = f" — inflight GRs A={op.inflightGRCountA} B={op.inflightGRCountB}" if op.inflightGRCountA is not None else ""
             print(f"{indent}WAIT (MT {op.mtIteration}) A: {op.subtileA}  B: {op.subtileB}{inflight}")
         elif isinstance(op, LROp):
             sikLabel = f", subIterK {op.subIterK}" if op.subIterK >= 0 else ""
@@ -752,6 +756,21 @@ class MFMAScheduler:
                             self.tileInfoB, tB, op.subIterK, dstTile))
         return module
 
+    def emitWaitLR(self, inflightGRCountA, inflightGRCountB):
+        """Emit SWaitCnt for GR (buffer_load) based on inflight GR counts.
+
+        Args:
+            inflightGRCountA: Number of A GR loads still inflight.
+            inflightGRCountB: Number of B GR loads still inflight.
+        """
+        module = Module()
+        grCnt = int(inflightGRCountA / self.tileInfoA.loadRatioGR) + \
+                int(inflightGRCountB / self.tileInfoB.loadRatioGR)
+        module.add(SWaitCnt(dscnt=-1, vlcnt=grCnt, vscnt=-1,
+                            comment=f"Wait GR: A={inflightGRCountA} B={inflightGRCountB} => vlcnt={grCnt}"))
+        module.add(SBarrier(comment=""))
+        return module
+
     def emitGRs(self, writer, kernel, steps):
         """Emit GR (Global Read) buffer_load instructions for a list of PartitionSchedules.
 
@@ -793,6 +812,10 @@ class MFMAScheduler:
                     print(module_gr)
                     module = self.emitMFMAs(writer, kernel, oneStep, dtileInfo)
                     print(module)
+                    for op in dus.ops:
+                        if isinstance(op, WaitOp):
+                            module_wait = self.emitWaitLR(op.inflightGRCountA, op.inflightGRCountB)
+                            print(module_wait)
                     module_lr = self.emitLRs(writer, kernel, oneStep)
                     print(module_lr)
 
