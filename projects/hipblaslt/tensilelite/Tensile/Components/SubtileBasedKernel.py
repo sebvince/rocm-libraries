@@ -29,7 +29,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   DSLoadU8, DSStore2B32, DSStore2B64, DSStoreB128, DSStoreB16, DSStoreB256, \
   DSStoreB32, DSStoreB64, DSStoreB8, DSStoreInstruction, FlatLoadB128, FlatLoadB32, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
-  MFMAInstruction, MXMFMAInstruction, SAddU32, SAddCU32, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
+  MFMAInstruction, MXMFMAInstruction, SAddU32, SAddCU32, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, SCmpLtU32, \
   SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SSubBU32, SWaitCnt, SWaitAlu, SXorB32, \
   SLongBranchPositive, VAccvgprWrite, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpXEqU32, VCndMaskB32, VReadfirstlaneB32, \
   VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, VXorB32, \
@@ -1485,39 +1485,116 @@ def emitMfmaCode(writer, kernel):
 #
 # Scheduling logic would be introduced here
 #
-def mainLoopImpl(writer, kernel, isNLL = False):
+def mainLoopImpl(writer, kernel):
   module = Module()
-  module.addComment0("REMOVE WHEN IMPLEMNTED: Placeholder for subtile based main loop impl")
+  module.addComment0("--------------------------------")
+  module.addComment0("-----  MAINLOOP         --------")
+  module.addComment0("--------------------------------")
 
+  pgr = kernel["PrefetchGlobalRead"]
+  endCounter = pgr  # PGR=0 -> 0, PGR=2 -> 2
 
-  label = Label("start", comment="")
-  module.add(label)
+  loopBegin = Label("LoopBeginL", "")
+  module.add(loopBegin)
 
-  if not isNLL:
+  if pgr >= 2:
+    # PGR=2 pipeline: MFMA uses vgprs from *previous* LR (preloop's LR on first iter)
+    # 1. MFMA (consume previous LR data)
+    module.add(emitMfmaCode(writer, kernel))
+
+    # 2. Issue next GR into current GR buffer
+    module.add(globalReadDoSubtile('A', writer, kernel))
+    module.add(globalReadDoSubtile('B', writer, kernel))
+
+    # 3. Wait for previous GR (the one from preloop or previous iteration, already in other LDS buffer)
+    module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for all GRs to complete"))
+    module.add(SBarrier(comment=""))
+
+    # 4. LR from the other buffer (the one that just completed)
+    module.add(localReadDoSubtile('A', writer, kernel))
+    module.add(localReadDoSubtile('B', writer, kernel))
+    module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
+
+    # 5. Swap buffers and advance pointer
+    module.add(globalReadLDSBufferSwap('A', writer, kernel))
+    module.add(globalReadLDSBufferSwap('B', writer, kernel))
+    module.add(localReadLDSBufferSwap('A', writer, kernel))
+    module.add(localReadLDSBufferSwap('B', writer, kernel))
+    module.add(globalReadPtrUpdates('A', writer, kernel))
+    module.add(globalReadPtrUpdates('B', writer, kernel))
+  else:
+    # PGR=0: non-pipelined — GR, wait, LR, MFMA in same iteration
     module.add(globalReadDoSubtile('A', writer, kernel))
     module.add(globalReadDoSubtile('B', writer, kernel))
     module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for all subtile GRs to complete"))
     module.add(SBarrier(comment=""))
 
+    module.add(localReadDoSubtile('A', writer, kernel))
+    module.add(localReadDoSubtile('B', writer, kernel))
+    module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
+
+    module.add(emitMfmaCode(writer, kernel))
+    module.add(globalReadLDSBufferSwap('A', writer, kernel))
+    module.add(globalReadLDSBufferSwap('B', writer, kernel))
+    module.add(localReadLDSBufferSwap('A', writer, kernel))
+    module.add(localReadLDSBufferSwap('B', writer, kernel))
+    module.add(globalReadPtrUpdates('A', writer, kernel))
+    module.add(globalReadPtrUpdates('B', writer, kernel))
+
+  # Decrement and loop back if counter > endCounter
+  module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
+                     comment="dec counterL"))
+  module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=endCounter,
+                       comment="counterL == %d?" % endCounter))
+  module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
+                          comment="restart mainloop"))
+
+  return module
 
 
+##################################################
+# NGLL: No Global Load Loop
+#
+# Same as mainloop but without global reads.
+# Drains the last set of global reads that are
+# already in flight (local writes + local reads + MFMAs).
+#
+def noGlobalLoadLoop(writer, kernel):
+  module = Module()
+  module.addComment0("--------------------------------")
+  module.addComment0("-----  NGLL             --------")
+  module.addComment0("--------------------------------")
+
+  # MFMA: consume vgprs from the last LR (mainloop's last iteration or preloop)
+  module.add(emitMfmaCode(writer, kernel))
+
+  # Wait for last inflight GR to land in LDS
+  module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for last GRs to land in LDS"))
+  module.add(SBarrier(comment=""))
+
+  # LR from the buffer containing the last GR data
   module.add(localReadDoSubtile('A', writer, kernel))
   module.add(localReadDoSubtile('B', writer, kernel))
   module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
 
+  return module
+
+
+##################################################
+# NLL: No Load Loop
+#
+# No global reads, no local writes.
+# Only local reads + MFMAs to drain the last
+# data already in LDS.
+#
+def noLoadLoop(writer, kernel):
+  module = Module()
+  module.addComment0("--------------------------------")
+  module.addComment0("-----  NLL              --------")
+  module.addComment0("--------------------------------")
+
+  # MFMA: consume vgprs from NGLL's LR (or preloop's LR for LoopCounter==1)
   module.add(emitMfmaCode(writer, kernel))
-  module.add(globalReadLDSBufferSwap('A', writer, kernel))
-  module.add(globalReadLDSBufferSwap('B', writer, kernel))
-
-  module.add(localReadLDSBufferSwap('A', writer, kernel))
-  module.add(localReadLDSBufferSwap('B', writer, kernel))
-
-  module.add(globalReadPtrUpdates('A', writer, kernel))
-  module.add(globalReadPtrUpdates('B', writer, kernel))
-
-  module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1))
-  module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=0))
-  module.add(SCBranchSCC0(labelName=label.getLabelName()))
 
   return module
 
@@ -1530,28 +1607,77 @@ def mainLoopImpl(writer, kernel, isNLL = False):
 #
 def preLoop(writer, kernel):
   module = Module()
-  module.addComment("")
-  module.addComment("")
   pgr = kernel["PrefetchGlobalRead"]
-  plr = kernel["PrefetchLocalRead"]
-  module.addComment0("REMOVE WHEN IMPLEMNTED: Placeholder for subtile based Preloop code with PGR=%u"%pgr)
+  module.addComment0("--------------------------------")
+  module.addComment0("-----  PRELOOP (PGR=%d) --------" % pgr)
+  module.addComment0("--------------------------------")
 
-  # Just sample impl, we can also interleave A/B loads
-  for i in range(pgr):
-    module.addComment0("Emitting %u-th set of GRs"%i)
+  if pgr == 0:
+    return module
+
+  # GR (MT 0) — first set of global reads into LDS buffer 0
+  module.addComment0("GR (MT 0): load into LDS buffer 0")
+  module.add(globalReadDoSubtile('A', writer, kernel))
+  module.add(globalReadDoSubtile('B', writer, kernel))
+
+  # Wait for GR(MT 0) to land, barrier
+  module.add(SWaitCnt(dscnt=-1, vlcnt=0, vscnt=-1, comment="Wait for GR (MT 0) to complete"))
+  module.add(SBarrier(comment=""))
+
+  if pgr >= 2:
+    skipGRMT1 = Label("SkipGRMT1", "")
+
+    # If LoopCounter < 2, skip GR(MT1) — only 1 iteration of data
+    module.add(SCmpLtU32(src0=sgpr("LoopCounterL"), src1=2,
+                         comment="LoopCounter < 2? Skip GR(MT1)"))
+    module.add(SCBranchSCC1(labelName=skipGRMT1.getLabelName(),
+                            comment="only 1 iteration, skip second prefetch"))
+
+    # Swap GR LDS buffer so GR(MT 1) writes to buffer 1
+    module.add(globalReadLDSBufferSwap('A', writer, kernel))
+    module.add(globalReadLDSBufferSwap('B', writer, kernel))
+
+    # Advance GR pointer so GR(MT 1) reads from K=DepthU
+    module.add(globalReadPtrUpdates('A', writer, kernel))
+    module.add(globalReadPtrUpdates('B', writer, kernel))
+
+    # GR (MT 1) — second set of global reads into LDS buffer 1
+    module.addComment0("GR (MT 1): load into LDS buffer 1")
     module.add(globalReadDoSubtile('A', writer, kernel))
     module.add(globalReadDoSubtile('B', writer, kernel))
-    module.addComment("Add appropriate GR offset swap logic")
-  module.addComment("")
 
-  for i in range(plr):
-    module.addComment("Add correct waits..")
-    module.addComment0("Emitting LR to read data loaded by %u-th set of GRs"%(i))
+    # Advance GR pointer for mainloop (K=2*DepthU)
+    module.add(globalReadPtrUpdates('A', writer, kernel))
+    module.add(globalReadPtrUpdates('B', writer, kernel))
+
+    # Swap GR LDS buffer back so mainloop GR writes to buffer 0
+    module.add(globalReadLDSBufferSwap('A', writer, kernel))
+    module.add(globalReadLDSBufferSwap('B', writer, kernel))
+
+    # LR from buffer 0 (data from GR MT 0)
+    module.addComment0("LR (MT 0): read from LDS buffer 0")
     module.add(localReadDoSubtile('A', writer, kernel))
     module.add(localReadDoSubtile('B', writer, kernel))
-    module.addComment("Add appropriate LR offset swap logic")
+    module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
 
-  module.addComment("")
+    # Swap LR buffer so NGLL reads from buffer 1 (GR MT1 data)
+    module.add(localReadLDSBufferSwap('A', writer, kernel))
+    module.add(localReadLDSBufferSwap('B', writer, kernel))
+
+    skipGRMT1End = Label("SkipGRMT1_End", "")
+    module.add(SBranch(labelName=skipGRMT1End.getLabelName(),
+                       comment="skip single-iteration path"))
+    module.add(skipGRMT1)
+
+    # LoopCounter == 1 path: only GR(MT0) was issued
+    # LR from buffer 0 and no swap — NLL will also read from buffer 0
+    module.addComment0("LR (MT 0): read from LDS buffer 0 (single iteration)")
+    module.add(localReadDoSubtile('A', writer, kernel))
+    module.add(localReadDoSubtile('B', writer, kernel))
+    module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
+
+    module.add(skipGRMT1End)
+
   return module
 
 ##################################################
@@ -1560,13 +1686,38 @@ def preLoop(writer, kernel):
 #
 def mainLoop(writer, kernel):
   module = Module()
+  pgr = kernel["PrefetchGlobalRead"]
+
+  if pgr >= 2:
+    skipToNLL    = Label("SkipToNLL", "")
+    skipToNGLL   = Label("SkipToNGLL", "")
+    skipMainloop = Label("SkipMainloop", "")
+
+    # Entry guards:
+    #   LoopCounter == 1 → skip mainloop + NGLL, jump to NLL
+    #   LoopCounter <= PGR → skip mainloop, jump to NGLL
+    module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=1,
+                         comment="LoopCounter == 1? (only 1 iteration, PGR=%d)" % pgr))
+    module.add(SCBranchSCC1(labelName=skipToNLL.getLabelName(),
+                            comment="skip mainloop + NGLL, jump to NLL"))
+    module.add(SCmpLeU32(src0=sgpr("LoopCounterL"), src1=pgr,
+                         comment="LoopCounter <= %d (PGR=%d)?" % (pgr, pgr)))
+    module.add(SCBranchSCC1(labelName=skipMainloop.getLabelName(),
+                            comment="skip mainloop, jump to NGLL"))
+
   module.addComment0("MAINLOOP")
   module.add(mainLoopImpl(writer, kernel))
   module.addComment("")
 
-  #module.addComment0("MAINLOOP-NLL")
-  #isNLL = True
-  #module.add(mainLoopImpl(writer, kernel, isNLL))
-  #module.addComment("")
+  if pgr >= 2:
+    module.add(skipMainloop)
+    module.addComment0("NGLL")
+    module.add(noGlobalLoadLoop(writer, kernel))
+    module.addComment("")
+
+    module.add(skipToNLL)
+    module.addComment0("NLL")
+    module.add(noLoadLoop(writer, kernel))
+    module.addComment("")
 
   return module
