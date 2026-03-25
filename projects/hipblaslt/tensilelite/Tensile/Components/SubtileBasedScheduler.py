@@ -844,7 +844,10 @@ class SubtileBasedScheduler:
     def _emitSubIterK(self, writer, kernel, pss, dus, lastLRmt):
         """Emit a single subIterK step into a Module.
 
-        Returns (module, lastLRmt) where lastLRmt tracks LR MT transitions.
+        Returns (module, lastLRmt, hasLR) where:
+          - lastLRmt tracks LR MT transitions
+          - hasLR is True if this step emitted LRs (caller should insert dscnt=0
+            before the next subIterK's MFMA module)
         """
         dtileInfo = writer.states.d.tileInfo
         module = Module()
@@ -878,7 +881,6 @@ class SubtileBasedScheduler:
                     partitionId=pss.partitionId,
                     subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
                 module.add(self.emitLRs(writer, kernel, oneStep))
-                module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
                 hasLR = True
             elif isinstance(op, SkipOp):
                 skipLabel = Label(f"SkipTo{op.target}", "")
@@ -889,9 +891,7 @@ class SubtileBasedScheduler:
                 module.add(SCBranchSCC1(
                     labelName=skipLabel.getLabelName(),
                     comment=f"skip to {op.target}"))
-        if not hasLR:
-            module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
-        return module, lastLRmt
+        return module, lastLRmt, hasLR
 
     @staticmethod
     def interleaveInstructions(module):
@@ -954,19 +954,34 @@ class SubtileBasedScheduler:
 
         return result
 
-    def _emitLoop(self, writer, kernel, label, steps):
+    def _emitLoop(self, writer, kernel, label, steps, pendingLRWait=False):
         """Emit a loop module (mainloop, NGLL, or NLL).
 
         Emits each subIterK step as a separate module, applies instruction
         interleaving, then combines into the final loop module.
+        The LR wait (dscnt=0) is deferred: inserted just before the next
+        subIterK's MFMA module, outside the interleaver so it doesn't
+        split the interleave region.
+
+        pendingLRWait: if True, a wait is inserted before the first MFMA module
+        (used by mainloop/NGLL/NLL entered with pending LR data from preloop).
         """
         module = Module(label)
         lastLRmt = None
         for pss in steps:
             for dus in pss.subIterKSteps:
-                subModule, lastLRmt = self._emitSubIterK(writer, kernel, pss, dus, lastLRmt)
+                subModule, lastLRmt, hasLR = self._emitSubIterK(writer, kernel, pss, dus, lastLRmt)
                 subModule = self.interleaveInstructions(subModule)
+                # Insert deferred LR wait before this subIterK's MFMAs
+                if pendingLRWait:
+                    module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LR to complete"))
+                    pendingLRWait = False
                 module.add(subModule)
+                if hasLR:
+                    pendingLRWait = True
+        # Flush any trailing LR wait (e.g. last subIterK has no following MFMAs)
+        if pendingLRWait:
+            module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LR to complete"))
         return module
 
     def generateCode(self, writer, kernel):
@@ -1034,10 +1049,10 @@ if __name__ == "__main__":
     }
     kernel = {
         "DepthU": 64,
-        "MacroTileA": 64,
-        "MacroTileB": 64,
-        "MacroTile0": 64,
-        "MacroTile1": 64,
+        "MacroTileA": 256,
+        "MacroTileB": 256,
+        "MacroTile0": 256,
+        "MacroTile1": 256,
         "MatrixInstM": 16,
         "MatrixInstN": 16,
         "MatrixInstK": 32,
