@@ -1,3 +1,4 @@
+import dataclasses
 from enum import Enum, auto
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Set, Optional, Union
@@ -129,12 +130,22 @@ class GROp:
 
 
 @dataclass
-class WaitOp:
+class WaitGROp:
     mtIteration: str  # e.g. "n", "n+1"
     subtileA: List[int]
     subtileB: List[int]
     inflightLoadsA: Optional[int] = None
     inflightLoadsB: Optional[int] = None
+
+
+@dataclass
+class WaitLROp:
+    pass
+
+
+@dataclass
+class SyncOp:
+    comment: str = ""
 
 
 @dataclass
@@ -152,7 +163,7 @@ class SkipOp:
     target: str   # "NLL", "NGLL"
 
 
-ScheduleOp = Union[MFMAOp, GROp, WaitOp, LROp, SkipOp]
+ScheduleOp = Union[MFMAOp, GROp, WaitGROp, WaitLROp, SyncOp, LROp, SkipOp]
 
 
 @dataclass
@@ -320,10 +331,12 @@ class SubtileBasedScheduler:
         preloopOps.append(GROp(mtIteration="0",
                                subtileA=allA, subtileB=allB,
                                lastForMT=True))
-        preloopOps.append(WaitOp(mtIteration="0",
+        preloopOps.append(WaitGROp(mtIteration="0",
                                  subtileA=allA, subtileB=allB,
                                  inflightLoadsA=0, inflightLoadsB=0))
+        preloopOps.append(SyncOp(comment="Barrier: wait for GR data before LR"))
         preloopOps.extend(lrOps)
+        preloopOps.append(WaitLROp())
         preloopOps.append(SkipOp(compare="EQ", value=1, target="NLL"))
         mt1Complete = (set(preloadMT1_A) == set(allA) and set(preloadMT1_B) == set(allB))
         preloopOps.append(GROp(mtIteration="1",
@@ -420,19 +433,30 @@ class SubtileBasedScheduler:
                         if self.allocator.isAllocated('B', tB, sik):
                             self.allocator.release('B', tB, sik)
 
-            # Insert GROp at the correct subIterK
+            # Insert GROps split across subIterK=0 and subIterK=1
             if gr.subtileA or gr.subtileB:
-                if gr.mtIteration == "n+2":
-                    bfSubIterK = 1
-                else:
-                    hasConflict = bool((gr.subtileA & subIterK0LoadAKeys) or (gr.subtileB & subIterK0LoadBKeys))
-                    bfSubIterK = 1 if hasConflict else 0
+                totalGR_A = sorted(gr.subtileA)
+                totalGR_B = sorted(gr.subtileB)
+                splitA = (len(totalGR_A) + 1) // 2
+                splitB = (len(totalGR_B) + 1) // 2
+                gr0_A, gr1_A = totalGR_A[:splitA], totalGR_A[splitA:]
+                gr0_B, gr1_B = totalGR_B[:splitB], totalGR_B[splitB:]
                 isLastPartition = (pi == numPartitions - 1)
-                pss.subIterKSteps[bfSubIterK].ops.insert(1, GROp(
-                    mtIteration=gr.mtIteration,
-                    subtileA=sorted(gr.subtileA),
-                    subtileB=sorted(gr.subtileB),
-                    lastForMT=isLastPartition))
+
+                if gr0_A or gr0_B:
+                    pss.subIterKSteps[0].ops.append(GROp(
+                        mtIteration=gr.mtIteration,
+                        subtileA=gr0_A, subtileB=gr0_B,
+                        lastForMT=False))
+                if gr1_A or gr1_B:
+                    pss.subIterKSteps[1].ops.append(GROp(
+                        mtIteration=gr.mtIteration,
+                        subtileA=gr1_A, subtileB=gr1_B,
+                        lastForMT=isLastPartition))
+                elif isLastPartition:
+                    # All GRs fit in subIterK=0, mark that one as last
+                    pss.subIterKSteps[0].ops[-1] = dataclasses.replace(
+                        pss.subIterKSteps[0].ops[-1], lastForMT=True)
 
             self.mainloopSteps.append(pss)
 
@@ -445,7 +469,7 @@ class SubtileBasedScheduler:
             elif self.config.reuseStrategy == VGPRTileReUseStrategy.ACROSS_SUBGROUP:
                 self._releaseUnusedAfterPartition(pi)
 
-        self._insertWaitsAndDeps(numPartitions)
+        self._insertWaitsAndSync(numPartitions)
         self.ngllSteps = self._buildNGLL()
         self.nllSteps = self._buildNLL()
         self._checkDuplicatedReads()
@@ -540,24 +564,33 @@ class SubtileBasedScheduler:
         for tB in partition.tileBIndices:
             self.allocator.releaseAllForTile('B', tB)
 
-    def _insertWaitsAndDeps(self, numPartitions: int):
-        """Insert WAIT ops into mainloop ops."""
-        # Build ordered GR events for inflight counting
+    def _insertWaitsAndSync(self, numPartitions: int):
+        """Pass 2: Insert WAIT_LR, WAIT_GR, SyncOp and reorder ops.
+
+        After pass 1, each subIterK has: [MFMAOp, LROp, GROp?]
+
+        This pass produces the final ordering per subIterK:
+          subIterK=0 (LR for MT n, GR n+2 collides):
+            MFMAs → LR → WAIT_LR → SyncOp → GR(n+2)
+          subIterK=1 (LR for MT n+1, WAIT_GR needed):
+            MFMAs → GR(n+2) → WAIT_GR → SyncOp → LR(n+1) → WAIT_LR
+        """
+        # ── Pass 3 prep: build GR events for inflight counting ──
         grEvents = []
         si = 0
         for pss in self.mainloopSteps:
             for dus in pss.subIterKSteps:
-                grOp = next((op for op in dus.ops if isinstance(op, GROp)), None)
-                if grOp:
-                    grEvents.append((si, pss.partitionId, dus.subIterK,
-                                     len(grOp.subtileA) + len(grOp.subtileB),
-                                     set(grOp.subtileA), set(grOp.subtileB)))
+                for op in dus.ops:
+                    if isinstance(op, GROp):
+                        grEvents.append((si, pss.partitionId, dus.subIterK,
+                                         len(op.subtileA) + len(op.subtileB),
+                                         set(op.subtileA), set(op.subtileB)))
                 si += 1
 
         def _countInflightGR(waitStepIndex, waitA, waitB):
             sourceGRIdx = None
             for evi, (si, gi, sik, cnt, grA, grB) in enumerate(grEvents):
-                if (waitA and waitA <= grA) or (waitB and waitB <= grB):
+                if (waitA and waitA & grA) or (waitB and waitB & grB):
                     sourceGRIdx = evi
                     break
             if sourceGRIdx is None:
@@ -571,7 +604,7 @@ class SubtileBasedScheduler:
                     totalB += len(grB)
             return totalA, totalB
 
-        # Insert WAIT ops
+        # ── Insert WAIT_LR, WAIT_GR, SyncOp and reorder ──
         pendingA = set()
         pendingB = set()
         si = 0
@@ -581,28 +614,63 @@ class SubtileBasedScheduler:
             pendingB |= gr.subtileB
 
             for dus in pss.subIterKSteps:
-                lrOp = dus.ops[-1]
-                assert isinstance(lrOp, LROp)
+                # Extract ops by type from pass 1
+                mfmaOps = [op for op in dus.ops if isinstance(op, MFMAOp)]
+                lrOps = [op for op in dus.ops if isinstance(op, LROp)]
+                grOps = [op for op in dus.ops if isinstance(op, GROp)]
+                otherOps = [op for op in dus.ops
+                            if not isinstance(op, (MFMAOp, LROp, GROp))]
 
-                waitA = set()
-                waitB = set()
-                if lrOp.subIterK == 0:
+                lrOp = lrOps[0] if lrOps else None
+                hasGRn2 = any(g.mtIteration == "n+2" for g in grOps)
+
+                # Determine if WAIT_GR is needed before this LR
+                waitGROp = None
+                if lrOp and lrOp.subIterK == 0:
                     waitA = set(lrOp.lrLoadA.keys()) & pendingA
                     waitB = set(lrOp.lrLoadB.keys()) & pendingB
-                if waitA or waitB:
-                    inflightCountA, inflightCountB = _countInflightGR(si, waitA, waitB)
-                    dus.ops.insert(-1, WaitOp(
-                        mtIteration=lrOp.mtIteration,
-                        subtileA=sorted(waitA), subtileB=sorted(waitB),
-                        inflightLoadsA=inflightCountA, inflightLoadsB=inflightCountB))
-                    pendingA -= waitA
-                    pendingB -= waitB
+                    if waitA or waitB:
+                        inflightCountA, inflightCountB = _countInflightGR(si, waitA, waitB)
+                        waitGROp = WaitGROp(
+                            mtIteration=lrOp.mtIteration,
+                            subtileA=sorted(waitA), subtileB=sorted(waitB),
+                            inflightLoadsA=inflightCountA, inflightLoadsB=inflightCountB)
+                        pendingA -= waitA
+                        pendingB -= waitB
 
+                # Rebuild ops in correct order
+                newOps = []
+                newOps.extend(mfmaOps)
+                newOps.extend(otherOps)
+
+                if waitGROp:
+                    # subIterK=1 pattern: MFMAs → GR(n+2) → WAIT_GR → SyncOp → LR → WAIT_LR
+                    newOps.extend(grOps)
+                    newOps.append(waitGROp)
+                    newOps.append(SyncOp(comment="Barrier: wait for GR data"))
+                    if lrOp:
+                        newOps.append(lrOp)
+                        newOps.append(WaitLROp())
+                elif hasGRn2 and lrOp:
+                    # subIterK=0 pattern: MFMAs → LR → WAIT_LR → SyncOp → GR(n+2)
+                    newOps.append(lrOp)
+                    newOps.append(WaitLROp())
+                    newOps.append(SyncOp(comment="Barrier: all waves done with LR before GR(n+2) writes"))
+                    newOps.extend(grOps)
+                else:
+                    # No special dependency: MFMAs → LR → GR → WAIT_LR
+                    if lrOp:
+                        newOps.append(lrOp)
+                    newOps.extend(grOps)
+                    if lrOp:
+                        newOps.append(WaitLROp())
+
+                dus.ops = newOps
                 si += 1
 
 
     def _buildNGLL(self) -> List[PartitionSchedule]:
-        """NGLL (Non Global Load Loop): mainloop without GR ops."""
+        """NGLL (Non Global Load Loop): mainloop without GR ops and their associated SyncOps."""
         ngll = []
         for pss in self.mainloopSteps:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
@@ -611,9 +679,11 @@ class SubtileBasedScheduler:
                 for op in dus.ops:
                     if isinstance(op, GROp):
                         continue
-                    if isinstance(op, WaitOp):
+                    if isinstance(op, SyncOp):
+                        continue
+                    if isinstance(op, WaitGROp):
                         # No new GRs in NGLL — just draining the last inflight GR
-                        op = WaitOp(mtIteration=op.mtIteration,
+                        op = WaitGROp(mtIteration=op.mtIteration,
                                     subtileA=op.subtileA, subtileB=op.subtileB,
                                     inflightLoadsA=0, inflightLoadsB=0)
                     newDus.ops.append(op)
@@ -622,7 +692,7 @@ class SubtileBasedScheduler:
         return ngll
 
     def _buildNLL(self) -> List[PartitionSchedule]:
-        """NLL (Non Load Loop): mainloop without GR, LR(n+1), and their associated WAITs."""
+        """NLL (Non Load Loop): mainloop without GR, LR(n+1), and their associated WAITs/SyncOps."""
         nll = []
         for pss in self.mainloopSteps:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
@@ -630,8 +700,9 @@ class SubtileBasedScheduler:
                 newDus = SubIterKSchedule(subIterK=dus.subIterK, conflict=dus.conflict)
                 newDus.ops = [op for op in dus.ops
                               if not isinstance(op, GROp)
+                              and not isinstance(op, SyncOp)
                               and not (isinstance(op, LROp) and op.mtIteration == "n+1")
-                              and not (isinstance(op, WaitOp) and op.mtIteration == "n+1")]
+                              and not (isinstance(op, WaitGROp) and op.mtIteration == "n+1")]
                 newPss.subIterKSteps.append(newDus)
             nll.append(newPss)
         return nll
@@ -677,9 +748,13 @@ class SubtileBasedScheduler:
             print(f"{indent}  - USING  A: {op.vgprTileMapA}  B: {op.vgprTileMapB}")
         elif isinstance(op, GROp):
             print(f"{indent}GR (MT {op.mtIteration}):  A: {op.subtileA}  B: {op.subtileB}")
-        elif isinstance(op, WaitOp):
+        elif isinstance(op, WaitGROp):
             inflight = f" — inflight GRs A={op.inflightLoadsA} B={op.inflightLoadsB}" if op.inflightLoadsA is not None else ""
-            print(f"{indent}WAIT (MT {op.mtIteration}) A: {op.subtileA}  B: {op.subtileB}{inflight}")
+            print(f"{indent}WAIT_GR (MT {op.mtIteration}) A: {op.subtileA}  B: {op.subtileB}{inflight}")
+        elif isinstance(op, WaitLROp):
+            print(f"{indent}WAIT_LR")
+        elif isinstance(op, SyncOp):
+            print(f"{indent}SYNC")
         elif isinstance(op, LROp):
             sikLabel = f", subIterK {op.subIterK}" if op.subIterK >= 0 else ""
             print(f"{indent}LR (MT {op.mtIteration}{sikLabel}) A: {op.lrLoadA}  B: {op.lrLoadB}")
@@ -803,7 +878,7 @@ class SubtileBasedScheduler:
                             self.tileInfoB, tB, op.subIterK, dstTile))
         return module
 
-    def emitWaitLR(self, inflightLoadsA, inflightLoadsB):
+    def emitWaitGR(self, inflightLoadsA, inflightLoadsB):
         """Emit SWaitCnt for GR (buffer_load) based on inflight GR counts.
 
         Args:
@@ -815,7 +890,6 @@ class SubtileBasedScheduler:
                 int(inflightLoadsB / self.tileInfoB.loadRatioGR)
         module.add(SWaitCnt(dscnt=-1, vlcnt=grCnt, vscnt=-1,
                             comment=f"Wait GR: A={inflightLoadsA} B={inflightLoadsB} => vlcnt={grCnt}"))
-        module.add(SBarrier(comment=""))
         return module
 
     def emitGRs(self, writer, kernel, steps):
@@ -844,15 +918,11 @@ class SubtileBasedScheduler:
     def _emitSubIterK(self, writer, kernel, pss, dus, lastLRmt):
         """Emit a single subIterK step into a Module.
 
-        Returns (module, lastLRmt, hasLR) where:
-          - lastLRmt tracks LR MT transitions
-          - hasLR is True if this step emitted LRs (caller should insert dscnt=0
-            before the next subIterK's MFMA module)
+        Returns (module, lastLRmt) where lastLRmt tracks LR MT transitions.
         """
         dtileInfo = writer.states.d.tileInfo
         module = Module()
         module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
-        hasLR = False
         for op in dus.ops:
             if isinstance(op, GROp):
                 oneStep = [PartitionSchedule(
@@ -869,8 +939,12 @@ class SubtileBasedScheduler:
                     partitionId=pss.partitionId,
                     subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
                 module.add(self.emitMFMAs(writer, kernel, oneStep, dtileInfo))
-            elif isinstance(op, WaitOp):
-                module.add(self.emitWaitLR(op.inflightLoadsA, op.inflightLoadsB))
+            elif isinstance(op, WaitGROp):
+                module.add(self.emitWaitGR(op.inflightLoadsA, op.inflightLoadsB))
+            elif isinstance(op, WaitLROp):
+                module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LR to complete"))
+            elif isinstance(op, SyncOp):
+                module.add(SBarrier(comment=op.comment))
             elif isinstance(op, LROp):
                 # Swap LR buffer when transitioning to a new MT
                 if lastLRmt is not None and op.mtIteration != lastLRmt:
@@ -881,7 +955,6 @@ class SubtileBasedScheduler:
                     partitionId=pss.partitionId,
                     subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
                 module.add(self.emitLRs(writer, kernel, oneStep))
-                hasLR = True
             elif isinstance(op, SkipOp):
                 skipLabel = Label(f"SkipTo{op.target}", "")
                 cmpMap = {"EQ": SCmpEQU32, "LE": SCmpLeU32}
@@ -891,7 +964,7 @@ class SubtileBasedScheduler:
                 module.add(SCBranchSCC1(
                     labelName=skipLabel.getLabelName(),
                     comment=f"skip to {op.target}"))
-        return module, lastLRmt, hasLR
+        return module, lastLRmt
 
     @staticmethod
     def interleaveInstructions(module):
@@ -929,37 +1002,20 @@ class SubtileBasedScheduler:
 
         return result
 
-    def _emitLoop(self, writer, kernel, label, steps, pendingLRWait=False):
+    def _emitLoop(self, writer, kernel, label, steps):
         """Emit a loop module (mainloop, NGLL, or NLL).
 
         Emits each subIterK step as a separate module, applies instruction
         interleaving, then combines into the final loop module.
-        The LR wait (dscnt=0) is deferred: inserted just before the next
-        subIterK's MFMA module, outside the interleaver so it doesn't
-        split the interleave region.
-
-        pendingLRWait: if True, a wait is inserted before the first MFMA module
-        (used by mainloop/NGLL/NLL entered with pending LR data from preloop).
+        All waits (WAIT_LR, WAIT_GR, SyncOp) are explicit schedule ops.
         """
         module = Module(label)
         lastLRmt = None
         for pss in steps:
             for dus in pss.subIterKSteps:
-                subModule, lastLRmt, hasLR = self._emitSubIterK(writer, kernel, pss, dus, lastLRmt)
+                subModule, lastLRmt = self._emitSubIterK(writer, kernel, pss, dus, lastLRmt)
                 subModule = self.interleaveInstructions(subModule)
-                # Insert deferred LR wait before this subIterK's MFMAs
-                if pendingLRWait:
-                    module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for LR to complete"))
-                    # With double LDS buffering, GR(MT n+2) overwrites the same buffer
-                    # that LR(MT n) reads from. Barrier ensures all waves finished
-                    # their LDS reads before GR starts writing.
-                    hasGRn2 = any(isinstance(op, GROp) and op.mtIteration == "n+2" for op in dus.ops)
-                    if hasGRn2:
-                        module.add(SBarrier(comment="Barrier: all waves done with LR(MT n) before GR(MT n+2) writes"))
-                    pendingLRWait = False
                 module.add(subModule)
-                if hasLR:
-                    pendingLRWait = True
         return module
 
     def generateCode(self, writer, kernel):
@@ -1047,11 +1103,11 @@ if __name__ == "__main__":
     lsgB = tiB.localSubtileGrid[0]
 
     configs = [
-        # (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-        #     SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+        (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+            SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
 
-         (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-         SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
+        #  (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+        #  SchedulerConfig(4, 4, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
 
         # (f"lsg {lsgA}x{lsgB}, group 4x4, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
         # SchedulerConfig(2, 2, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)),
