@@ -1679,6 +1679,7 @@ def mainLoop(writer, kernel):
     from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler, SchedulerConfig, PrefetchMode, VGPRTileReUseStrategy
     tiA = writer.states.a.tileInfo
     tiB = writer.states.b.tileInfo
+    # cfg = SchedulerConfig(tiA.localSubtileGrid[0]//2, tiB.localSubtileGrid[0]//2,
     cfg = SchedulerConfig(tiA.localSubtileGrid[0], tiB.localSubtileGrid[0],
                           PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)
     scheduler = SubtileBasedScheduler(tiA, tiB, cfg)

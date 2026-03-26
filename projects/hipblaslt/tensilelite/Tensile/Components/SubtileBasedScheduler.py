@@ -735,8 +735,8 @@ class SubtileBasedScheduler:
                               and not isinstance(op, GR_INCOp)
                               and not isinstance(op, SyncOp)
                               and not isinstance(op, LR_INCOp)
-                              and not (isinstance(op, LROp) and op.mtIteration == "n+1")
-                              and not (isinstance(op, WaitGROp) and op.mtIteration == "n+1")]
+                              and not isinstance(op, WaitGROp)
+                              and not (isinstance(op, LROp) and op.mtIteration == "n+1")]
                 newPss.subIterKSteps.append(newDus)
             nll.append(newPss)
         return nll

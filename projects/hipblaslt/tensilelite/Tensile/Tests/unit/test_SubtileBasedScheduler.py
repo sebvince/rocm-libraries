@@ -28,10 +28,10 @@ def create_kernel():
     }
     return {
         "DepthU": 64,
-        "MacroTileA": 256,
-        "MacroTileB": 256,
-        "MacroTile0": 256,
-        "MacroTile1": 256,
+        "MacroTileA": 64,
+        "MacroTileB": 64,
+        "MacroTile0": 64,
+        "MacroTile1": 64,
         "MatrixInstM": 16,
         "MatrixInstN": 16,
         "MatrixInstK": 32,
@@ -94,8 +94,10 @@ if __name__ == "__main__":
     lsgB = tiB.localSubtileGrid[0]
 
     configs = [
-        (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-            SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+        # (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+        #     SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+        (f"lsg {lsgA}x{lsgB}, group {lsgA//2}x{lsgB//2}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+            SchedulerConfig(lsgA//2, lsgB//2, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
     ]
 
     for name, cfg in configs:
@@ -103,5 +105,5 @@ if __name__ == "__main__":
         s = SubtileBasedScheduler(tiA, tiB, cfg)
         s.printSchedule()
         writer = create_writer_with_tiles(kernel, tiA, tiB)
-        s.generateCode(writer, kernel)
-        print()
+        # s.generateCode(writer, kernel)
+        # print()
