@@ -8,7 +8,8 @@ from Tensile.Components.SubtileBasedKernel import emitSingleDsRead
 from Tensile.Components.SubtileBasedKernel import emitSingleBufferLoad
 from Tensile.Components.SubtileBasedKernel import globalReadPtrUpdates, globalReadLDSBufferSwap, localReadLDSBufferSwap
 from rocisa.code import Module, Label
-from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1, MFMAInstruction
+from rocisa.instruction import SWaitCnt, SBarrier, SCmpEQU32, SCmpLeU32, SCBranchSCC1, MFMAInstruction, \
+    GlobalReadInstruction, LocalReadInstruction
 from rocisa.container import sgpr
 
 class PrefetchMode(Enum):
@@ -967,14 +968,17 @@ class SubtileBasedScheduler:
         return module, lastLRmt
 
     @staticmethod
-    def interleaveInstructions(module):
-        """Interleave MFMAs with other instructions within a subIterK module.
+    def instructionSchedule(module):
+        """Schedule MFMAs among other instructions within a subIterK module.
 
-        MFMAs only depend on the previous LR being complete (handled by the
-        caller via dscnt=0 before this module). So we can freely reorder MFMAs
-        among the other instructions as long as:
-          - The relative order of non-MFMA instructions is preserved
-          - MFMAs are distributed evenly among them
+        Rules (invariants preserved by this pass):
+          - MFMA instruction order is preserved
+          - Non-MFMA instruction order is preserved
+          - Insert 1 MFMA between each LR (ds_read) instruction
+          - Insert 4 MFMAs between the last LR and the WAIT_LR (SWaitCnt dscnt)
+          - Insert 1 MFMA between WAIT_LR and SYNC (SBarrier)
+          - No MFMAs between an m0 update and its buffer_load (they are a pair)
+          - Remaining MFMAs are spread evenly between buffer_load pairs
         """
         items = module.flatitems()
         if not items:
@@ -986,19 +990,107 @@ class SubtileBasedScheduler:
         if not mfmas or not others:
             return module
 
-        # Distribute MFMAs evenly among others
+        # Group others into slots: each slot is a list of instructions that
+        # must stay together (e.g. m0 update + buffer_load pair).
+        # We'll insert MFMAs BETWEEN slots.
+        slots = []
+        i = 0
+        while i < len(others):
+            inst = others[i]
+            # Pair m0 update with its following buffer_load
+            if i + 1 < len(others) and isinstance(others[i + 1], GlobalReadInstruction):
+                slots.append(others[i:i+2])
+                i += 2
+            else:
+                slots.append([inst])
+                i += 1
+
+        # Classify each slot for MFMA insertion rules
+        LR_SLOT = 0       # ds_read (LocalReadInstruction)
+        WAITLR_SLOT = 1   # SWaitCnt with dscnt (WAIT_LR)
+        SYNC_SLOT = 2     # SBarrier (SYNC)
+        GR_SLOT = 3       # m0 + buffer_load pair or standalone buffer_load
+        OTHER_SLOT = 4    # everything else
+
+        def classify(slot):
+            first = slot[0]
+            if isinstance(first, LocalReadInstruction):
+                return LR_SLOT
+            if isinstance(first, SWaitCnt):
+                return WAITLR_SLOT
+            if isinstance(first, SBarrier):
+                return SYNC_SLOT
+            if isinstance(first, GlobalReadInstruction) or \
+               (len(slot) > 1 and isinstance(slot[-1], GlobalReadInstruction)):
+                return GR_SLOT
+            return OTHER_SLOT
+
+        slotTypes = [classify(s) for s in slots]
+
+        # Build MFMA budget: how many MFMAs to insert AFTER each slot.
+        # (mfmasAfter[i] = number of MFMAs inserted after slots[i])
+        numSlots = len(slots)
+        mfmasAfter = [0] * numSlots
+
+        mi = 0  # next MFMA to assign
+
+        # Pass 1: assign fixed MFMAs per rules
+        for si in range(numSlots):
+            if mi >= len(mfmas):
+                break
+            st = slotTypes[si]
+            nextSt = slotTypes[si + 1] if si + 1 < numSlots else None
+
+            if st == LR_SLOT and nextSt == LR_SLOT:
+                # 1 MFMA between each LR
+                mfmasAfter[si] = min(1, len(mfmas) - mi)
+                mi += mfmasAfter[si]
+            elif st == LR_SLOT and nextSt == WAITLR_SLOT:
+                # 4 MFMAs between last LR and WAIT_LR
+                mfmasAfter[si] = min(4, len(mfmas) - mi)
+                mi += mfmasAfter[si]
+            elif st == LR_SLOT and nextSt != LR_SLOT and nextSt != WAITLR_SLOT:
+                # Last LR but no WAIT_LR follows — still insert 1
+                mfmasAfter[si] = min(1, len(mfmas) - mi)
+                mi += mfmasAfter[si]
+            elif st == WAITLR_SLOT and nextSt == SYNC_SLOT:
+                # 1 MFMA between WAIT_LR and SYNC
+                mfmasAfter[si] = min(1, len(mfmas) - mi)
+                mi += mfmasAfter[si]
+
+        # Pass 2: spread remaining MFMAs evenly between GR slots
+        grIndices = [si for si in range(numSlots) if slotTypes[si] == GR_SLOT]
+        remaining = len(mfmas) - mi
+        if remaining > 0 and grIndices:
+            base = remaining // len(grIndices)
+            extra = remaining % len(grIndices)
+            for gi, si in enumerate(grIndices):
+                count = base + (1 if gi < extra else 0)
+                mfmasAfter[si] += count
+                mi += count
+
+        # Assemble final output
         result = Module()
-        numMfmas = len(mfmas)
-        numOthers = len(others)
-        baseCount = numOthers // numMfmas
-        extra = numOthers % numMfmas
-        otherIdx = 0
-        for mi, mfma in enumerate(mfmas):
-            result.add(mfma)
-            count = baseCount + (1 if mi < extra else 0)
-            for _ in range(count):
-                result.add(others[otherIdx])
-                otherIdx += 1
+        mfmaIdx = 0
+
+        # Leading MFMAs: any unassigned MFMAs go before the first slot
+        leadingMfmas = len(mfmas) - mi
+        for _ in range(leadingMfmas):
+            result.add(mfmas[mfmaIdx])
+            mfmaIdx += 1
+
+        for si in range(numSlots):
+            for inst in slots[si]:
+                result.add(inst)
+            for _ in range(mfmasAfter[si]):
+                if mfmaIdx < len(mfmas):
+                    result.add(mfmas[mfmaIdx])
+                    mfmaIdx += 1
+
+        # Any remaining MFMAs at the end
+        while mfmaIdx < len(mfmas):
+            result.add(mfmas[mfmaIdx])
+            mfmaIdx += 1
 
         return result
 
@@ -1014,7 +1106,7 @@ class SubtileBasedScheduler:
         for pss in steps:
             for dus in pss.subIterKSteps:
                 subModule, lastLRmt = self._emitSubIterK(writer, kernel, pss, dus, lastLRmt)
-                subModule = self.interleaveInstructions(subModule)
+                subModule = self.instructionSchedule(subModule)
                 module.add(subModule)
         return module
 
