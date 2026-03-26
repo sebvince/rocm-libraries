@@ -182,8 +182,8 @@ if __name__ == "__main__":
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
     # 2x2 partition grid
-    lsgA = tiA.localSubtileGrid[0]
-    lsgB = tiB.localSubtileGrid[0]
+    lsgA = tiA.localSubtileGrid[0]//2
+    lsgB = tiB.localSubtileGrid[0]//2
 
     cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
                           VGPRTileReUseStrategy.ACROSS_SUBGROUP,

@@ -457,7 +457,16 @@ class SubtileBasedScheduler:
                 splitB = (len(totalGR_B) + 1) // 2
                 gr0_A, gr1_A = totalGR_A[:splitA], totalGR_A[splitA:]
                 gr0_B, gr1_B = totalGR_B[:splitB], totalGR_B[splitB:]
-                isLastPartition = (pi == numPartitions - 1)
+
+                # lastForMT: true when this is the last GR for this MT iteration
+                # (next partition with GRs has a different mtIteration, or no more GRs)
+                isLastForThisMT = True
+                for fpi in range(pi + 1, numPartitions):
+                    fgr = self.partitionGRs[fpi]
+                    if fgr.subtileA or fgr.subtileB:
+                        if fgr.mtIteration == gr.mtIteration:
+                            isLastForThisMT = False
+                        break
 
                 if gr0_A or gr0_B:
                     pss.subIterKSteps[0].ops.append(GROp(
@@ -468,8 +477,8 @@ class SubtileBasedScheduler:
                     pss.subIterKSteps[1].ops.append(GROp(
                         mtIteration=gr.mtIteration,
                         subtileA=gr1_A, subtileB=gr1_B,
-                        lastForMT=isLastPartition))
-                elif isLastPartition:
+                        lastForMT=isLastForThisMT))
+                elif isLastForThisMT:
                     # All GRs fit in subIterK=0, mark that one as last
                     pss.subIterKSteps[0].ops[-1] = dataclasses.replace(
                         pss.subIterKSteps[0].ops[-1], lastForMT=True)
@@ -557,11 +566,15 @@ class SubtileBasedScheduler:
     # ── Reuse strategies ─────────────────────────────────────
 
     def _releaseUnusedAfterPartition(self, partitionIdx: int):
-        """ACROSS_SUBGROUP: release tiles not appearing in any future partition."""
+        """ACROSS_SUBGROUP: release tiles not appearing in any future partition.
+        Partition 0's tiles are always considered "future" because the wrap-around
+        LR at the end of the loop loads back into partition 0's vgprTile IDs."""
         currentPartition = self.partitions[partitionIdx]
 
-        futureA: Set[int] = set()
-        futureB: Set[int] = set()
+        # Include partition 0 in the future set — the wrap-around LR needs
+        # those tiles to still be allocated so it reuses the same vgprTile IDs.
+        futureA: Set[int] = set(self.partitions[0].tileAIndices)
+        futureB: Set[int] = set(self.partitions[0].tileBIndices)
         for pi in range(partitionIdx + 1, len(self.partitions)):
             futureA.update(self.partitions[pi].tileAIndices)
             futureB.update(self.partitions[pi].tileBIndices)
@@ -702,19 +715,18 @@ class SubtileBasedScheduler:
 
 
     def _buildNGLL(self) -> List[PartitionSchedule]:
-        """NGLL (Non Global Load Loop): mainloop without GR ops and their associated SyncOps."""
+        """NGLL (Non Global Load Loop): mainloop without GR(n+2) and GR_INC."""
         ngll = []
         for pss in self.mainloopSteps:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
             for dus in pss.subIterKSteps:
                 newDus = SubIterKSchedule(subIterK=dus.subIterK, conflict=dus.conflict)
                 for op in dus.ops:
-                    if isinstance(op, GROp):
+                    if isinstance(op, GROp) and op.mtIteration == "n+2":
                         continue
                     if isinstance(op, GR_INCOp):
                         continue
                     if isinstance(op, WaitGROp):
-                        # No new GRs in NGLL — just draining the last inflight GR
                         op = WaitGROp(mtIteration=op.mtIteration,
                                     subtileA=op.subtileA, subtileB=op.subtileB,
                                     inflightLoadsA=0, inflightLoadsB=0)
@@ -724,19 +736,36 @@ class SubtileBasedScheduler:
         return ngll
 
     def _buildNLL(self) -> List[PartitionSchedule]:
-        """NLL (Non Load Loop): mainloop without GR, LR(n+1), and their associated WAITs/SyncOps."""
+        """NLL (No Load Loop): mainloop without GR, GR_INC, LR_INC, LR(n+1),
+        WaitGR(n+1) and their associated SyncOps. Keeps WaitGR(n) and its SYNC."""
         nll = []
         for pss in self.mainloopSteps:
             newPss = PartitionSchedule(partitionId=pss.partitionId)
             for dus in pss.subIterKSteps:
                 newDus = SubIterKSchedule(subIterK=dus.subIterK, conflict=dus.conflict)
-                newDus.ops = [op for op in dus.ops
-                              if not isinstance(op, GROp)
-                              and not isinstance(op, GR_INCOp)
-                              and not isinstance(op, SyncOp)
-                              and not isinstance(op, LR_INCOp)
-                              and not isinstance(op, WaitGROp)
-                              and not (isinstance(op, LROp) and op.mtIteration == "n+1")]
+                ops = dus.ops
+                for i, op in enumerate(ops):
+                    if isinstance(op, (GROp, GR_INCOp, LR_INCOp)):
+                        continue
+                    if isinstance(op, LROp) and op.mtIteration == "n+1":
+                        continue
+                    if isinstance(op, WaitGROp):
+                        if op.mtIteration == "n+1":
+                            continue
+                        op = WaitGROp(mtIteration=op.mtIteration,
+                                    subtileA=op.subtileA, subtileB=op.subtileB,
+                                    inflightLoadsA=0, inflightLoadsB=0)
+                    if isinstance(op, SyncOp):
+                        # Skip SyncOps associated with removed ops:
+                        # - SyncOp followed by a GROp (barrier before GR writes)
+                        # - SyncOp preceded by a WaitGROp(n+1) (barrier after GR wait)
+                        nextOp = ops[i + 1] if i + 1 < len(ops) else None
+                        prevOp = ops[i - 1] if i > 0 else None
+                        if isinstance(nextOp, GROp):
+                            continue
+                        if isinstance(prevOp, WaitGROp) and prevOp.mtIteration == "n+1":
+                            continue
+                    newDus.ops.append(op)
                 # Remove orphaned WAIT_LR when no LR remains in this subIterK
                 hasLR = any(isinstance(op, LROp) for op in newDus.ops)
                 if not hasLR:
