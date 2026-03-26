@@ -351,7 +351,7 @@ class SubtileBasedScheduler:
         preloopOps.append(SyncOp(comment="Barrier: wait for GR data before LR"))
         preloopOps.extend(lrOps)
         preloopOps.append(WaitLROp())
-        preloopOps.append(SkipOp(compare="EQ", value=1, target="NLL"))
+        preloopOps.append(SkipOp(compare="LE", value=1, target="NLL"))
         mt1Complete = (set(preloadMT1_A) == set(allA) and set(preloadMT1_B) == set(allB))
         preloopOps.append(GROp(mtIteration="1",
                                subtileA=preloadMT1_A, subtileB=preloadMT1_B,
@@ -712,8 +712,6 @@ class SubtileBasedScheduler:
                     if isinstance(op, GROp):
                         continue
                     if isinstance(op, GR_INCOp):
-                        continue
-                    if isinstance(op, SyncOp):
                         continue
                     if isinstance(op, WaitGROp):
                         # No new GRs in NGLL — just draining the last inflight GR
