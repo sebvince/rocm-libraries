@@ -458,15 +458,33 @@ class SubtileBasedScheduler:
                 gr0_A, gr1_A = totalGR_A[:splitA], totalGR_A[splitA:]
                 gr0_B, gr1_B = totalGR_B[:splitB], totalGR_B[splitB:]
 
-                # lastForMT: true when this is the last GR for this MT iteration
-                # (next partition with GRs has a different mtIteration, or no more GRs)
-                isLastForThisMT = True
-                for fpi in range(pi + 1, numPartitions):
-                    fgr = self.partitionGRs[fpi]
-                    if fgr.subtileA or fgr.subtileB:
-                        if fgr.mtIteration == gr.mtIteration:
+                # lastForMT: true for the last GR that completes a full MT load
+                # within this loop iteration. One GR_INC per loop iteration.
+                # - For n+1 GRs: true when no more n+1 GRs follow.
+                # - For n+2 GRs: true only when there are no n+1 GRs at all
+                #   (1 partition case where n+2 loads all subtiles in one shot).
+                #   Otherwise n+2 is partial and continues in the next iteration.
+                isLastForThisMT = False
+                if gr.mtIteration == "n+1":
+                    isLastForThisMT = True
+                    for fpi in range(pi + 1, numPartitions):
+                        fgr = self.partitionGRs[fpi]
+                        if (fgr.subtileA or fgr.subtileB) and fgr.mtIteration == "n+1":
                             isLastForThisMT = False
-                        break
+                            break
+                elif gr.mtIteration == "n+2":
+                    # n+2 gets GR_INC only if no n+1 GRs exist (single partition)
+                    hasN1 = any((self.partitionGRs[p].subtileA or self.partitionGRs[p].subtileB)
+                                and self.partitionGRs[p].mtIteration == "n+1"
+                                for p in range(numPartitions))
+                    if not hasN1:
+                        # Check this is the last n+2 GR
+                        isLastForThisMT = True
+                        for fpi in range(pi + 1, numPartitions):
+                            fgr = self.partitionGRs[fpi]
+                            if (fgr.subtileA or fgr.subtileB) and fgr.mtIteration == "n+2":
+                                isLastForThisMT = False
+                                break
 
                 if gr0_A or gr0_B:
                     pss.subIterKSteps[0].ops.append(GROp(
