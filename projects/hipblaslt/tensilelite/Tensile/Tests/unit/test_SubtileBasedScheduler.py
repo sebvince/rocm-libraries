@@ -1,3 +1,5 @@
+import io
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from Tensile.Components.SubtileBasedKernel import TileInfo
@@ -19,7 +21,7 @@ def _mock_dtype(num_bytes=2):
     mock.numBytes.return_value = num_bytes
     return mock
 
-def create_kernel():
+def create_kernel(MT0=64, MT1=64):
     dtype = _mock_dtype(2)
     problemType = {
         "DataTypeA": dtype,
@@ -66,9 +68,11 @@ def create_writer_with_tiles(kernel, tiA, tiB):
 
 
 def test_half_prefetch_across_subgroup_column_major():
-    kernel = create_kernel()
+    MT0=MT1=64
+    kernel = create_kernel(MT0,MT1)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
+    # 2x2 partition grid
     lsgA = tiA.localSubtileGrid[0]
     lsgB = tiB.localSubtileGrid[0]
 
@@ -83,27 +87,135 @@ def test_half_prefetch_across_subgroup_column_major():
     assert len(s.nllSteps)      > 0
 
     writer = create_writer_with_tiles(kernel, tiA, tiB)
-    s.generateCode(writer, kernel)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        s.printSchedule()
+    actual = buf.getvalue()
+
+    expected = """\
+SubtileGridA=2, SubtileGridB=2
+Partition grid: 1 x 1
+Partition size: 2 x 2
+Prefetch: HALF_PREFETCH
+Reuse: ACROSS_SUBGROUP
+hasDuplicatedReads: False
+needsUnrolling: False
+totalVGPRTiles: 8 (32 VGPRs)
+
+Ordering grid (COLUMN_MAJOR):
+   0
+
+PRELOOP:
+  GR (MT 0):  A: [0, 1]  B: [0, 1]
+  GR_INC
+  WAIT_GR (MT 0) A: [0, 1]  B: [0, 1] — inflight GRs A=0 B=0
+  SYNC
+  LR (MT 0, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
+  WAIT_LR
+  SKIP_IF_LE(1, NLL)
+  GR (MT 1):  A: [0, 1]  B: [0, 1]
+  GR_INC
+  SKIP_IF_LE(2, NGLL)
+
+MAINLOOP:
+  Partition 0:
+    subIterK=0:
+      MFMAs (MT n, subIterK 0):
+        - [(0, 0), (0, 1), (1, 0), (1, 1)]
+        - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
+      LR (MT n, subIterK 1) A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
+      WAIT_LR
+      SYNC
+      GR (MT n+2):  A: [0]  B: [0]
+    subIterK=1:
+      MFMAs (MT n, subIterK 1):
+        - [(0, 0), (0, 1), (1, 0), (1, 1)]
+        - USING  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
+      GR (MT n+2):  A: [1]  B: [1]
+      GR_INC
+      WAIT_GR (MT n+1) A: [0, 1]  B: [0, 1] — inflight GRs A=2 B=2
+      SYNC
+      LR_INC
+      LR (MT n+1, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
+      WAIT_LR
+
+NGLL (No Global Load Loop):
+  Partition 0:
+    subIterK=0:
+      MFMAs (MT n, subIterK 0):
+        - [(0, 0), (0, 1), (1, 0), (1, 1)]
+        - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
+      LR (MT n, subIterK 1) A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
+      WAIT_LR
+      SYNC
+    subIterK=1:
+      MFMAs (MT n, subIterK 1):
+        - [(0, 0), (0, 1), (1, 0), (1, 1)]
+        - USING  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
+      WAIT_GR (MT n+1) A: [0, 1]  B: [0, 1] — inflight GRs A=0 B=0
+      SYNC
+      LR_INC
+      LR (MT n+1, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
+      WAIT_LR
+
+NLL (No Load Loop):
+  Partition 0:
+    subIterK=0:
+      MFMAs (MT n, subIterK 0):
+        - [(0, 0), (0, 1), (1, 0), (1, 1)]
+        - USING  A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
+      LR (MT n, subIterK 1) A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
+      WAIT_LR
+    subIterK=1:
+      MFMAs (MT n, subIterK 1):
+        - [(0, 0), (0, 1), (1, 0), (1, 1)]
+        - USING  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
+"""
+
+    assert actual == expected
 
 
 if __name__ == "__main__":
-    kernel = create_kernel()
+    MT0=MT1=64
+    kernel = create_kernel(MT0,MT1)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
+    # 2x2 partition grid
     lsgA = tiA.localSubtileGrid[0]
     lsgB = tiB.localSubtileGrid[0]
 
-    configs = [
-        # (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-        #     SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
-        (f"lsg {lsgA}x{lsgB}, group {lsgA//2}x{lsgB//2}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
-            SchedulerConfig(lsgA//2, lsgB//2, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
-    ]
+    cfg = SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH,
+                          VGPRTileReUseStrategy.ACROSS_SUBGROUP,
+                          SubgroupOrdering.COLUMN_MAJOR)
+    s = SubtileBasedScheduler(tiA, tiB, cfg)
 
-    for name, cfg in configs:
-        print(f"=== {name} ===")
-        s = SubtileBasedScheduler(tiA, tiB, cfg)
-        s.printSchedule()
-        writer = create_writer_with_tiles(kernel, tiA, tiB)
-        # s.generateCode(writer, kernel)
-        # print()
+    assert len(s.preloopSteps)  > 0
+    assert len(s.mainloopSteps) > 0
+    assert len(s.ngllSteps)     > 0
+    assert len(s.nllSteps)      > 0
+
+    writer = create_writer_with_tiles(kernel, tiA, tiB)
+
+    s.printSchedule()
+
+    # kernel = create_kernel()
+    # tiA = TileInfo('A', kernel)
+    # tiB = TileInfo('B', kernel)
+    # lsgA = tiA.localSubtileGrid[0]
+    # lsgB = tiB.localSubtileGrid[0]
+
+    # configs = [
+    #     # (f"lsg {lsgA}x{lsgB}, group {lsgA}x{lsgB}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+    #     #     SchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+    #     (f"lsg {lsgA}x{lsgB}, group {lsgA//2}x{lsgB//2}, HALF_PREFETCH, ACROSS_SUBGROUP, COLUMN_MAJOR",
+    #         SchedulerConfig(lsgA//2, lsgB//2, PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP, SubgroupOrdering.COLUMN_MAJOR)),
+    # ]
+
+    # for name, cfg in configs:
+    #     print(f"=== {name} ===")
+    #     s = SubtileBasedScheduler(tiA, tiB, cfg)
+    #     s.printSchedule()
+    #     writer = create_writer_with_tiles(kernel, tiA, tiB)
+    #     # s.generateCode(writer, kernel)
+    #     # print()

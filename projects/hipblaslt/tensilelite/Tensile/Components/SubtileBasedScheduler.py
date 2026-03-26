@@ -737,6 +737,10 @@ class SubtileBasedScheduler:
                               and not isinstance(op, LR_INCOp)
                               and not isinstance(op, WaitGROp)
                               and not (isinstance(op, LROp) and op.mtIteration == "n+1")]
+                # Remove orphaned WAIT_LR when no LR remains in this subIterK
+                hasLR = any(isinstance(op, LROp) for op in newDus.ops)
+                if not hasLR:
+                    newDus.ops = [op for op in newDus.ops if not isinstance(op, WaitLROp)]
                 newPss.subIterKSteps.append(newDus)
             nll.append(newPss)
         return nll
