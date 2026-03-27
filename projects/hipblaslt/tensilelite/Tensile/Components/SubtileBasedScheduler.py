@@ -656,46 +656,53 @@ class SubtileBasedScheduler:
                 return int(mt[2:])
             return None
 
-        def _countInflightSubtileLoads(waitOpIndex, waitMT):
+        def _countInflightSubtileLoads(waitOpIndex, waitMT, waitSubtileA, waitSubtileB):
             """Count inflight subtile loads by walking backwards through
-            the mainloop from the WAIT_GR position.
+            the mainloop from the WAIT_GR position until we find the GR
+            that originally issued the waited subtiles.
 
-            Only counts GR ops whose effective MT == waitMT + 1, as
-            these are loads for the next iteration that are genuinely
-            still in-flight.  Loads with effective MT == waitMT were
-            already consumed by intermediate WAIT_GRs in the same
-            loop iteration.
+            Walk upward from the WAIT_GR. Every GR encountered increments
+            the inflight count. When we find a GR whose (shifted) MT and
+            subtile sets match the WAIT target, we stop (without counting it).
 
-            When wrapping from the top of the mainloop to the bottom
-            (previous iteration), MT iterations are shifted by -1
-            (e.g. n+2 becomes n+1), so we match waitMT + 2 in that
-            phase.
+            When wrapping from the start of the mainloop to the end
+            (previous iteration), MT iterations shift down by 1
+            (e.g. n+2 becomes n+1, n+1 becomes n).
             """
             waitOffset = _parseMTOffset(waitMT)
             if waitOffset is None:
                 return 0, 0
 
-            targetBeforeWrap = waitOffset + 1
-            targetAfterWrap = waitOffset + 2
+            targetA = set(waitSubtileA)
+            targetB = set(waitSubtileB)
+
+            # Split grEvents into before-wait and after-wait (for wrap)
+            before = [(mt, a, b) for (idx, mt, a, b) in grEvents if idx < waitOpIndex]
+            after  = [(mt, a, b) for (idx, mt, a, b) in grEvents if idx >= waitOpIndex]
 
             totalA = 0
             totalB = 0
 
-            for (stepIdx, grMT, grA, grB) in grEvents:
+            # Walk backwards through events before the WAIT (no MT shift)
+            for (grMT, grA, grB) in reversed(before):
                 grOffset = _parseMTOffset(grMT)
                 if grOffset is None:
                     continue
-                if stepIdx < waitOpIndex:
-                    # Before wrap: count GR ops with MT = waitMT + 1
-                    if grOffset == targetBeforeWrap:
-                        totalA += len(grA)
-                        totalB += len(grB)
-                else:
-                    # After wrap (previous iteration): MT shifted by -1,
-                    # so match original MT = waitMT + 2
-                    if grOffset == targetAfterWrap:
-                        totalA += len(grA)
-                        totalB += len(grB)
+                if grOffset == waitOffset and grA == targetA and grB == targetB:
+                    return totalA, totalB
+                totalA += len(grA)
+                totalB += len(grB)
+
+            # Wrap: walk backwards from end of mainloop (shift MT by -1)
+            for (grMT, grA, grB) in reversed(after):
+                grOffset = _parseMTOffset(grMT)
+                if grOffset is None:
+                    continue
+                shiftedOffset = grOffset - 1
+                if shiftedOffset == waitOffset and grA == targetA and grB == targetB:
+                    return totalA, totalB
+                totalA += len(grA)
+                totalB += len(grB)
 
             return totalA, totalB
 
@@ -704,11 +711,6 @@ class SubtileBasedScheduler:
         pendingB = set()
         lastLRmt = None
         opIdx = 0
-        # Track loads consumed by earlier WAIT_GRs in this iteration,
-        # keyed by the MT iteration they wait for. Each WAIT_GR drains
-        # its source loads, reducing the effective inflight count for
-        # subsequent WAIT_GRs targeting the same MT.
-        consumedByPriorWaits: Dict[str, Tuple[int, int]] = {}  # mt -> (consumedA, consumedB)
         for pss in self.mainloopSteps:
             gr = self.partitionGRs[pss.partitionId]
             pendingA |= gr.subtileA
@@ -734,15 +736,12 @@ class SubtileBasedScheduler:
                     if waitA or waitB:
                         # WAIT_GR position: after all original ops in this subIterK step
                         waitOpIdx = opIdx + numOrigOps
-                        rawInflightA, rawInflightB = _countInflightSubtileLoads(waitOpIdx, lrOp.mtIteration)
-                        priorA, priorB = consumedByPriorWaits.get(lrOp.mtIteration, (0, 0))
-                        inflightCountA = rawInflightA - priorA
-                        inflightCountB = rawInflightB - priorB
+                        inflightCountA, inflightCountB = _countInflightSubtileLoads(
+                            waitOpIdx, lrOp.mtIteration, sorted(waitA), sorted(waitB))
                         waitGROp = WaitGROp(
                             mtIteration=lrOp.mtIteration,
                             subtileA=sorted(waitA), subtileB=sorted(waitB),
                             inflightLoadsA=inflightCountA, inflightLoadsB=inflightCountB)
-                        consumedByPriorWaits[lrOp.mtIteration] = (priorA + len(waitA), priorB + len(waitB))
                         pendingA -= waitA
                         pendingB -= waitB
 
