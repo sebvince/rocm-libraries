@@ -990,40 +990,29 @@ class SubtileBasedScheduler:
                     pool.checkIn(val)
         self.vgprTiles = []
 
-    def emitMFMAs(self, writer, kernel, steps, dtileInfo):
-        """Emit MFMA instructions for a list of PartitionSchedules."""
-
+    def emitMFMA(self, writer, kernel, op, dtileInfo):
+        """Emit MFMA instructions for a single MFMAOp."""
         module = Module()
-        for pss in steps:
-            for dus in pss.subIterKSteps:
-                for op in dus.ops:
-                    if not isinstance(op, MFMAOp):
-                        continue
-                    for (a, b) in op.subtiles:
-                        aTile = self.vgprTiles[op.vgprTileMapA[a]]
-                        bTile = self.vgprTiles[op.vgprTileMapB[b]]
-                        dTile = dtileInfo.vgprTiles[a + b * dtileInfo.localMMATileGrid[0]]
-                        module.add(emitMfmaInstruction(
-                            writer, kernel, aTile, bTile, dTile, dTile,
-                            f"MFMA C[{a},{b}] += A[{a},subIterK{op.subIterK}] * B[{b},subIterK{op.subIterK}]"))
+        for (a, b) in op.subtiles:
+            aTile = self.vgprTiles[op.vgprTileMapA[a]]
+            bTile = self.vgprTiles[op.vgprTileMapB[b]]
+            dTile = dtileInfo.vgprTiles[a + b * dtileInfo.localMMATileGrid[0]]
+            module.add(emitMfmaInstruction(
+                writer, kernel, aTile, bTile, dTile, dTile,
+                f"MFMA C[{a},{b}] += A[{a},subIterK{op.subIterK}] * B[{b},subIterK{op.subIterK}]"))
         return module
 
-    def emitLRs(self, writer, kernel, steps):
-        """Emit LR (Local Read) ds_load instructions for a list of PartitionSchedules."""
+    def emitLR(self, writer, kernel, op):
+        """Emit LR (Local Read) ds_load instructions for a single LROp."""
         module = Module()
-        for pss in steps:
-            for dus in pss.subIterKSteps:
-                for op in dus.ops:
-                    if not isinstance(op, LROp):
-                        continue
-                    for tA, vgprTileId in op.lrLoadA.items():
-                        dstTile = self.vgprTiles[vgprTileId]
-                        module.add(emitSingleDsRead(
-                            self.tileInfoA, tA, op.subIterK, dstTile))
-                    for tB, vgprTileId in op.lrLoadB.items():
-                        dstTile = self.vgprTiles[vgprTileId]
-                        module.add(emitSingleDsRead(
-                            self.tileInfoB, tB, op.subIterK, dstTile))
+        for tA, vgprTileId in op.lrLoadA.items():
+            dstTile = self.vgprTiles[vgprTileId]
+            module.add(emitSingleDsRead(
+                self.tileInfoA, tA, op.subIterK, dstTile))
+        for tB, vgprTileId in op.lrLoadB.items():
+            dstTile = self.vgprTiles[vgprTileId]
+            module.add(emitSingleDsRead(
+                self.tileInfoB, tB, op.subIterK, dstTile))
         return module
 
     def emitWaitGR(self, inflightLoadsA, inflightLoadsB):
@@ -1040,27 +1029,13 @@ class SubtileBasedScheduler:
                             comment=f"Wait GR: A={inflightLoadsA} B={inflightLoadsB} => vlcnt={grCnt}"))
         return module
 
-    def emitGRs(self, writer, kernel, steps):
-        """Emit GR (Global Read) buffer_load instructions for a list of PartitionSchedules.
-
-        For each GROp, expands sId0 indices to all sId1 (K-dimension) values,
-        with deduplication via globalReadMap tracking.
-        """
+    def emitGR(self, op):
+        """Emit GR (Global Read) buffer_load instructions for a single GROp."""
         module = Module()
-        grTrackerA = set()
-        grTrackerB = set()
-        for pss in steps:
-            for siks in pss.subIterKSteps:
-                for op in siks.ops:
-                    if not isinstance(op, GROp):
-                        continue
-                    for subtileList, tileInfo, grTracker in [(op.subtileA, self.tileInfoA, grTrackerA),
-                                                            (op.subtileB, self.tileInfoB, grTrackerB)]:
-                        for sId0 in subtileList:
-                            grIds = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, 0)].globalReadMap
-                            if not set(grIds).issubset(grTracker):
-                                grTracker.update(grIds)
-                                module.add(emitSingleBufferLoad(tileInfo, sId0, 0))
+        for subtileList, tileInfo in [(op.subtileA, self.tileInfoA),
+                                      (op.subtileB, self.tileInfoB)]:
+            for sId0 in subtileList:
+                module.add(emitSingleBufferLoad(tileInfo, sId0, 0))
         return module
 
     def _emitSubIterK(self, writer, kernel, pss, dus):
@@ -1070,20 +1045,14 @@ class SubtileBasedScheduler:
         module.addComment0(f"Partition {pss.partitionId}: subIterK={dus.subIterK}")
         for op in dus.ops:
             if isinstance(op, GROp):
-                oneStep = [PartitionSchedule(
-                    partitionId=pss.partitionId,
-                    subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
-                module.add(self.emitGRs(writer, kernel, oneStep))
+                module.add(self.emitGR(op))
             elif isinstance(op, GR_INCOp):
                 module.add(globalReadPtrUpdates('A', writer, kernel))
                 module.add(globalReadPtrUpdates('B', writer, kernel))
                 module.add(globalReadLDSBufferSwap('A', writer, kernel))
                 module.add(globalReadLDSBufferSwap('B', writer, kernel))
             elif isinstance(op, MFMAOp):
-                oneStep = [PartitionSchedule(
-                    partitionId=pss.partitionId,
-                    subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
-                module.add(self.emitMFMAs(writer, kernel, oneStep, dtileInfo))
+                module.add(self.emitMFMA(writer, kernel, op, dtileInfo))
             elif isinstance(op, WaitGROp):
                 module.add(self.emitWaitGR(op.inflightLoadsA, op.inflightLoadsB))
             elif isinstance(op, WaitLROp):
@@ -1094,10 +1063,7 @@ class SubtileBasedScheduler:
                 module.add(localReadLDSBufferSwap('A', writer, kernel))
                 module.add(localReadLDSBufferSwap('B', writer, kernel))
             elif isinstance(op, LROp):
-                oneStep = [PartitionSchedule(
-                    partitionId=pss.partitionId,
-                    subIterKSteps=[SubIterKSchedule(subIterK=dus.subIterK, ops=[op])])]
-                module.add(self.emitLRs(writer, kernel, oneStep))
+                module.add(self.emitLR(writer, kernel, op))
             elif isinstance(op, SkipOp):
                 skipLabel = Label(f"SkipTo{op.target}", "")
                 cmpMap = {"EQ": SCmpEQU32, "LE": SCmpLeU32}
