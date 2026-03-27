@@ -339,11 +339,25 @@ class SubtileBasedScheduler:
             lrOps.append(LROp(mtIteration="0", subIterK=sik,
                               lrLoadA=lrLoadA, lrLoadB=lrLoadB))
 
-        # Build preloop steps: GR(MT0), WAIT, LR(MT0), SKIP guards, GR(MT1)
+        # Build preloop steps: GR(MT0) split by partition, WAIT, LR(MT0), SKIP guards, GR(MT1)
         preloopOps: List[ScheduleOp] = []
-        preloopOps.append(GROp(mtIteration="0",
-                               subtileA=allA, subtileB=allB,
-                               lastForMT=True))
+        # Split MT 0 GR by partition with dedup (same order as mainloop)
+        loadedA: Set[int] = set()
+        loadedB: Set[int] = set()
+        for partition in self.partitions:
+            grA = sorted(set(partition.tileAIndices) - loadedA)
+            grB = sorted(set(partition.tileBIndices) - loadedB)
+            loadedA.update(partition.tileAIndices)
+            loadedB.update(partition.tileBIndices)
+            if grA or grB:
+                preloopOps.append(GROp(mtIteration="0",
+                                       subtileA=grA, subtileB=grB,
+                                       lastForMT=False))
+        # Mark the last MT 0 GR as lastForMT
+        for i in range(len(preloopOps) - 1, -1, -1):
+            if isinstance(preloopOps[i], GROp):
+                preloopOps[i] = dataclasses.replace(preloopOps[i], lastForMT=True)
+                break
         preloopOps.append(GR_INCOp())
         preloopOps.append(WaitGROp(mtIteration="0",
                                  subtileA=allA, subtileB=allB,
@@ -623,45 +637,85 @@ class SubtileBasedScheduler:
             MFMAs → GR(n+2) → WAIT_GR → SyncOp → LR(n+1) → WAIT_LR
         """
         # ── Pass 3 prep: build GR events for inflight counting ──
+        # Each entry: (opIndex, mtIteration, subtileA_set, subtileB_set)
+        # Also record the opIndex of each WAIT_GR candidate (subIterK==0 LR ops).
         grEvents = []
-        si = 0
+        opIdx = 0
         for pss in self.mainloopSteps:
             for dus in pss.subIterKSteps:
                 for op in dus.ops:
                     if isinstance(op, GROp):
-                        grEvents.append((si, pss.partitionId, dus.subIterK,
-                                         len(op.subtileA) + len(op.subtileB),
+                        grEvents.append((opIdx, op.mtIteration,
                                          set(op.subtileA), set(op.subtileB)))
-                si += 1
+                    opIdx += 1
 
-        def _countInflightGR(waitStepIndex, waitA, waitB):
-            sourceGRIdx = None
-            for evi, (si, gi, sik, cnt, grA, grB) in enumerate(grEvents):
-                if (waitA and waitA & grA) or (waitB and waitB & grB):
-                    sourceGRIdx = evi
-                    break
-            if sourceGRIdx is None:
-                return None, None
+        def _parseMTOffset(mt: str) -> Optional[int]:
+            if mt == "n":
+                return 0
+            if mt.startswith("n+"):
+                return int(mt[2:])
+            return None
+
+        def _countInflightSubtileLoads(waitOpIndex, waitMT):
+            """Count inflight subtile loads by walking backwards through
+            the mainloop from the WAIT_GR position.
+
+            Only counts GR ops whose effective MT == waitMT + 1, as
+            these are loads for the next iteration that are genuinely
+            still in-flight.  Loads with effective MT == waitMT were
+            already consumed by intermediate WAIT_GRs in the same
+            loop iteration.
+
+            When wrapping from the top of the mainloop to the bottom
+            (previous iteration), MT iterations are shifted by -1
+            (e.g. n+2 becomes n+1), so we match waitMT + 2 in that
+            phase.
+            """
+            waitOffset = _parseMTOffset(waitMT)
+            if waitOffset is None:
+                return 0, 0
+
+            targetBeforeWrap = waitOffset + 1
+            targetAfterWrap = waitOffset + 2
+
             totalA = 0
             totalB = 0
-            sourceStepIdx = grEvents[sourceGRIdx][0]
-            for (si, gi, sik, cnt, grA, grB) in grEvents:
-                if si >= sourceStepIdx or si < waitStepIndex:
-                    totalA += len(grA)
-                    totalB += len(grB)
+
+            for (stepIdx, grMT, grA, grB) in grEvents:
+                grOffset = _parseMTOffset(grMT)
+                if grOffset is None:
+                    continue
+                if stepIdx < waitOpIndex:
+                    # Before wrap: count GR ops with MT = waitMT + 1
+                    if grOffset == targetBeforeWrap:
+                        totalA += len(grA)
+                        totalB += len(grB)
+                else:
+                    # After wrap (previous iteration): MT shifted by -1,
+                    # so match original MT = waitMT + 2
+                    if grOffset == targetAfterWrap:
+                        totalA += len(grA)
+                        totalB += len(grB)
+
             return totalA, totalB
 
         # ── Insert WAIT_LR, WAIT_GR, SyncOp, GR_INC, LR_INC and reorder ──
         pendingA = set()
         pendingB = set()
         lastLRmt = None
-        si = 0
+        opIdx = 0
+        # Track loads consumed by earlier WAIT_GRs in this iteration,
+        # keyed by the MT iteration they wait for. Each WAIT_GR drains
+        # its source loads, reducing the effective inflight count for
+        # subsequent WAIT_GRs targeting the same MT.
+        consumedByPriorWaits: Dict[str, Tuple[int, int]] = {}  # mt -> (consumedA, consumedB)
         for pss in self.mainloopSteps:
             gr = self.partitionGRs[pss.partitionId]
             pendingA |= gr.subtileA
             pendingB |= gr.subtileB
 
             for dus in pss.subIterKSteps:
+                numOrigOps = len(dus.ops)
                 # Extract ops by type from pass 1
                 mfmaOps = [op for op in dus.ops if isinstance(op, MFMAOp)]
                 lrOps = [op for op in dus.ops if isinstance(op, LROp)]
@@ -678,11 +732,17 @@ class SubtileBasedScheduler:
                     waitA = set(lrOp.lrLoadA.keys()) & pendingA
                     waitB = set(lrOp.lrLoadB.keys()) & pendingB
                     if waitA or waitB:
-                        inflightCountA, inflightCountB = _countInflightGR(si, waitA, waitB)
+                        # WAIT_GR position: after all original ops in this subIterK step
+                        waitOpIdx = opIdx + numOrigOps
+                        rawInflightA, rawInflightB = _countInflightSubtileLoads(waitOpIdx, lrOp.mtIteration)
+                        priorA, priorB = consumedByPriorWaits.get(lrOp.mtIteration, (0, 0))
+                        inflightCountA = rawInflightA - priorA
+                        inflightCountB = rawInflightB - priorB
                         waitGROp = WaitGROp(
                             mtIteration=lrOp.mtIteration,
                             subtileA=sorted(waitA), subtileB=sorted(waitB),
                             inflightLoadsA=inflightCountA, inflightLoadsB=inflightCountB)
+                        consumedByPriorWaits[lrOp.mtIteration] = (priorA + len(waitA), priorB + len(waitB))
                         pendingA -= waitA
                         pendingB -= waitB
 
@@ -728,8 +788,8 @@ class SubtileBasedScheduler:
                     if lrOp:
                         newOps.append(WaitLROp())
 
+                opIdx += numOrigOps
                 dus.ops = newOps
-                si += 1
 
 
     def _buildNGLL(self) -> List[PartitionSchedule]:
@@ -834,7 +894,7 @@ class SubtileBasedScheduler:
         elif isinstance(op, GROp):
             print(f"{indent}GR (MT {op.mtIteration}):  A: {op.subtileA}  B: {op.subtileB}")
         elif isinstance(op, WaitGROp):
-            inflight = f" — inflight GRs A={op.inflightLoadsA} B={op.inflightLoadsB}" if op.inflightLoadsA is not None else ""
+            inflight = f" — inflight SubtileLoads A={op.inflightLoadsA} B={op.inflightLoadsB}" if op.inflightLoadsA is not None else ""
             print(f"{indent}WAIT_GR (MT {op.mtIteration}) A: {op.subtileA}  B: {op.subtileB}{inflight}")
         elif isinstance(op, WaitLROp):
             print(f"{indent}WAIT_LR")

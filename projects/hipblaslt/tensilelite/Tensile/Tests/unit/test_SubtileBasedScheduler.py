@@ -109,7 +109,7 @@ Ordering grid (COLUMN_MAJOR):
 PRELOOP:
   GR (MT 0):  A: [0, 1]  B: [0, 1]
   GR_INC
-  WAIT_GR (MT 0) A: [0, 1]  B: [0, 1] — inflight GRs A=0 B=0
+  WAIT_GR (MT 0) A: [0, 1]  B: [0, 1] — inflight SubtileLoads A=0 B=0
   SYNC
   LR (MT 0, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
   WAIT_LR
@@ -134,7 +134,7 @@ MAINLOOP:
         - USING  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
       GR (MT n+2):  A: [1]  B: [1]
       GR_INC
-      WAIT_GR (MT n+1) A: [0, 1]  B: [0, 1] — inflight GRs A=2 B=2
+      WAIT_GR (MT n+1) A: [0, 1]  B: [0, 1] — inflight SubtileLoads A=2 B=2
       SYNC
       LR_INC
       LR (MT n+1, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
@@ -153,7 +153,7 @@ NGLL (No Global Load Loop):
       MFMAs (MT n, subIterK 1):
         - [(0, 0), (0, 1), (1, 0), (1, 1)]
         - USING  A: {0: 4, 1: 5}  B: {0: 6, 1: 7}
-      WAIT_GR (MT n+1) A: [0, 1]  B: [0, 1] — inflight GRs A=0 B=0
+      WAIT_GR (MT n+1) A: [0, 1]  B: [0, 1] — inflight SubtileLoads A=0 B=0
       SYNC
       LR_INC
       LR (MT n+1, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}
@@ -198,7 +198,7 @@ if __name__ == "__main__":
     writer = create_writer_with_tiles(kernel, tiA, tiB)
 
     s.printSchedule()
-
+    s.generateCode(writer, kernel)
     # kernel = create_kernel()
     # tiA = TileInfo('A', kernel)
     # tiB = TileInfo('B', kernel)
