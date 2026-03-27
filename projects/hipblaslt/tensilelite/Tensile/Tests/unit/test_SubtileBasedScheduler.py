@@ -30,10 +30,10 @@ def create_kernel(MT0=64, MT1=64):
     }
     return {
         "DepthU": 64,
-        "MacroTileA": 64,
-        "MacroTileB": 64,
-        "MacroTile0": 64,
-        "MacroTile1": 64,
+        "MacroTileA": MT0,
+        "MacroTileB": MT1,
+        "MacroTile0": MT0,
+        "MacroTile1": MT1,
         "MatrixInstM": 16,
         "MatrixInstN": 16,
         "MatrixInstK": 32,
