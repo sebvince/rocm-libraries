@@ -1228,6 +1228,7 @@ def globalReadDoSubtile(tc, writer, kernel):
 
   return module
 
+
 def emitSingleDsRead(tileInfo, sId0, du, dstTile, interleaved = False):
   """Emit a single DSLoadB128 for one MMA tile within a subtile.
 
@@ -1237,6 +1238,7 @@ def emitSingleDsRead(tileInfo, sId0, du, dstTile, interleaved = False):
       du:        DU index within the subtile (maps to mfmaC; subtileShape[0]=1 so mfmaR=0)
       dstTile:   RegisterTileInfo — destination vgpr tile for the load
   """
+ 
   # du maps to mfmaC, mfmaR is always 0 (subtileShape[0]=1)
   mfmaId = tileInfo.getSubtileShapeLinearId(du, 0)
   addrVgpr = tileInfo.sharedVgprLROffset[mfmaId]

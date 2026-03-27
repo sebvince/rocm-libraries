@@ -1017,6 +1017,7 @@ class SubtileBasedScheduler:
 
     def emitWaitGR(self, inflightLoadsA, inflightLoadsB):
         """Emit SWaitCnt for GR (buffer_load) based on inflight GR counts.
+        WARNING: current algo won't work in all cases. TBD
 
         Args:
             inflightLoadsA: Number of A GR loads still inflight.
