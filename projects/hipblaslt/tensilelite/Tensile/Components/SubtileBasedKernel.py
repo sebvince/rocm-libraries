@@ -1227,7 +1227,7 @@ def globalReadDoSubtile(tc, writer, kernel):
 
   return module
 
-def emitSingleDsRead(tileInfo, sId0, du, dstTile):
+def emitSingleDsRead(tileInfo, sId0, du, dstTile, interleaved = False):
   """Emit a single DSLoadB128 for one MMA tile within a subtile.
 
   Args:
@@ -1241,12 +1241,15 @@ def emitSingleDsRead(tileInfo, sId0, du, dstTile):
   addrVgpr = tileInfo.sharedVgprLROffset[mfmaId]
 
   offsetStride = tileInfo.subtileSize
-  if tileInfo.loadRatioGR == 2.0:
-    offset = sId0 * offsetStride
-  elif tileInfo.loadRatioGR == 0.5:
-    offset = sId0 * 4 * offsetStride
+  if interleaved:
+    if tileInfo.loadRatioGR == 2.0:
+      offset = sId0*offsetStride
+    elif tileInfo.loadRatioGR == 0.5:
+      offset = sId0*4*offsetStride
+    else:
+      offset = sId0*2*offsetStride
   else:
-    offset = sId0 * 2 * offsetStride
+    offset = sId0*offsetStride
 
   dstVgpr = dstTile.regList.regValues[0]
   numRegs = len(dstTile.regList.regValues)
@@ -1680,7 +1683,7 @@ def mainLoop(writer, kernel):
     tiA = writer.states.a.tileInfo
     tiB = writer.states.b.tileInfo
     # cfg = SchedulerConfig(tiA.localSubtileGrid[0]//2, tiB.localSubtileGrid[0]//2,
-    cfg = SchedulerConfig(tiA.localSubtileGrid[0], tiB.localSubtileGrid[0],
+    cfg = SchedulerConfig(tiA.localSubtileGrid[0], tiB.localSubtileGrid[0]//10,
                           PrefetchMode.HALF_PREFETCH, VGPRTileReUseStrategy.ACROSS_SUBGROUP)
     scheduler = SubtileBasedScheduler(tiA, tiB, cfg)
     scheduler.allocVgprTiles(writer)
