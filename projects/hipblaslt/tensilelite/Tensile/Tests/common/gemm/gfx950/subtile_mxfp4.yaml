@@ -99,23 +99,23 @@ BenchmarkProblems:
           # Asymmetric edge cases
           - Exact: [192, 256, 1, 256]   # M edge, N full tile
           - Exact: [256, 192, 1, 256]   # M full tile, N edge
-          # Non-multiple-of-32 M,N (multiples of 16) — known failures on non-aligned sizes
-          #- Exact: [48,   48, 1, 256]   # 3*16, both M,N non-mult-of-32
-          #- Exact: [112, 176, 1, 256]   # 7*16, 11*16
-          #- Exact: [48,  128, 1, 256]   # M non-mult-of-32, N full tile
-          #- Exact: [128,  48, 1, 256]   # M full tile, N non-mult-of-32
-          #- Exact: [240, 112, 1, 256]   # 15*16, 7*16
+          # Non-multiple-of-32 M,N (multiples of 16)
+          - Exact: [48,   48, 1, 256]   # 3*16, both M,N non-mult-of-32
+          - Exact: [112, 176, 1, 256]   # 7*16, 11*16
+          - Exact: [48,  128, 1, 256]   # M non-mult-of-32, N full tile
+          - Exact: [128,  48, 1, 256]   # M full tile, N non-mult-of-32
+          - Exact: [240, 112, 1, 256]   # 15*16, 7*16
           # Even non-multiple-of-16 M,N
-          #- Exact: [10,   34, 1, 256]   # both even, neither mult-of-16
-          #- Exact: [50,  100, 1, 256]   # 50=2*25, 100=4*25
-          #- Exact: [66,  128, 1, 256]   # M even non-mult-of-16, N full tile
-          #- Exact: [128,  66, 1, 256]   # M full tile, N even non-mult-of-16
+          - Exact: [10,   34, 1, 256]   # both even, neither mult-of-16
+          - Exact: [50,  100, 1, 256]   # 50=2*25, 100=4*25
+          - Exact: [66,  128, 1, 256]   # M even non-mult-of-16, N full tile
+          - Exact: [128,  66, 1, 256]   # M full tile, N even non-mult-of-16
           # Odd M,N
-          #- Exact: [17,   33, 1, 256]   # both odd
-          #- Exact: [63,   63, 1, 256]   # both odd, just below 64
-          #- Exact: [97,  129, 1, 256]   # both odd, just above 96/128
-          #- Exact: [33,  128, 1, 256]   # M odd, N full tile
-          #- Exact: [128,  33, 1, 256]   # M full tile, N odd
+          - Exact: [17,   33, 1, 256]   # both odd
+          - Exact: [63,   63, 1, 256]   # both odd, just below 64
+          - Exact: [97,  129, 1, 256]   # both odd, just above 96/128
+          - Exact: [33,  128, 1, 256]   # M odd, N full tile
+          - Exact: [128,  33, 1, 256]   # M full tile, N odd
           - Exact: [3,     5, 1, 256]   # very small odd
 
   ########################################
@@ -169,16 +169,16 @@ BenchmarkProblems:
           - Exact: [320, 320, 1,  512]   # 5*64, edge for MT=128,192,256,384
           # Asymmetric edge case
           - Exact: [192, 256, 1,  512]   # M edge, N full tile
-          # Non-multiple-of-32 M,N (multiples of 16) — known failures on non-aligned sizes
-          #- Exact: [48,   48, 1,  512]   # 3*16, both M,N non-mult-of-32
-          #- Exact: [112, 176, 1,  512]   # 7*16, 11*16
+          # Non-multiple-of-32 M,N (multiples of 16)
+          - Exact: [48,   48, 1,  512]   # 3*16, both M,N non-mult-of-32
+          - Exact: [112, 176, 1,  512]   # 7*16, 11*16
           # Even non-multiple-of-16 M,N
-          #- Exact: [50,  100, 1,  512]   # 50=2*25, 100=4*25
-          #- Exact: [66,   66, 1,  512]   # both even, neither mult-of-16
+          - Exact: [50,  100, 1,  512]   # 50=2*25, 100=4*25
+          - Exact: [66,   66, 1,  512]   # both even, neither mult-of-16
           # Odd M,N
-          #- Exact: [17,   33, 1,  512]   # both odd
-          #- Exact: [63,   63, 1,  512]   # both odd, just below 64
-          #- Exact: [97,  129, 1,  512]   # both odd, just above 96/128
+          - Exact: [17,   33, 1,  512]   # both odd
+          - Exact: [63,   63, 1,  512]   # both odd, just below 64
+          - Exact: [97,  129, 1,  512]   # both odd, just above 96/128
 
   ########################################
   # F4SS TN — MX FP4 input, F32 output, DU = 2*MI_K = 256
@@ -231,15 +231,15 @@ BenchmarkProblems:
           # Asymmetric
           - Exact: [192, 256, 1, 256]
           - Exact: [256, 192, 1, 256]
-          # Non-multiple-of-32 M,N (multiples of 16) — known failures on non-aligned sizes
-          #- Exact: [48,   48, 1, 256]   # 3*16, both M,N non-mult-of-32
-          #- Exact: [112, 176, 1, 256]   # 7*16, 11*16
+          # Non-multiple-of-32 M,N (multiples of 16)
+          - Exact: [48,   48, 1, 256]   # 3*16, both M,N non-mult-of-32
+          - Exact: [112, 176, 1, 256]   # 7*16, 11*16
           # Even non-multiple-of-16 M,N
-          #- Exact: [50,  100, 1, 256]   # 50=2*25, 100=4*25
-          #- Exact: [66,   66, 1, 256]   # both even, neither mult-of-16
+          - Exact: [50,  100, 1, 256]   # 50=2*25, 100=4*25
+          - Exact: [66,   66, 1, 256]   # both even, neither mult-of-16
           # Odd M,N
-          #- Exact: [17,   33, 1, 256]   # both odd
-          #- Exact: [63,   63, 1, 256]   # both odd, just below 64
+          - Exact: [17,   33, 1, 256]   # both odd
+          - Exact: [63,   63, 1, 256]   # both odd, just below 64
 
   ########################################
   # FP4 TN — with bias (float32 bias vector)
