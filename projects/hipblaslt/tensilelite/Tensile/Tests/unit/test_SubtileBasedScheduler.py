@@ -211,7 +211,7 @@ MAINLOOP:
       LR (MT n+1, subtileK 0, subIterK 0) A: {0: 0, 1: 1}  B: {0: 2, 1: 3}  scaleSet=1
         before: [WaitGROp(A=1 B=1 SA=0 SB=0), SyncOp, LR_INCOp]  after: [WaitLROp]
       GR (MT n+2, subtileK 0):  A: [1]  B: [1]
-        before: [none]  after: [GR_INCOp]
+        before: [none]  after: [GRScaleOp(MT n+2), GR_INCOp]
 """
 
     assert expected in actual
@@ -632,8 +632,8 @@ def test_PGR2_256_256_fp4_instruction_schedule_exact():
         "MLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMLMMMMSSMSMGMSMMMMGMSMMMMGMSMMMMGMSMMMMGM" \
         "SMMMMGMSMMMMGMSMMMMGMMMMMMM"
     expected_sik1 = \
-        "MSSMGSMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMSMSSMSGSMSSSMSSMSSMSLMGLMS" \
-        "LMLMLMLMGLMSLMLMLMLMGLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLMLMLMLMMMMSM"
+        "MSMGMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMMMGMSMMSMSSMSGSMSSSMSSMSSMSLMGLSMS" \
+        "LMLMLMLMGLSMSLMLMLMLMGLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLSMSLMLMLMLMMMMSM"
 
     assert seq0 == expected_sik0, f"subIterK=0 mismatch:\n  got: {seq0}\n  exp: {expected_sik0}"
     assert seq1 == expected_sik1, f"subIterK=1 mismatch:\n  got: {seq1}\n  exp: {expected_sik1}"
@@ -678,6 +678,7 @@ Ordering grid (COLUMN_MAJOR):
 PRELOOP:
   GR (MT 0, subtileK 0):  A: [0, 1, 2, 3]  B: [0, 1, 2, 3]
   GR (MT 0, subtileK 1):  A: [0, 1, 2, 3]  B: [0, 1, 2, 3]
+  GR_SCALE (MT 0)
   GR_INC
   WAIT_GR (MT 0) A: [0, 1, 2, 3]  B: [0, 1, 2, 3] — inflight SubtileLoads A=0 B=0 scaleA=0 scaleB=0
   SYNC
@@ -686,6 +687,7 @@ PRELOOP:
   SKIP_IF_LE(1, NLLEarly)
   GR (MT 1, subtileK 0):  A: [0, 1, 2, 3]  B: [0, 1, 2, 3]
   GR (MT 1, subtileK 1):  A: [0, 1, 2, 3]  B: [0, 1, 2, 3]
+  GR_SCALE (MT 1)
   GR_INC
   SKIP_IF_LE(2, NGLL)
 
@@ -726,7 +728,7 @@ MAINLOOP:
       LR (MT n+1, subtileK 0, subIterK 0) A: {0: 0, 1: 1, 2: 2, 3: 3}  B: {0: 4, 1: 5, 2: 6, 3: 7}  scaleSet=0
         before: [WaitGROp(A=6 B=6 SA=0 SB=0), SyncOp, LR_INCOp]  after: [WaitLROp]
       GR (MT n+2, subtileK 1):  A: [2, 3]  B: [2, 3]
-        before: [none]  after: [GR_INCOp]
+        before: [none]  after: [GRScaleOp(MT n+2), GR_INCOp]
 """
 
     assert expected in actual
@@ -760,7 +762,7 @@ def test_PGR2_128_128_DU512_fp4_instruction_schedule_exact():
     expected_sik0 = "MLMLMLMLMLMLMLMLMMMMSSMSMGMSGSGSGM"
     expected_sik1 = "MLMLMLMLMLMLMLMLMLMLMLMLSMSSMGMSGSGSGM"
     expected_sik2 = "MLMLMLMLMLMLMLMLMMMMSSMSMGMSGSGSGM"
-    expected_sik3 = "MSSSSSSSSSSSSLLSMSLMGLSMSLMGLMSLMGLMSLMGLMSLMGLMSMGSMSSMSSSSSSSSSSSSSSSSM"
+    expected_sik3 = "MSSSSSSSSSSSSLLSMGLMSLMGLMSLMGLMSLMGLSMSLMGLSMSLMGSMSSMSSMSSSSSSSSSSSSSSM"
 
     assert seq0 == expected_sik0, f"subIterK=0 mismatch:\n  got: {seq0}\n  exp: {expected_sik0}"
     assert seq1 == expected_sik1, f"subIterK=1 mismatch:\n  got: {seq1}\n  exp: {expected_sik1}"

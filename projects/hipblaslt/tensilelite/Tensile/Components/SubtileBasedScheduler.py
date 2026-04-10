@@ -188,7 +188,6 @@ class GROp:
     subtileB: List[int]  # N-dim subtile indices
     subtileK: int = 0        # subtiles K index
     lastForMT: bool = False  # True = last partition's GR for this MT → emit ptrUpdate+swap
-    firstForMT: bool = False # True = first partition's GR for this MT → emit scale loads
 
 
 @dataclass
@@ -237,12 +236,18 @@ class GR_INCOp:
 
 
 @dataclass
+class GRScaleOp:
+    """Global Read scale DTL: loads scale subtiles into LDS."""
+    mtIteration: str  # same as the GROp it's attached to
+
+
+@dataclass
 class LR_INCOp:
     """Local Read increment: LDS buffer swap for LR."""
     pass
 
 
-ScheduleOp = Union[MFMAOp, GROp, WaitGROp, WaitLROp, SyncOp, LROp, SkipOp, GR_INCOp, LR_INCOp]
+ScheduleOp = Union[MFMAOp, GROp, WaitGROp, WaitLROp, SyncOp, LROp, SkipOp, GR_INCOp, GRScaleOp, LR_INCOp]
 
 
 @dataclass
@@ -253,7 +258,7 @@ class DepEdge:
     - op: a sync/housekeeping instruction to emit (WAIT_GR, WAIT_LR, SYNC, etc.)
     - module: a reference to another AnnotatedModule that must complete first (ordering constraint)
     """
-    op: Union[WaitGROp, WaitLROp, SyncOp, GR_INCOp, LR_INCOp, None] = None
+    op: Union[WaitGROp, WaitLROp, SyncOp, GR_INCOp, GRScaleOp, LR_INCOp, None] = None
     module: Optional['AnnotatedModule'] = None
 
 
@@ -748,15 +753,12 @@ class SubtileBasedScheduler:
                     preloopOps.append(GROp(mtIteration="0",
                                            subtileA=grA, subtileB=grB, subtileK=subtileK,
                                            lastForMT=False))
-        # Mark the first MT 0 GR as firstForMT
-        for i in range(len(preloopOps)):
-            if isinstance(preloopOps[i], GROp):
-                preloopOps[i].firstForMT = True
-                break
-        # Mark the last MT 0 GR as lastForMT
+        # Mark the last MT 0 GR as lastForMT and insert GRScaleOp after it
         for i in range(len(preloopOps) - 1, -1, -1):
             if isinstance(preloopOps[i], GROp):
                 preloopOps[i].lastForMT = True
+                if self.hasScale:
+                    preloopOps.insert(i + 1, GRScaleOp(mtIteration="0"))
                 break
         preloopOps.append(GR_INCOp())
         preloopOps.append(WaitGROp(mtIteration="0",
@@ -771,12 +773,13 @@ class SubtileBasedScheduler:
         preloopOps.append(SkipOp(compare="LE", value=1, target=nllTarget))
         mt1Complete = (set(preloadMT1_A) == set(allA) and set(preloadMT1_B) == set(allB))
         for subtileK in range(self.numSubtileK):
-            isFirstSId1 = (subtileK == 0)
             isLastSId1 = (subtileK == self.numSubtileK - 1)
             preloopOps.append(GROp(mtIteration="1",
                                    subtileA=preloadMT1_A, subtileB=preloadMT1_B, subtileK=subtileK,
-                                   firstForMT=isFirstSId1, lastForMT=mt1Complete and isLastSId1))
+                                   lastForMT=mt1Complete and isLastSId1))
         if mt1Complete:
+            if self.hasScale:
+                preloopOps.append(GRScaleOp(mtIteration="1"))
             preloopOps.append(GR_INCOp())
         preloopOps.append(SkipOp(compare="LE", value=2, target="NGLL"))
         preloopSik = SubIterKSchedule(subtileK=0, subIterK=0)
@@ -869,15 +872,6 @@ class SubtileBasedScheduler:
                 for fpi in range(pi + 1, numPartitions))
         return False
 
-    def _isFirstGRForMT(self, pi, gr, numPartitions):
-        """Check if this partition's GR is the first one for its MT iteration."""
-        if gr.mtIteration in ("n+1", "n+2"):
-            return not any(
-                (self.partitionGRs[fpi].subtileA or self.partitionGRs[fpi].subtileB)
-                and self.partitionGRs[fpi].mtIteration == gr.mtIteration
-                for fpi in range(0, pi))
-        return False
-
     def _insertGROps(self, pss, pi, gr, numPartitions):
         """Insert GR ops for a partition, one per (M-subtile-chunk, subtileK), spread across steps."""
         if not gr.subtileA and not gr.subtileB:
@@ -886,7 +880,6 @@ class SubtileBasedScheduler:
         totalGR_A = sorted(gr.subtileA)
         totalGR_B = sorted(gr.subtileB)
         isLast = self._isLastGRForMT(pi, gr, numPartitions)
-        isFirst = self._isFirstGRForMT(pi, gr, numPartitions)
 
         # Split M-dim subtiles into min(numSubIterK, 2) chunks, then replicate per subtileK.
         numMSplits = min(self.numSubIterK, 2)
@@ -913,12 +906,11 @@ class SubtileBasedScheduler:
                     grOps.append((min(stepIdx, totalSteps - 1), subtileK, cA, cB))
                 stepIdx += 1
 
-        # Assign firstForMT / lastForMT
+        # Assign lastForMT
         for i, (si, subtileK, cA, cB) in enumerate(grOps):
             pss.subIterKSteps[si].modules.append(AnnotatedModule(op=GROp(
                 mtIteration=gr.mtIteration,
                 subtileA=cA, subtileB=cB, subtileK=subtileK,
-                firstForMT=isFirst and i == 0,
                 lastForMT=isLast and i == len(grOps) - 1)))
 
     # Generate the schedule
@@ -1043,7 +1035,7 @@ class SubtileBasedScheduler:
                     if isinstance(mod.op, GROp):
                         grEvents.append((opIdx, mod.op.mtIteration,
                                          set(mod.op.subtileA), set(mod.op.subtileB),
-                                         mod.op.lastForMT))
+                                         mod.op.lastForMT and self.hasScale))
                     opIdx += 1
         return grEvents
 
@@ -1131,10 +1123,12 @@ class SubtileBasedScheduler:
                      if g.op.mtIteration == targetMT), None)
 
     @staticmethod
-    def _annotateGRInc(grMods):
-        """Append GR_INC to the last GR module for this MT iteration."""
+    def _annotateGRInc(grMods, hasScale):
+        """Append GRScaleOp and GR_INC to the last GR module for this MT iteration."""
         for grMod in grMods:
             if grMod.op.lastForMT:
+                if hasScale:
+                    grMod.after.append(DepEdge(op=GRScaleOp(mtIteration=grMod.op.mtIteration)))
                 grMod.after.append(DepEdge(op=GR_INCOp()))
 
     @staticmethod
@@ -1185,7 +1179,7 @@ class SubtileBasedScheduler:
                 waitGROp, waitA, waitB = self._buildWaitGROp(
                     lrOp, pendingA, pendingB, opIdx, opIdx + len(dus.modules), grEvents)
 
-                self._annotateGRInc(grMods)
+                self._annotateGRInc(grMods, self.hasScale)
 
                 if waitGROp and lrMod:
                     self._annotateLRDependsOnGR(
@@ -1231,7 +1225,9 @@ class SubtileBasedScheduler:
                                 inflightLoadsA=0, inflightLoadsB=0)))
                         else:
                             newBefore.append(e)
-                    newAfter = self._filterDepEdges(mod.after, (GR_INCOp,))
+                    newAfter = [e for e in mod.after
+                               if not isinstance(e.op, GR_INCOp)
+                               and not (isinstance(e.op, GRScaleOp) and e.op.mtIteration == "n+2")]
                     newDus.modules.append(AnnotatedModule(
                         op=mod.op, before=newBefore, after=newAfter))
                 newPss.subIterKSteps.append(newDus)
@@ -1281,7 +1277,7 @@ class SubtileBasedScheduler:
                                 inflightLoadsA=0, inflightLoadsB=0)))
                         else:
                             newBefore.append(e)
-                    newAfter = self._filterDepEdges(mod.after, (GR_INCOp,))
+                    newAfter = self._filterDepEdges(mod.after, (GR_INCOp, GRScaleOp))
                     newDus.modules.append(AnnotatedModule(
                         op=mod.op, before=newBefore, after=newAfter))
                 # Remove WaitLROp from after when no LR exists in this subIterK
@@ -1331,6 +1327,8 @@ class SubtileBasedScheduler:
             print(f"{indent}SKIP_IF_{op.compare}({op.value}, {op.target})")
         elif isinstance(op, GR_INCOp):
             print(f"{indent}GR_INC")
+        elif isinstance(op, GRScaleOp):
+            print(f"{indent}GR_SCALE (MT {op.mtIteration})")
         elif isinstance(op, LR_INCOp):
             print(f"{indent}LR_INC")
 
@@ -1346,6 +1344,8 @@ class SubtileBasedScheduler:
         op = e.op
         if isinstance(op, WaitGROp) and op.inflightLoadsA is not None:
             return f"WaitGROp(A={op.inflightLoadsA} B={op.inflightLoadsB} SA={op.inflightScaleLoadsA} SB={op.inflightScaleLoadsB})"
+        if isinstance(op, GRScaleOp):
+            return f"GRScaleOp(MT {op.mtIteration})"
         return type(op).__name__
 
     def _printModules(self, modules: List[AnnotatedModule], indent: str,
@@ -1559,12 +1559,6 @@ class SubtileBasedScheduler:
     def emitGR(self, writer, kernel, op):
         """Emit GR (Global Read) buffer_load instructions for a single GROp."""
         module = Module()
-        # Scale DTL loads: emitted on the last GR of an MT so all scale LR from the
-        # current bank have completed before the DTL overwrites them (scale DTL
-        # covers all subtileK values in a single load).
-        if op.lastForMT and self.hasScale:
-            module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
-            module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
         # A and B data loads for this GR's subtileK layer
         for subtileList, tileInfo in [(op.subtileA, self.tileInfoA),
                                       (op.subtileB, self.tileInfoB)]:
@@ -1572,11 +1566,20 @@ class SubtileBasedScheduler:
                 module.add(emitSingleBufferLoad(tileInfo, kernel, sId0, op.subtileK))
         return module
 
+    def emitGRScale(self, writer, kernel, op):
+        """Emit scale DTL (Data Transfer Load) for scale subtiles into LDS."""
+        module = Module()
+        module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
+        module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
+        return module
+
     def _emitOp(self, writer, kernel, op, dtileInfo, scaleSet=0, scaleLRSet=0):
         """Emit a single ScheduleOp into a list of instructions."""
         module = Module()
         if isinstance(op, GROp):
             module.add(self.emitGR(writer, kernel, op))
+        elif isinstance(op, GRScaleOp):
+            module.add(self.emitGRScale(writer, kernel, op))
         elif isinstance(op, GR_INCOp):
             module.add(globalReadPtrUpdates('A', writer, kernel))
             module.add(globalReadPtrUpdates('B', writer, kernel))
@@ -1631,6 +1634,8 @@ class SubtileBasedScheduler:
             return "sync"
         if isinstance(op, GR_INCOp):
             return "gr_inc"
+        if isinstance(op, GRScaleOp):
+            return "gr_scale"
         if isinstance(op, LR_INCOp):
             return "lr_inc"
         if isinstance(op, SkipOp):
