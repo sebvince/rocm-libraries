@@ -87,75 +87,364 @@ def make_example_granularities_1():
 
 # ── Step 1: Place LRs ─────────────────────────────────────
 
-def test_step1_place_LRs():
-    """Validate Step 1 output matches design doc Example Granularities 1."""
-    cfg = make_example_granularities_1()
+def make_256x256_fp4():
+    """MT=256x256, DU=256, FP4 config built from TileInfo."""
+    kernel = create_kernel(256, 256, fp4=True)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+    return SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+    )
+
+
+def _get_lr(slot, tensor):
+    """Get the LR placement for a given tensor in a slot."""
+    matches = [lr for lr in slot.lrs if lr.tensor == tensor]
+    assert len(matches) == 1, f"Expected 1 LR for {tensor}, got {len(matches)}"
+    return matches[0]
+
+
+def test_step1_LR_1x1():
+    """Validate Step 1: MT=256x256, DU=256, FP4.
+
+    Config: numMFMATilesM=8, numMFMATilesN=8, numSubIterK=2
+    LR A,B: k=1 (one per subIterK), LR SA,SB: k=2 (one per MT, split across subIterKs)
+    """
+    cfg = make_256x256_fp4()
+    assert cfg.numMFMATilesM == 8
+    assert cfg.numMFMATilesN == 8
+    assert cfg.numSubIterK == 2
+    assert cfg.hasScale
+
     sched = MFMATileScheduler(cfg)
     slots = sched.step1_place_LRs()
+    print(sched.print_step1())
 
-    output = sched.print_step1()
-    print(output)
-
-    # subIterK=0: MFMA + LR A + LR B + LR SA
     assert len(slots) == 2
 
-    # subIterK=0
+    # ── subIterK=0 ──
     s0 = slots[0]
-    assert s0.mfma is not None
+
+    # MFMA at subIterK=0 consumes all 8 M/N tiles
     assert s0.mfma.subIterK == 0
-    # LRs at subIterK=0: A(loads k=1), B(loads k=1), SA(loads k=[0,1])
-    lr_tensors_0 = [lr.tensor for lr in s0.lrs]
-    assert 'A' in lr_tensors_0
-    assert 'B' in lr_tensors_0
-    assert 'SA' in lr_tensors_0
+    assert s0.mfma.tileA.tileId_start == 0
+    assert s0.mfma.tileA.tileId_end == 8
+    assert s0.mfma.tileB.tileId_end == 8
 
-    # LR A at subIterK=0 loads subIterK [1] for MT n
-    lr_a_0 = [lr for lr in s0.lrs if lr.tensor == 'A'][0]
-    assert lr_a_0.tiles.subIterK_start == 1
-    assert lr_a_0.tiles.subIterK_end == 2
-    assert lr_a_0.mtIteration == "n"
+    # 3 LRs: A, B (k=1), SA (k=2, placed at subIterK=0)
+    assert [lr.tensor for lr in s0.lrs] == ['A', 'B', 'SA']
 
-    # LR SA at subIterK=0 loads subIterK [0,1] for MT n+1
-    lr_sa = [lr for lr in s0.lrs if lr.tensor == 'SA'][0]
+    # LR A loads next subIterK [1], same MT, all 8 tiles
+    lr_a0 = _get_lr(s0, 'A')
+    assert lr_a0.mtIteration == "n"
+    assert lr_a0.tiles.subIterK_start == 1
+    assert lr_a0.tiles.subIterK_end == 2
+    assert lr_a0.tiles.tileId_end == 8
+
+    # LR B same pattern as A
+    lr_b0 = _get_lr(s0, 'B')
+    assert lr_b0.mtIteration == "n"
+    assert lr_b0.tiles.subIterK_start == 1
+
+    # LR SA loads all subIterKs [0,1] for next MT
+    lr_sa = _get_lr(s0, 'SA')
+    assert lr_sa.mtIteration == "n+1"
     assert lr_sa.tiles.subIterK_start == 0
     assert lr_sa.tiles.subIterK_end == 2
-    assert lr_sa.mtIteration == "n+1"
+    assert lr_sa.tiles.tileId_end == 8
 
-    # subIterK=1
+    # ── subIterK=1 ──
     s1 = slots[1]
-    lr_tensors_1 = [lr.tensor for lr in s1.lrs]
-    assert 'A' in lr_tensors_1
-    assert 'B' in lr_tensors_1
-    assert 'SB' in lr_tensors_1
 
-    # LR A at subIterK=1 loads subIterK [0] for MT n+1 (wrap-around)
-    lr_a_1 = [lr for lr in s1.lrs if lr.tensor == 'A'][0]
-    assert lr_a_1.tiles.subIterK_start == 0
-    assert lr_a_1.tiles.subIterK_end == 1
-    assert lr_a_1.mtIteration == "n+1"
+    assert s1.mfma.subIterK == 1
 
-    # LR SB at subIterK=1 loads subIterK [0,1] for MT n+1
-    lr_sb = [lr for lr in s1.lrs if lr.tensor == 'SB'][0]
+    # 3 LRs: A, B (k=1 wrap-around → MT n+1), SB (k=2, placed at subIterK=1)
+    assert [lr.tensor for lr in s1.lrs] == ['A', 'B', 'SB']
+
+    # LR A wraps to subIterK [0] of next MT
+    lr_a1 = _get_lr(s1, 'A')
+    assert lr_a1.mtIteration == "n+1"
+    assert lr_a1.tiles.subIterK_start == 0
+    assert lr_a1.tiles.subIterK_end == 1
+
+    # LR SB loads all subIterKs [0,1] for next MT
+    lr_sb = _get_lr(s1, 'SB')
+    assert lr_sb.mtIteration == "n+1"
     assert lr_sb.tiles.subIterK_start == 0
     assert lr_sb.tiles.subIterK_end == 2
-    assert lr_sb.mtIteration == "n+1"
+    assert lr_sb.tiles.tileId_end == 8
 
-    # Verify print format matches design doc Step 1
-    expected_step1 = """\
-MAINLOOP:
-  Partition 0:
-    subIterK=0:
-      MFMAs (MT n, subIterK 0  ) A : [0-1] , B : [0-1]
-      LR A  (MT n, subIterK [1]) [0-1]
-      LR B  (MT n, subIterK [1]) [0-1]
-      LR SA (MT n+1, subIterK [0,1]) [0-1]
-    subIterK=1:
-      MFMAs (MT n, subIterK 1  ) A : [0-1] , B : [0-1]
-      LR A  (MT n+1, subIterK [0]) [0-1]
-      LR B  (MT n+1, subIterK [0]) [0-1]
-      LR SB (MT n+1, subIterK [0,1]) [0-1]
-"""
-    assert output == expected_step1
+
+def test_step1_LR_1x1_DU512():
+    """Validate Step 1: MT=256x256, DU=512, FP4.
+
+    DU=512 gives localMMATileGrid=[8,4] → numSubIterK=4, numMFMATilesM/N=8.
+    LR A,B: k=1 → one LR per subIterK.
+    LR SA,SB: k=2 → 2 LRs per tensor (chunks of 2 subIterKs), placed consecutively.
+      SA chunks at subIterK=0 and 1, SB chunks at subIterK=2 and 3.
+    """
+    kernel = create_kernel(256, 256, fp4=True, depthU=512)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+
+    cfg = SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+    )
+
+    assert cfg.numMFMATilesM == 8
+    assert cfg.numMFMATilesN == 8
+    assert cfg.numSubIterK == 4
+    assert cfg.hasScale
+
+    sched = MFMATileScheduler(cfg)
+    slots = sched.step1_place_LRs()
+    print(sched.print_step1())
+
+    assert len(slots) == 4
+
+    # ── subIterK=0: LR A, LR B, LR SA (chunk 0: loads [2,3] of MT n) ──
+    s0 = slots[0]
+    assert s0.mfma.subIterK == 0
+    assert s0.mfma.tileA.tileId_end == 8
+    assert [lr.tensor for lr in s0.lrs] == ['A', 'B', 'SA']
+
+    lr_a0 = _get_lr(s0, 'A')
+    assert lr_a0.mtIteration == "n"
+    assert lr_a0.tiles.subIterK_start == 1
+    assert lr_a0.tiles.subIterK_end == 2
+
+    lr_sa0 = _get_lr(s0, 'SA')
+    assert lr_sa0.mtIteration == "n"
+    assert lr_sa0.tiles.subIterK_start == 2
+    assert lr_sa0.tiles.subIterK_end == 4
+
+    # ── subIterK=1: LR A, LR B, LR SB (chunk 0: loads [2,3] of MT n) ──
+    s1 = slots[1]
+    assert [lr.tensor for lr in s1.lrs] == ['A', 'B', 'SB']
+
+    lr_a1 = _get_lr(s1, 'A')
+    assert lr_a1.mtIteration == "n"
+    assert lr_a1.tiles.subIterK_start == 2
+    assert lr_a1.tiles.subIterK_end == 3
+
+    lr_sb0 = _get_lr(s1, 'SB')
+    assert lr_sb0.mtIteration == "n"
+    assert lr_sb0.tiles.subIterK_start == 2
+    assert lr_sb0.tiles.subIterK_end == 4
+
+    # ── subIterK=2: LR A, LR B, LR SA (chunk 1: loads [0,1] of MT n+1) ──
+    s2 = slots[2]
+    assert [lr.tensor for lr in s2.lrs] == ['A', 'B', 'SA']
+
+    lr_a2 = _get_lr(s2, 'A')
+    assert lr_a2.mtIteration == "n"
+    assert lr_a2.tiles.subIterK_start == 3
+    assert lr_a2.tiles.subIterK_end == 4
+
+    lr_sa1 = _get_lr(s2, 'SA')
+    assert lr_sa1.mtIteration == "n+1"
+    assert lr_sa1.tiles.subIterK_start == 0
+    assert lr_sa1.tiles.subIterK_end == 2
+
+    # ── subIterK=3: LR A, LR B (wrap to MT n+1), LR SB (chunk 1: loads [0,1] of MT n+1) ──
+    s3 = slots[3]
+    assert [lr.tensor for lr in s3.lrs] == ['A', 'B', 'SB']
+
+    lr_a3 = _get_lr(s3, 'A')
+    assert lr_a3.mtIteration == "n+1"
+    assert lr_a3.tiles.subIterK_start == 0
+    assert lr_a3.tiles.subIterK_end == 1
+
+    lr_sb1 = _get_lr(s3, 'SB')
+    assert lr_sb1.mtIteration == "n+1"
+    assert lr_sb1.tiles.subIterK_start == 0
+    assert lr_sb1.tiles.subIterK_end == 2
+
+
+def test_step1_LR_1x2_DU512():
+    """Validate Step 1: MT=256x256, DU=512, FP4, LR A/B with k=2.
+
+    DU=512 gives numSubIterK=4. All tensors have k=2 granularity.
+    2 chunks of 2 subIterKs each. Tensors split within each chunk:
+      chunk 0 (subIterK 0,1): A+SA at slot 0, B+SB at slot 1, loads [2,3] of MT n
+      chunk 1 (subIterK 2,3): A+SA at slot 2, B+SB at slot 3, loads [0,1] of MT n+1
+    """
+    kernel = create_kernel(256, 256, fp4=True, depthU=512)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+
+    cfg = SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+    )
+
+    assert cfg.numMFMATilesM == 8
+    assert cfg.numMFMATilesN == 8
+    assert cfg.numSubIterK == 4
+
+    sched = MFMATileScheduler(cfg)
+    slots = sched.step1_place_LRs()
+    print(sched.print_step1())
+
+    assert len(slots) == 4
+
+    # ── subIterK=0: LR A + LR SA (chunk 0, loads [2,3] of MT n) ──
+    s0 = slots[0]
+    assert [lr.tensor for lr in s0.lrs] == ['A', 'SA']
+
+    lr_a0 = _get_lr(s0, 'A')
+    assert lr_a0.mtIteration == "n"
+    assert lr_a0.tiles.subIterK_start == 2
+    assert lr_a0.tiles.subIterK_end == 4
+
+    lr_sa0 = _get_lr(s0, 'SA')
+    assert lr_sa0.mtIteration == "n"
+    assert lr_sa0.tiles.subIterK_start == 2
+    assert lr_sa0.tiles.subIterK_end == 4
+
+    # ── subIterK=1: LR B + LR SB (chunk 0, loads [2,3] of MT n) ──
+    s1 = slots[1]
+    assert [lr.tensor for lr in s1.lrs] == ['B', 'SB']
+
+    lr_b0 = _get_lr(s1, 'B')
+    assert lr_b0.mtIteration == "n"
+    assert lr_b0.tiles.subIterK_start == 2
+    assert lr_b0.tiles.subIterK_end == 4
+
+    lr_sb0 = _get_lr(s1, 'SB')
+    assert lr_sb0.mtIteration == "n"
+    assert lr_sb0.tiles.subIterK_start == 2
+    assert lr_sb0.tiles.subIterK_end == 4
+
+    # ── subIterK=2: LR A + LR SA (chunk 1, loads [0,1] of MT n+1) ──
+    s2 = slots[2]
+    assert [lr.tensor for lr in s2.lrs] == ['A', 'SA']
+
+    lr_a1 = _get_lr(s2, 'A')
+    assert lr_a1.mtIteration == "n+1"
+    assert lr_a1.tiles.subIterK_start == 0
+    assert lr_a1.tiles.subIterK_end == 2
+
+    lr_sa1 = _get_lr(s2, 'SA')
+    assert lr_sa1.mtIteration == "n+1"
+    assert lr_sa1.tiles.subIterK_start == 0
+    assert lr_sa1.tiles.subIterK_end == 2
+
+    # ── subIterK=3: LR B + LR SB (chunk 1, loads [0,1] of MT n+1) ──
+    s3 = slots[3]
+    assert [lr.tensor for lr in s3.lrs] == ['B', 'SB']
+
+    lr_b1 = _get_lr(s3, 'B')
+    assert lr_b1.mtIteration == "n+1"
+    assert lr_b1.tiles.subIterK_start == 0
+    assert lr_b1.tiles.subIterK_end == 2
+
+    lr_sb1 = _get_lr(s3, 'SB')
+    assert lr_sb1.mtIteration == "n+1"
+    assert lr_sb1.tiles.subIterK_start == 0
+    assert lr_sb1.tiles.subIterK_end == 2
+
+
+def test_step1_LR_1x2():
+    """Validate Step 1: MT=256x256, DU=256, FP4, LR A/B with k=2.
+
+    This matches design doc Example Granularities 2:
+      LR A,B: 1x2 (MFMATileSize(k=2, mn=1))
+      LR SA,SB: 2x2
+
+    With k=2 == numSubIterK, LR A/B load all subIterKs at once.
+    Split: LR A at subIterK=0, LR B at subIterK=1.
+    """
+    kernel = create_kernel(256, 256, fp4=True)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+
+    cfg = SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+    )
+
+    assert cfg.numMFMATilesM == 8
+    assert cfg.numMFMATilesN == 8
+    assert cfg.numSubIterK == 2
+
+    sched = MFMATileScheduler(cfg)
+    slots = sched.step1_place_LRs()
+    print(sched.print_step1())
+
+    assert len(slots) == 2
+
+    # ── subIterK=0: LR A (loads MT n+1, all subIterKs) + LR SA ──
+    s0 = slots[0]
+    assert [lr.tensor for lr in s0.lrs] == ['A', 'SA']
+
+    lr_a = _get_lr(s0, 'A')
+    assert lr_a.mtIteration == "n+1"
+    assert lr_a.tiles.subIterK_start == 0
+    assert lr_a.tiles.subIterK_end == 2
+    assert lr_a.tiles.tileId_end == 8
+
+    lr_sa = _get_lr(s0, 'SA')
+    assert lr_sa.mtIteration == "n+1"
+    assert lr_sa.tiles.subIterK_start == 0
+    assert lr_sa.tiles.subIterK_end == 2
+
+    # ── subIterK=1: LR B (loads MT n+1, all subIterKs) + LR SB ──
+    s1 = slots[1]
+    assert [lr.tensor for lr in s1.lrs] == ['B', 'SB']
+
+    lr_b = _get_lr(s1, 'B')
+    assert lr_b.mtIteration == "n+1"
+    assert lr_b.tiles.subIterK_start == 0
+    assert lr_b.tiles.subIterK_end == 2
+    assert lr_b.tiles.tileId_end == 8
+
+    lr_sb = _get_lr(s1, 'SB')
+    assert lr_sb.mtIteration == "n+1"
+    assert lr_sb.tiles.subIterK_start == 0
+    assert lr_sb.tiles.subIterK_end == 2
 
 
 # ── Step 2: Assign VGPR sets ──────────────────────────────

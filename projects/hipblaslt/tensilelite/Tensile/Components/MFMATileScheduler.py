@@ -99,14 +99,14 @@ class SchedulerConfig:
         Derives numMFMATilesM/N/K from the tile info:
         - numMFMATilesM = tileInfoA.localMMATileGrid[0]
         - numMFMATilesN = tileInfoB.localMMATileGrid[0]
-        - numSubIterK   = tileInfoA.subtileShape[1]
+        - numSubIterK   = tileInfoA.localMMATileGrid[1]
         """
         numMFMATilesM = tileInfoA.localMMATileGrid[0]
         numMFMATilesN = tileInfoB.localMMATileGrid[0]
-        numSubIterK = tileInfoA.subtileShape[1]
+        numSubIterK = tileInfoA.localMMATileGrid[1]
 
-        assert tileInfoA.subtileShape[1] == tileInfoB.subtileShape[1], \
-            "A and B must have same subtileShape[1]"
+        assert tileInfoA.localMMATileGrid[1] == tileInfoB.localMMATileGrid[1], \
+            "A and B must have same localMMATileGrid[1]"
 
         return cls(
             numMFMATilesM=numMFMATilesM,
@@ -292,70 +292,48 @@ class MFMATileScheduler:
             tensors_and_grans.append(('SA', cfg.lrSA, cfg.numMFMATilesM))
             tensors_and_grans.append(('SB', cfg.lrSB, cfg.numMFMATilesN))
 
-        for tensor, gran, numTiles in tensors_and_grans:
-            self._place_LRs_for_tensor(slots, tensor, gran, numTiles, numK)
+        # Separate k=1 tensors from multi-k tensors
+        k1_tensors = [(t, g, n) for t, g, n in tensors_and_grans if g.size.k == 1]
+        multi_k_tensors = [(t, g, n) for t, g, n in tensors_and_grans if g.size.k > 1]
 
-        self._step1_result = slots
-        return slots
-
-    def _place_LRs_for_tensor(self, slots, tensor, gran, numTiles, numK):
-        """Place LR operations for one tensor across subIterK slots.
-
-        The LR always loads data for the *next* consumption point:
-        - k granularity = 1: LR at subIterK=i loads subIterK=i+1 data
-          - At last subIterK, loads subIterK=0 of next MT (n+1)
-        - k granularity = numSubIterK: LR loads all subIterKs at once
-          - Only placed once per MT boundary, split across subIterKs by tensor
-        """
-        k_gran = gran.size.k
-        mn_gran = gran.size.mn
-
-        if k_gran == 1:
-            # One LR per subIterK, loading the next subIterK's data
-            # Each LR covers ALL M/N tiles for that tensor
+        # k=1: one LR per subIterK per tensor
+        for tensor, gran, numTiles in k1_tensors:
             for k in range(numK):
                 next_k = (k + 1) % numK
                 is_mt_switch = (next_k == 0)
-                mt_iter = "n+1" if is_mt_switch else "n"
-
-                if is_mt_switch:
-                    lr_k_start = 0
-                    lr_k_end = k_gran
-                else:
-                    lr_k_start = next_k
-                    lr_k_end = next_k + k_gran
-
                 lr = LRPlacement(
                     tensor=tensor,
-                    mtIteration=mt_iter,
-                    tiles=MFMATileRange(lr_k_start, lr_k_end, 0, numTiles),
+                    mtIteration="n+1" if is_mt_switch else "n",
+                    tiles=MFMATileRange(next_k, next_k + 1, 0, numTiles),
                     subIterK_slot=k,
                 )
                 slots[k].lrs.append(lr)
 
-        elif k_gran == numK:
-            # One LR covers all subIterKs — placed once, at MT switch
-            # Split across subIterKs by tensor type:
-            # SA goes in the first subIterK that has room, SB in the next, etc.
-            # For the design doc example: SA at subIterK=0, SB at subIterK=1
-            if tensor == 'SA':
-                slot_k = 0
-            elif tensor == 'SB':
-                slot_k = numK - 1
-            else:
-                slot_k = 0
+        # Multi-k: each chunk of k_gran subIterKs loads the next chunk's data.
+        # Tensors are split across the subIterKs within each chunk.
+        if multi_k_tensors:
+            k_grans = set(g.size.k for _, g, _ in multi_k_tensors)
+            for k_gran in sorted(k_grans):
+                group = [(t, g, n) for t, g, n in multi_k_tensors if g.size.k == k_gran]
+                num_chunks = numK // k_gran
+                for chunk_idx in range(num_chunks):
+                    next_chunk = (chunk_idx + 1) % num_chunks
+                    is_mt_switch = (next_chunk == 0)
+                    lr_k_start = next_chunk * k_gran
+                    lr_k_end = lr_k_start + k_gran
+                    base_slot = chunk_idx * k_gran
+                    for i, (tensor, gran, numTiles) in enumerate(group):
+                        slot_k = base_slot + (i % k_gran)
+                        lr = LRPlacement(
+                            tensor=tensor,
+                            mtIteration="n+1" if is_mt_switch else "n",
+                            tiles=MFMATileRange(lr_k_start, lr_k_end, 0, numTiles),
+                            subIterK_slot=slot_k,
+                        )
+                        slots[slot_k].lrs.append(lr)
 
-            lr = LRPlacement(
-                tensor=tensor,
-                mtIteration="n+1",
-                tiles=MFMATileRange(0, numK, 0, numTiles),
-                subIterK_slot=slot_k,
-            )
-            slots[slot_k].lrs.append(lr)
-
-        else:
-            raise NotImplementedError(
-                f"LR k granularity {k_gran} not yet supported (must be 1 or numSubIterK={numK})")
+        self._step1_result = slots
+        return slots
 
     # ── Step 2: Assign VGPR sets ──────────────────────────
 
