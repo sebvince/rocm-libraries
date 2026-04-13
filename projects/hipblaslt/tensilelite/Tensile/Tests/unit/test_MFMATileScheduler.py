@@ -15,6 +15,7 @@ from Tensile.Components.MFMATileScheduler import (
     MFMATileRange,
     ReadGranularity,
     SchedulerConfig,
+    EmittedModule,
 )
 from unittest.mock import MagicMock
 
@@ -243,15 +244,94 @@ def test_step5_group():
     assert op_kinds_0[3] == 'LR'  # SA
 
     # MFMA has WaitLROp before
-    assert "WaitLROp" in g0.ops[0].before
+    assert any(dep.kind == 'wait_lr' for dep in g0.ops[0].before)
 
     # First LR has WaitGROp before
-    assert any("WaitGROp" in dep for dep in g0.ops[1].before)
+    assert any(dep.kind == 'wait_gr' for dep in g0.ops[1].before)
 
     # subIterK=1: MFMA, LR A, LR B, LR SB, GR SB, GR B
     g1 = grouped[1]
     lr_tensors = [op.placement.tensor for op in g1.ops if op.kind == 'LR']
     assert lr_tensors == ['A', 'B', 'SB']
+
+
+# ── Step 6: EmittedModules ──────────────────────────────────
+
+def test_step6_emit():
+    """Validate Step 6: EmittedModule list with correct before-links."""
+    cfg = make_example_granularities_1()
+    sched = MFMATileScheduler(cfg)
+    all_emitted = sched.step6_emit()
+
+    output = sched.print_step6()
+    print(output)
+
+    assert len(all_emitted) == 2  # 2 subIterKs
+
+    # ── subIterK=0 ──
+    e0 = all_emitted[0]
+
+    # Exactly one MFMA
+    mfmas = [e for e in e0 if e.opType == 'mfma']
+    assert len(mfmas) == 1
+
+    # MFMA's before chain should include wait_lr
+    mfma = mfmas[0]
+    assert mfma.before is not None
+    assert e0[mfma.before].opType == 'wait_lr'
+
+    # LRs: 3 (A, B, SA)
+    lrs = [e for e in e0 if e.opType == 'lr']
+    assert len(lrs) == 3
+
+    # First LR's chain: wait_gr → lr_inc → lr
+    first_lr = lrs[0]
+    chain = _walk_before_chain(e0, first_lr.moduleId)
+    chain_types = [e0[mid].opType for mid in chain]
+    assert 'wait_gr' in chain_types
+    assert 'lr_inc' in chain_types
+
+    # Second LR links back to first LR
+    second_lr = lrs[1]
+    assert second_lr.before is not None
+    assert e0[second_lr.before].opType == 'lr'
+
+    # GRs: 2 (SA, A)
+    grs = [e for e in e0 if e.opType == 'gr']
+    assert len(grs) == 2
+
+    # First GR's chain: ref(LR A) → wait_lr → sync → GR
+    first_gr = grs[0]
+    chain = _walk_before_chain(e0, first_gr.moduleId)
+    chain_types = [e0[mid].opType for mid in chain]
+    assert 'sync' in chain_types
+    assert 'wait_lr' in chain_types
+
+    # Second GR links to first GR
+    assert grs[1].before is not None
+    assert e0[grs[1].before].opType == 'gr'
+
+    # ── subIterK=1 ──
+    e1 = all_emitted[1]
+
+    mfmas1 = [e for e in e1 if e.opType == 'mfma']
+    assert len(mfmas1) == 1
+
+    lrs1 = [e for e in e1 if e.opType == 'lr']
+    assert len(lrs1) == 3  # A, B, SB
+
+    grs1 = [e for e in e1 if e.opType == 'gr']
+    assert len(grs1) == 2  # SB, B
+
+
+def _walk_before_chain(emitted, start_id):
+    """Walk the before-chain backwards, returning list of moduleIds."""
+    chain = []
+    cur = emitted[start_id].before
+    while cur is not None:
+        chain.append(cur)
+        cur = emitted[cur].before
+    return chain
 
 
 # ── from_tile_info ──────────────────────────────────────────
@@ -352,6 +432,7 @@ if __name__ == "__main__":
         ("Step 3: Place GRs",           lambda: (sched.step3_place_GRs(), sched.print_step3())),
         ("Step 4: Annotate deps",       lambda: (sched.step4_annotate_deps(), sched.print_step4())),
         ("Step 5: Group and serialize", lambda: (sched.step5_group(), sched.print_step5())),
+        ("Step 6: EmittedModules",      lambda: (sched.step6_emit(), sched.print_step6())),
     ]
 
     interactive = "--interactive" in sys.argv or "-i" in sys.argv

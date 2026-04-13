@@ -3,12 +3,13 @@
 Builds a logical schedule using MFMA tile indices as the core primitive,
 with explicit per-operation load granularity for GR/LR on A, B, SA, SB.
 
-The schedule is built in 5 steps:
+The schedule is built in 6 steps:
   1. Place LRs based on their granularities
   2. Assign VGPR tile sets (ping-pong) based on subIterK dependencies
   3. Place GRs
   4. Annotate dependencies
   5. Group and serialize (produce paths for instructionSchedule)
+  6. Produce List[EmittedModule] with before-link chains
 """
 
 from __future__ import annotations
@@ -181,20 +182,38 @@ class VGPRSetAssignment:
     lr_sets: dict     # tensor -> set id
 
 
-# ── Step 4 dependency types ─────────────────────────────────
+# ── Dependency types ────────────────────────────────────────
 
 @dataclass
-class DepRef:
-    """A dependency reference: either an op string or an LR/GR reference."""
-    label: str   # human-readable label e.g. "LR A (MT n, subIterK [0])"
+class DepOp:
+    """A typed dependency in a before-chain.
+
+    Kinds:
+      'wait_gr'      — wait for global reads (includes implicit sync)
+      'wait_lr'      — wait for local reads (no sync, used before MFMAs)
+      'wait_lr_sync' — wait for local reads + sync barrier (used before GRs,
+                        to ensure LR finished reading LDS before GR overwrites it)
+      'lr_inc'       — LDS buffer swap for LR (needs tensor)
+      'gr_inc'       — pointer update + LDS swap for GR (needs tensor)
+      'ref'          — reference to another AnnotatedOp in same subIterK
+      'lr_ref'       — dependency on LR for a tensor (Step 4, cross-subIterK)
+      'gr_ref'       — dependency on GR for a tensor (Step 4, cross-subIterK)
+    """
+    kind: str
+    tensor: str = ""
+    ref: Optional['AnnotatedOp'] = None
+
+    def __str__(self):
+        if self.tensor:
+            return f"{self.kind}({self.tensor})"
+        return self.kind
 
 
 @dataclass
 class AnnotatedOp:
     """An operation with its before-dependencies."""
     kind: str        # 'MFMA', 'LR', 'GR', etc.
-    label: str       # human-readable
-    before: List[str] = field(default_factory=list)
+    before: List[DepOp] = field(default_factory=list)
     # Original placement reference
     placement: object = None
 
@@ -206,6 +225,22 @@ class GroupedSubIterK:
     """Step 5 output: serialized ops within one subIterK."""
     subIterK: int
     ops: List[AnnotatedOp] = field(default_factory=list)
+
+
+# ── Step 6 output ──────────────────────────────────────────
+
+@dataclass
+class EmittedModule:
+    """One emitted module with before-link for instruction scheduling.
+
+    Compatible with SubtileBasedScheduler.instructionSchedule().
+    Instructions are left empty at the logical level — filled during emission.
+    """
+    moduleId: int = -1
+    instructions: list = field(default_factory=list)
+    before: Optional[int] = None   # moduleId that must complete before this module
+    opType: str = ""
+    label: str = ""                # human-readable label for debugging
 
 
 # ── Main scheduler class ───────────────────────────────────
@@ -223,6 +258,7 @@ class MFMATileScheduler:
         self._step3_result: Optional[List[SubIterKSlot]] = None
         self._step4_result: Optional[List[SubIterKSlot]] = None
         self._step5_result: Optional[List[GroupedSubIterK]] = None
+        self._step6_result: Optional[List[EmittedModule]] = None
 
     # ── Step 1: Place LRs ─────────────────────────────────
 
@@ -432,47 +468,86 @@ class MFMATileScheduler:
 
     # ── Step 4: Annotate dependencies ─────────────────────
 
-    def step4_annotate_deps(self) -> List[SubIterKSlot]:
-        """Annotate each operation with its before-dependencies.
+    def step4_annotate_deps(self) -> List[GroupedSubIterK]:
+        """Annotate each operation with its raw before-dependencies.
+
+        These are the per-op dependencies before Step 5 grouping. They may
+        reference operations in other subIterKs or iterations (descriptive).
 
         Rules:
         - MFMA(subIterK=k) depends on all LRs that loaded subIterK=k data
-        - LR(n) depends on GR(n) (data must be in LDS before local read)
-        - GR(n+2) depends on LR(n) (LDS double-buffer collision avoidance)
+        - LR depends on GR for same tensor (data must be in LDS)
         - LR cross-MT depends on LR_INCOp (buffer swap)
-        - GR last-for-MT depends on GR_INCOp (pointer update)
+        - GR depends on GRInc for same tensor (pointer update)
+        - GR depends on collision LR for same tensor (LDS double-buffer)
         """
         if self._step3_result is None:
             self.step3_place_GRs()
         slots = self._step3_result
+        cfg = self.config
+        numK = cfg.numSubIterK
 
-        result = []
+        grouped = []
         for k, slot in enumerate(slots):
-            annotated_slot = SubIterKSlot(
-                subIterK=k,
-                mfma=slot.mfma,
-                lrs=list(slot.lrs),
-                grs=list(slot.grs),
-                mfma_sets=slot.mfma_sets,
-                lr_sets=slot.lr_sets,
-            )
-            result.append(annotated_slot)
+            gslot = GroupedSubIterK(subIterK=k)
 
-        self._step4_result = result
-        return result
+            # ── MFMA deps ──
+            # MFMA(subIterK=k) depends on all LRs that loaded subIterK=k data.
+            # These are from the previous iteration (MT n).
+            if slot.mfma:
+                before = []
+                tensor_names = ['A', 'B']
+                if cfg.hasScale:
+                    tensor_names += ['SA', 'SB']
+                for t in tensor_names:
+                    before.append(DepOp(kind='lr_ref', tensor=t))
+
+                gslot.ops.append(AnnotatedOp(
+                    kind='MFMA', before=before, placement=slot.mfma))
+
+            # ── LR deps ──
+            for lr in slot.lrs:
+                before = []
+                if lr.mtIteration != "n":
+                    before.append(DepOp(kind='lr_inc', tensor=lr.tensor))
+                before.append(DepOp(kind='gr_ref', tensor=lr.tensor))
+
+                gslot.ops.append(AnnotatedOp(
+                    kind='LR', before=before, placement=lr))
+
+            # ── GR deps ──
+            for gr in slot.grs:
+                before = [
+                    DepOp(kind='gr_inc', tensor=gr.tensor),
+                    DepOp(kind='lr_ref', tensor=gr.tensor),
+                ]
+                gslot.ops.append(AnnotatedOp(
+                    kind='GR', before=before, placement=gr))
+
+            grouped.append(gslot)
+
+        self._step4_result = grouped
+        return grouped
 
     # ── Step 5: Group and serialize ───────────────────────
 
     def step5_group(self) -> List[GroupedSubIterK]:
         """Serialize operations within each subIterK.
 
-        - MFMAs: single WaitLROp before
-        - LRs: serialized A → B → SA → SB with WaitGROp+Sync before first
-        - GRs: serialized SA → A (or SB → B) with merged deps
+        Takes Step 4's raw deps and transforms them:
+        - Cross-subIterK LR deps → WaitLROp barrier
+        - Cross-subIterK GR deps → WaitGROp barrier
+        - Same-subIterK deps → node refs for serialization
+        - LRs serialized: A → B → SA → SB with WaitGROp before first
+        - GRs serialized: SA → A (or SB → B) with merged deps
         """
+        if self._step3_result is None:
+            self.step3_place_GRs()
+        # Step 5 operates on the raw slot placements from Step 3
+        slots = self._step3_result
+        # Ensure Step 4 has been run (for its own output/display)
         if self._step4_result is None:
             self.step4_annotate_deps()
-        slots = self._step4_result
         cfg = self.config
         numK = cfg.numSubIterK
 
@@ -482,99 +557,148 @@ class MFMATileScheduler:
 
             # MFMA with WaitLROp before
             if slot.mfma:
-                mfma_label = (f"MFMAs (MT n, subIterK {k}  ) "
-                              f"A : {slot.mfma.tileA.fmt_tiles()} , "
-                              f"B : {slot.mfma.tileB.fmt_tiles()}")
-                sets_str = ", ".join(
-                    f"set{t}:{slot.mfma_sets[t]}"
-                    for t in sorted(slot.mfma_sets.keys())
-                ) if slot.mfma_sets else ""
-                mfma_label += f" {sets_str}"
-
-                mfma_op = AnnotatedOp(
-                    kind='MFMA', label=mfma_label,
-                    before=["WaitLROp"],
+                gslot.ops.append(AnnotatedOp(
+                    kind='MFMA',
+                    before=[DepOp(kind='wait_lr')],
                     placement=slot.mfma,
-                )
-                gslot.ops.append(mfma_op)
+                ))
 
             # LRs serialized: A → B → SA → SB
-            # First LR gets WaitGROp + Sync + any LR_INCOps
+            # First LR gets WaitGROp + any LR_INCOps
             lr_order = ['A', 'B', 'SA', 'SB']
             ordered_lrs = sorted(slot.lrs, key=lambda lr: lr_order.index(lr.tensor))
 
-            prev_lr_label = None
+            prev_lr_op = None
             for i, lr in enumerate(ordered_lrs):
-                lr_label = (f"LR {lr.tensor}  (MT {lr.mtIteration}, "
-                            f"subIterK {lr.tiles.fmt_k()}) "
-                            f"{lr.tiles.fmt_tiles()}")
-                if lr.tensor in (slot.lr_sets or {}):
-                    lr_label += f" set{lr.tensor}:{slot.lr_sets[lr.tensor]}"
-
                 before = []
                 if i == 0:
-                    # First LR: WaitGROp + Sync
-                    before.append("WaitGROp(A=X,B=Y,SA=W SB=Z), SyncOp")
-                    # Add LR_INCOps for cross-MT reads
+                    before.append(DepOp(kind='wait_gr'))
                     for lr2 in ordered_lrs:
                         if lr2.mtIteration != "n":
-                            before.append(f"LR_INCOp {lr2.tensor}")
+                            before.append(DepOp(kind='lr_inc', tensor=lr2.tensor))
                 else:
-                    before.append(prev_lr_label)
+                    before.append(DepOp(kind='ref', ref=prev_lr_op))
 
                 lr_op = AnnotatedOp(
-                    kind='LR', label=lr_label,
-                    before=before,
-                    placement=lr,
+                    kind='LR', before=before, placement=lr,
                 )
                 gslot.ops.append(lr_op)
-                prev_lr_label = lr_label
+                prev_lr_op = lr_op
 
             # GRs serialized: SA → A or SB → B
             gr_order = ['SA', 'A', 'SB', 'B']
             ordered_grs = sorted(slot.grs, key=lambda gr: gr_order.index(gr.tensor))
 
-            prev_gr_label = None
-            for i, gr in enumerate(ordered_grs):
-                gr_label = (f"GR {gr.tensor} (MT {gr.mtIteration}, "
-                            f"subIterK {gr.tiles.fmt_k()}) "
-                            f"ids {gr.tiles.fmt_tiles()}")
+            # Only subIterK=0 needs collision wait (same-subIterK LR still async).
+            # Later subIterKs: collision LR covered by MFMAs' WaitLROp.
+            needs_collision_wait = self._needs_collision_wait(k, ordered_lrs)
+            collision_lr_op = None
+            if needs_collision_wait:
+                collision_lr_op = self._find_collision_LR_op(gslot, ordered_lrs)
 
+            prev_gr_op = None
+            for i, gr in enumerate(ordered_grs):
                 before = []
                 if i == 0:
-                    # First GR: depends on GRInc + LR collision avoidance
                     for gr2 in ordered_grs:
-                        before.append(f"GRInc {gr2.tensor}")
-                    # LDS collision: GR(n+2) depends on LR(n)
-                    collision_lrs = self._find_collision_LRs(slot, slots)
-                    for clr in collision_lrs:
-                        before.append(
-                            f"LR {clr.tensor} (MT n, subIterK {clr.tiles.fmt_k()}) "
-                            f"{clr.tiles.fmt_tiles()}, WaitLROp, Sync")
+                        before.append(DepOp(kind='gr_inc', tensor=gr2.tensor))
+                    if collision_lr_op:
+                        before.append(DepOp(kind='ref', ref=collision_lr_op))
+                        before.append(DepOp(kind='wait_lr_sync'))
                 else:
-                    before.append(prev_gr_label)
+                    before.append(DepOp(kind='ref', ref=prev_gr_op))
 
                 gr_op = AnnotatedOp(
-                    kind='GR', label=gr_label,
-                    before=before,
-                    placement=gr,
+                    kind='GR', before=before, placement=gr,
                 )
                 gslot.ops.append(gr_op)
-                prev_gr_label = gr_label
+                prev_gr_op = gr_op
 
             grouped.append(gslot)
 
         self._step5_result = grouped
         return grouped
 
-    def _find_collision_LRs(self, current_slot, all_slots):
-        """Find LRs from current subIterK that GR(n+2) must wait for (LDS collision)."""
-        # GR(n+2) writes to LDS buffer that LR(n) reads from.
-        # So GR depends on the LR in the same slot that reads from MT n.
-        result = []
-        for lr in current_slot.lrs:
-            result.append(lr)
-        return result
+    def _needs_collision_wait(self, subIterK: int, ordered_lrs: list) -> bool:
+        """Check if GRs at this subIterK need explicit wait_lr_sync.
+
+        At Step 5, only same-subIterK node refs survive; cross-subIterK deps
+        are absorbed by WaitLROp/WaitGROp barriers.
+
+        At subIterK=0: the LRs in this slot just ran (async ds_reads). GR is
+        about to write to the same LDS buffer. Need ref(LR) + wait_lr_sync.
+
+        At later subIterKs: the collision LR is from a previous iteration,
+        already covered by MFMAs' WaitLROp. No explicit wait needed.
+        """
+        return subIterK == 0
+
+    def _find_collision_LR_op(self, gslot: GroupedSubIterK, ordered_lrs: list) -> Optional[AnnotatedOp]:
+        """Find the last LR AnnotatedOp in this subIterK that GR must wait for.
+
+        Returns the last LR node — since LRs are serialized (A → B → SA),
+        referencing the last one ensures GR is sequenced after all LRs
+        and the wait_lr_sync covers all pending ds_reads.
+        """
+        last_lr = None
+        for op in gslot.ops:
+            if op.kind == 'LR':
+                last_lr = op
+        return last_lr
+
+    # ── Step 6: Produce EmittedModules ────────────────────
+
+    def step6_emit(self) -> List[List[EmittedModule]]:
+        """Convert Step 5 grouped ops into a flat List[EmittedModule] per subIterK.
+
+        Each AnnotatedOp becomes one EmittedModule. Its DepOp before-deps are
+        flattened into chained EmittedModules, with the primary op's .before
+        pointing to the last dep in the chain.
+
+        'ref' deps resolve to the referenced AnnotatedOp's moduleId.
+        'wait_lr_sync' expands to two modules (wait_lr → sync).
+        All other dep kinds become one EmittedModule each.
+        """
+        if self._step5_result is None:
+            self.step5_group()
+        grouped = self._step5_result
+
+        all_emitted = []
+        for gslot in grouped:
+            emitted: List[EmittedModule] = []
+            op_to_id = {}  # AnnotatedOp id() → EmittedModule moduleId
+
+            def add(opType, label, before=None):
+                mid = len(emitted)
+                emitted.append(EmittedModule(
+                    moduleId=mid, opType=opType,
+                    label=label, before=before))
+                return mid
+
+            for op in gslot.ops:
+                opType = op.kind.lower()
+
+                prev_id = None
+                for dep in op.before:
+                    if dep.kind == 'ref':
+                        ref_id = op_to_id.get(id(dep.ref))
+                        if ref_id is not None:
+                            prev_id = ref_id
+                    elif dep.kind == 'wait_lr_sync':
+                        # Expand to two modules: wait_lr → sync
+                        prev_id = add('wait_lr', 'wait_lr', before=prev_id)
+                        prev_id = add('sync', 'sync', before=prev_id)
+                    else:
+                        prev_id = add(dep.kind, str(dep), before=prev_id)
+
+                label = self._format_op_label(op, gslot)
+                mid = add(opType, label, before=prev_id)
+                op_to_id[id(op)] = mid
+
+            all_emitted.append(emitted)
+
+        self._step6_result = all_emitted
+        return all_emitted
 
     # ── Print helpers ───────────────────────────────────────
 
@@ -582,6 +706,44 @@ class MFMATileScheduler:
     def _fmt_tensor(tensor: str) -> str:
         """Pad tensor name to 2 chars for alignment: 'A' -> 'A ', 'SA' -> 'SA'."""
         return tensor.ljust(2)
+
+    def _get_slot_data(self, subIterK: int) -> Optional[SubIterKSlot]:
+        """Get Step 3 slot for set annotations (mfma_sets, lr_sets)."""
+        if self._step3_result and subIterK < len(self._step3_result):
+            return self._step3_result[subIterK]
+        return None
+
+    def _format_op_label(self, op: AnnotatedOp, gslot) -> str:
+        """Compute a human-readable label from an AnnotatedOp's placement.
+
+        Labels are only for display — never stored in the data structure.
+        Set annotations come from the Step 3 slot data.
+        """
+        p = op.placement
+        k = gslot.subIterK if hasattr(gslot, 'subIterK') else 0
+        s3 = self._get_slot_data(k)
+
+        if op.kind == 'MFMA':
+            label = (f"MFMAs (MT n, subIterK {p.subIterK}  ) "
+                     f"A : {p.tileA.fmt_tiles()} , B : {p.tileB.fmt_tiles()}")
+            if s3 and s3.mfma_sets:
+                label += " " + ", ".join(
+                    f"set{t}:{s3.mfma_sets[t]}"
+                    for t in sorted(s3.mfma_sets.keys()))
+            return label
+        elif op.kind == 'LR':
+            t = self._fmt_tensor(p.tensor)
+            label = (f"LR {t} (MT {p.mtIteration}, "
+                     f"subIterK {p.tiles.fmt_k()}) "
+                     f"{p.tiles.fmt_tiles()}")
+            if s3 and s3.lr_sets and p.tensor in s3.lr_sets:
+                label += f" set{p.tensor}:{s3.lr_sets[p.tensor]}"
+            return label
+        elif op.kind == 'GR':
+            return (f"GR {p.tensor} (MT {p.mtIteration}, "
+                    f"subIterK {p.tiles.fmt_k()}) "
+                    f"ids {p.tiles.fmt_tiles()}")
+        return op.kind
 
     def print_step1(self, slots: List[SubIterKSlot] = None) -> str:
         """Print Step 1 output in design doc format."""
@@ -667,10 +829,11 @@ class MFMATileScheduler:
                           f"ids {gr.tiles.fmt_tiles()}\n")
         return buf.getvalue()
 
-    def print_step4(self, slots: List[SubIterKSlot] = None) -> str:
-        """Print Step 4 output: Step 3 + dependency annotations."""
-        # For now, Step 4 produces the same structure; deps are shown in Step 5
-        return self.print_step3(slots)
+    def print_step4(self, grouped: List[GroupedSubIterK] = None) -> str:
+        """Print Step 4 output: ops with raw per-op dependencies."""
+        if grouped is None:
+            grouped = self._step4_result
+        return self.print_step5(grouped)
 
     def print_step5(self, grouped: List[GroupedSubIterK] = None) -> str:
         """Print Step 5 output: grouped and serialized with dependencies."""
@@ -682,9 +845,30 @@ class MFMATileScheduler:
         for gslot in grouped:
             buf.write(f"    subIterK={gslot.subIterK}:\n")
             for op in gslot.ops:
-                buf.write(f"      {op.label}\n")
+                label = self._format_op_label(op, gslot)
+                buf.write(f"      {label}\n")
                 if op.before:
                     buf.write("        before:\n")
                     for dep in op.before:
-                        buf.write(f"            - {dep}\n")
+                        dep_str = self._format_dep(dep, gslot)
+                        buf.write(f"            - {dep_str}\n")
+        return buf.getvalue()
+
+    def _format_dep(self, dep: DepOp, gslot) -> str:
+        """Format a DepOp for display. Refs are resolved to labels."""
+        if dep.kind == 'ref' and dep.ref:
+            return self._format_op_label(dep.ref, gslot)
+        return str(dep)
+
+    def print_step6(self, all_emitted: List[List[EmittedModule]] = None) -> str:
+        """Print Step 6 output: EmittedModule list with before-links."""
+        if all_emitted is None:
+            all_emitted = self._step6_result
+        buf = io.StringIO()
+        for k, emitted in enumerate(all_emitted):
+            buf.write(f"subIterK={k}:\n")
+            for em in emitted:
+                before_str = f" ← [{em.before}]" if em.before is not None else ""
+                buf.write(f"  [{em.moduleId:2d}] {em.opType:8s} {em.label}{before_str}\n")
+            buf.write("\n")
         return buf.getvalue()
