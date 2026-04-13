@@ -80,10 +80,26 @@ class SchedulerConfig:
     lrSB: Optional[ReadGranularity] = None
     grSA: Optional[ReadGranularity] = None
     grSB: Optional[ReadGranularity] = None
+    numPartitionsM: int = 1   # partition grid in M dimension
+    numPartitionsN: int = 1   # partition grid in N dimension
 
     @property
     def hasScale(self) -> bool:
         return self.lrSA is not None and self.lrSB is not None
+
+    @property
+    def numPartitions(self) -> int:
+        return self.numPartitionsM * self.numPartitionsN
+
+    @property
+    def partitionSizeM(self) -> int:
+        assert self.numMFMATilesM % self.numPartitionsM == 0
+        return self.numMFMATilesM // self.numPartitionsM
+
+    @property
+    def partitionSizeN(self) -> int:
+        assert self.numMFMATilesN % self.numPartitionsN == 0
+        return self.numMFMATilesN // self.numPartitionsN
 
     @classmethod
     def from_tile_info(cls, tileInfoA, tileInfoB,
@@ -93,7 +109,9 @@ class SchedulerConfig:
                        lrSA: Optional[ReadGranularity] = None,
                        lrSB: Optional[ReadGranularity] = None,
                        grSA: Optional[ReadGranularity] = None,
-                       grSB: Optional[ReadGranularity] = None):
+                       grSB: Optional[ReadGranularity] = None,
+                       numPartitionsM: int = 1,
+                       numPartitionsN: int = 1):
         """Build config from TileInfo objects.
 
         Derives numMFMATilesM/N/K from the tile info:
@@ -114,6 +132,8 @@ class SchedulerConfig:
             numSubIterK=numSubIterK,
             lrA=lrA, lrB=lrB,
             grA=grA, grB=grB,
+            numPartitionsM=numPartitionsM,
+            numPartitionsN=numPartitionsN,
             lrSA=lrSA, lrSB=lrSB,
             grSA=grSA, grSB=grSB,
         )
@@ -253,7 +273,7 @@ class MFMATileScheduler:
 
     def __init__(self, config: SchedulerConfig):
         self.config = config
-        self._step1_result: Optional[List[SubIterKSlot]] = None
+        self._step1_result: Optional[List[List[SubIterKSlot]]] = None
         self._step2_result: Optional[List[SubIterKSlot]] = None
         self._step3_result: Optional[List[SubIterKSlot]] = None
         self._step4_result: Optional[List[SubIterKSlot]] = None
@@ -262,49 +282,163 @@ class MFMATileScheduler:
 
     # ── Step 1: Place LRs ─────────────────────────────────
 
-    def step1_place_LRs(self) -> List[SubIterKSlot]:
+    def step1_place_LRs(self) -> List[List[SubIterKSlot]]:
         """Place MFMAs and LRs based on read granularities.
 
-        For each subIterK:
-        - Place MFMA that consumes all M/N tiles at this subIterK
-        - Place LR for each tensor based on its granularity:
-          - k=1: one LR per subIterK, loading next subIterK
-          - k=numSubIterK: one LR per MT switch, split across subIterKs
+        Returns a list of partitions, each containing a list of SubIterKSlots.
+        Each partition covers a subset of M/N tiles.
+
+        LRs load data for the NEXT partition's tile range. With VGPR double
+        buffering (2 sets per tensor), loaded data persists until overwritten.
+        A tensor only needs loading when the next partition's tiles aren't already
+        in either VGPR set. Last partition loads everything for MT n+1.
         """
         cfg = self.config
         numK = cfg.numSubIterK
+        numP = cfg.numPartitions
+
+        # Compute tile ranges for all partitions
+        part_ranges = []
+        for pi in range(numP):
+            piM = pi % cfg.numPartitionsM
+            piN = pi // cfg.numPartitionsM
+            tileA_start = piM * cfg.partitionSizeM
+            tileA_end = tileA_start + cfg.partitionSizeM
+            tileB_start = piN * cfg.partitionSizeN
+            tileB_end = tileB_start + cfg.partitionSizeN
+            part_ranges.append((tileA_start, tileA_end, tileB_start, tileB_end))
+
+        # Track what's in each VGPR set per tensor (2 sets: 0 and 1).
+        # At MT start, set 0 holds P0's tiles (loaded by P_last of previous MT).
+        # Set 1 is initialized to the same to represent "nothing new loaded yet".
+        if numP > 1:
+            vgpr_A = [part_ranges[0][:2], part_ranges[0][:2]]
+            vgpr_B = [part_ranges[0][2:], part_ranges[0][2:]]
+            write_set = {'A': 1, 'B': 1}
+
+        partitions = []
+        for pi in range(numP):
+            cur = part_ranges[pi]
+            nxt = part_ranges[(pi + 1) % numP]
+            is_last = (pi == numP - 1)
+
+            if numP == 1:
+                load_a = True
+                load_b = True
+            elif is_last:
+                # Last partition always loads everything (MT switch)
+                load_a = True
+                load_b = True
+            else:
+                nxt_A = nxt[:2]
+                nxt_B = nxt[2:]
+                # Load only if the next partition's tiles aren't in either VGPR set
+                load_a = (nxt_A != vgpr_A[0] and nxt_A != vgpr_A[1])
+                load_b = (nxt_B != vgpr_B[0] and nxt_B != vgpr_B[1])
+
+            slots = self._place_LRs_for_partition(
+                numK, cur, nxt, is_last, load_a, load_b)
+            partitions.append(slots)
+
+            # Update VGPR set tracking: loaded data goes into the write set
+            if numP > 1:
+                if load_a:
+                    ws = write_set['A']
+                    vgpr_A[ws] = nxt[:2]
+                    write_set['A'] = 1 - ws
+                if load_b:
+                    ws = write_set['B']
+                    vgpr_B[ws] = nxt[2:]
+                    write_set['B'] = 1 - ws
+
+        self._step1_result = partitions
+        return partitions
+
+    def _place_LRs_for_partition(self, numK,
+                                  cur_range: tuple, nxt_range: tuple,
+                                  is_last_partition: bool,
+                                  load_a: bool, load_b: bool) -> List[SubIterKSlot]:
+        """Place MFMAs and LRs for one partition.
+
+        Args:
+            cur_range: (tileA_start, tileA_end, tileB_start, tileB_end) for current partition
+            nxt_range: tile ranges for the next partition (what LRs load)
+            is_last_partition: True if this is the last partition (wraps to MT n+1)
+            load_a: whether to load A-side tensors (A, SA)
+            load_b: whether to load B-side tensors (B, SB)
+        """
+        cfg = self.config
+        tileA_start, tileA_end, tileB_start, tileB_end = cur_range
+        nxt_A_start, nxt_A_end, nxt_B_start, nxt_B_end = nxt_range
+
         slots = [SubIterKSlot(subIterK=k) for k in range(numK)]
 
-        # Place MFMAs: each subIterK gets one MFMA consuming all M/N tiles
+        # Place MFMAs: each subIterK gets one MFMA consuming this partition's tiles
         for k in range(numK):
             slots[k].mfma = MFMAPlacement(
                 subIterK=k,
-                tileA=MFMATileRange(k, k + 1, 0, cfg.numMFMATilesM),
-                tileB=MFMATileRange(k, k + 1, 0, cfg.numMFMATilesN),
+                tileA=MFMATileRange(k, k + 1, tileA_start, tileA_end),
+                tileB=MFMATileRange(k, k + 1, tileB_start, tileB_end),
             )
 
-        # Place LRs for each tensor
-        tensors_and_grans = [
-            ('A',  cfg.lrA,  cfg.numMFMATilesM),
-            ('B',  cfg.lrB,  cfg.numMFMATilesN),
-        ]
+        # Current and next partition tile info per tensor
+        numTilesM_cur = tileA_end - tileA_start
+        numTilesN_cur = tileB_end - tileB_start
+        numTilesM_nxt = nxt_A_end - nxt_A_start
+        numTilesN_nxt = nxt_B_end - nxt_B_start
+
+        # Build tensor list for multi-k LRs (use NEXT partition tiles)
+        tensors_and_grans = []
+        if load_a:
+            tensors_and_grans.append(('A', cfg.lrA, numTilesM_nxt, nxt_A_start))
+        if load_b:
+            tensors_and_grans.append(('B', cfg.lrB, numTilesN_nxt, nxt_B_start))
         if cfg.hasScale:
-            tensors_and_grans.append(('SA', cfg.lrSA, cfg.numMFMATilesM))
-            tensors_and_grans.append(('SB', cfg.lrSB, cfg.numMFMATilesN))
+            if load_a:
+                tensors_and_grans.append(('SA', cfg.lrSA, numTilesM_nxt, nxt_A_start))
+            if load_b:
+                tensors_and_grans.append(('SB', cfg.lrSB, numTilesN_nxt, nxt_B_start))
+
+        # mtIteration: "n+1" if last partition (wrapping to next MT), "n" otherwise
+        # For single partition, use the existing per-subIterK logic
+        if cfg.numPartitions > 1:
+            mt_iter = "n+1" if is_last_partition else "n"
+
+        # Per-tensor current/next tile ranges for k=1 logic
+        cur_tile = {'A': (tileA_start, numTilesM_cur),
+                    'B': (tileB_start, numTilesN_cur),
+                    'SA': (tileA_start, numTilesM_cur),
+                    'SB': (tileB_start, numTilesN_cur)}
+        nxt_tile = {'A': (nxt_A_start, numTilesM_nxt),
+                    'B': (nxt_B_start, numTilesN_nxt),
+                    'SA': (nxt_A_start, numTilesM_nxt),
+                    'SB': (nxt_B_start, numTilesN_nxt)}
 
         # Separate k=1 tensors from multi-k tensors
-        k1_tensors = [(t, g, n) for t, g, n in tensors_and_grans if g.size.k == 1]
-        multi_k_tensors = [(t, g, n) for t, g, n in tensors_and_grans if g.size.k > 1]
+        k1_tensors = [(t, g, n, s) for t, g, n, s in tensors_and_grans if g.size.k == 1]
+        multi_k_tensors = [(t, g, n, s) for t, g, n, s in tensors_and_grans if g.size.k > 1]
 
-        # k=1: one LR per subIterK per tensor
-        for tensor, gran, numTiles in k1_tensors:
+        # k=1: one LR per subIterK per tensor.
+        # Non-wrapping subIterKs prefetch the next subIterK within the CURRENT
+        # partition (same tiles). The wrapping subIterK (last → 0) loads for the
+        # NEXT partition (different tiles).
+        for tensor, gran, numTiles, tileStart in k1_tensors:
             for k in range(numK):
                 next_k = (k + 1) % numK
-                is_mt_switch = (next_k == 0)
+                is_wrap = (next_k == 0)
+                if cfg.numPartitions > 1:
+                    lr_mt = mt_iter
+                    if is_wrap:
+                        ts, tn = nxt_tile[tensor]
+                    else:
+                        ts, tn = cur_tile[tensor]
+                else:
+                    lr_mt = "n+1" if is_wrap else "n"
+                    ts, tn = tileStart, numTiles
                 lr = LRPlacement(
                     tensor=tensor,
-                    mtIteration="n+1" if is_mt_switch else "n",
-                    tiles=MFMATileRange(next_k, next_k + 1, 0, numTiles),
+                    mtIteration=lr_mt,
+                    tiles=MFMATileRange(next_k, next_k + 1, ts, ts + tn),
                     subIterK_slot=k,
                 )
                 slots[k].lrs.append(lr)
@@ -312,27 +446,42 @@ class MFMATileScheduler:
         # Multi-k: each chunk of k_gran subIterKs loads the next chunk's data.
         # Tensors are split across the subIterKs within each chunk.
         if multi_k_tensors:
-            k_grans = set(g.size.k for _, g, _ in multi_k_tensors)
+            k_grans = set(g.size.k for _, g, _, _ in multi_k_tensors)
             for k_gran in sorted(k_grans):
-                group = [(t, g, n) for t, g, n in multi_k_tensors if g.size.k == k_gran]
+                group = [(t, g, n, s) for t, g, n, s in multi_k_tensors if g.size.k == k_gran]
                 num_chunks = numK // k_gran
                 for chunk_idx in range(num_chunks):
                     next_chunk = (chunk_idx + 1) % num_chunks
-                    is_mt_switch = (next_chunk == 0)
+                    if cfg.numPartitions > 1:
+                        lr_mt = mt_iter
+                    else:
+                        is_mt_switch = (next_chunk == 0)
+                        lr_mt = "n+1" if is_mt_switch else "n"
                     lr_k_start = next_chunk * k_gran
                     lr_k_end = lr_k_start + k_gran
                     base_slot = chunk_idx * k_gran
-                    for i, (tensor, gran, numTiles) in enumerate(group):
-                        slot_k = base_slot + (i % k_gran)
-                        lr = LRPlacement(
-                            tensor=tensor,
-                            mtIteration="n+1" if is_mt_switch else "n",
-                            tiles=MFMATileRange(lr_k_start, lr_k_end, 0, numTiles),
-                            subIterK_slot=slot_k,
-                        )
-                        slots[slot_k].lrs.append(lr)
+                    # Group tensors by side: A-side (A,SA) and B-side (B,SB).
+                    # Each side goes into one slot within the chunk.
+                    a_side = [(t, g, n, s) for t, g, n, s in group if t in ('A', 'SA')]
+                    b_side = [(t, g, n, s) for t, g, n, s in group if t in ('B', 'SB')]
+                    side_groups = []
+                    if a_side:
+                        side_groups.append(a_side)
+                    if b_side:
+                        side_groups.append(b_side)
 
-        self._step1_result = slots
+                    for side_idx, side in enumerate(side_groups):
+                        slot_k = base_slot + (side_idx % k_gran)
+                        for tensor, gran, numTiles, tileStart in side:
+                            lr = LRPlacement(
+                                tensor=tensor,
+                                mtIteration=lr_mt,
+                                tiles=MFMATileRange(lr_k_start, lr_k_end,
+                                                    tileStart, tileStart + numTiles),
+                                subIterK_slot=slot_k,
+                            )
+                            slots[slot_k].lrs.append(lr)
+
         return slots
 
     # ── Step 2: Assign VGPR sets ──────────────────────────
@@ -346,7 +495,7 @@ class MFMATileScheduler:
         """
         if self._step1_result is None:
             self.step1_place_LRs()
-        slots = self._step1_result
+        slots = self._step1_result[0]  # operate on partition 0
         cfg = self.config
         numK = cfg.numSubIterK
 
@@ -723,13 +872,18 @@ class MFMATileScheduler:
                     f"ids {p.tiles.fmt_tiles()}")
         return op.kind
 
-    def print_step1(self, slots: List[SubIterKSlot] = None) -> str:
+    def print_step1(self, partitions: List[List[SubIterKSlot]] = None) -> str:
         """Print Step 1 output in design doc format."""
-        if slots is None:
-            slots = self._step1_result
+        if partitions is None:
+            partitions = self._step1_result
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
-        buf.write("  Partition 0:\n")
+        for pi, slots in enumerate(partitions):
+            buf.write(f"  Partition {pi}:\n")
+            self._print_step1_partition(buf, slots)
+        return buf.getvalue()
+
+    def _print_step1_partition(self, buf, slots):
         for slot in slots:
             buf.write(f"    subIterK={slot.subIterK}:\n")
             if slot.mfma:
