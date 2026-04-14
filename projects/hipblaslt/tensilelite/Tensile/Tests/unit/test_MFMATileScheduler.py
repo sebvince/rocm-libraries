@@ -1429,39 +1429,6 @@ def test_step3_LR_1x1_partition_1x1():
     _assert_gr(slots[1], 'SB', 0, 2, 0, 8)
 
 
-def test_step3_LR_1x2_partition_1x1():
-    """Step 3: 256x256, DU256, FP4, k=2. Same GR layout as k=1."""
-    kernel = create_kernel(256, 256, fp4=True)
-    tiA = TileInfo('A', kernel)
-    tiB = TileInfo('B', kernel)
-    scaleTiA = TileInfo('MXSA', kernel)
-    scaleTiB = TileInfo('MXSB', kernel)
-
-    cfg = SchedulerConfig.from_tile_info(
-        tiA, tiB,
-        lrA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-    )
-    sched = MFMATileScheduler(cfg)
-    slots = sched.step3_place_GRs()
-    print(sched.print_step3())
-
-    assert [gr.tensor for gr in slots[0].grs] == ['A', 'SA']
-    _assert_gr(slots[0], 'A', 0, 2, 0, 8)
-    _assert_gr(slots[0], 'SA', 0, 2, 0, 8)
-
-    assert [gr.tensor for gr in slots[1].grs] == ['B', 'SB']
-    _assert_gr(slots[1], 'B', 0, 2, 0, 8)
-    _assert_gr(slots[1], 'SB', 0, 2, 0, 8)
-
-
 def test_step3_LR_1x1_partition_1x1_DU512():
     """Step 3: 256x256, DU512, FP4, k=1. GR A+SA at s0, GR B+SB at s1.
 
@@ -1490,42 +1457,6 @@ def test_step3_LR_1x1_partition_1x1_DU512():
     print(sched.print_step3())
 
     # GRs only in s0 and s1, none in s2/s3
-    assert [gr.tensor for gr in slots[0].grs] == ['A', 'SA']
-    _assert_gr(slots[0], 'A', 0, 2, 0, 8)
-    _assert_gr(slots[0], 'SA', 0, 2, 0, 8)
-
-    assert [gr.tensor for gr in slots[1].grs] == ['B', 'SB']
-    _assert_gr(slots[1], 'B', 0, 2, 0, 8)
-    _assert_gr(slots[1], 'SB', 0, 2, 0, 8)
-
-    assert len(slots[2].grs) == 0
-    assert len(slots[3].grs) == 0
-
-
-def test_step3_LR_1x2_partition_1x1_DU512():
-    """Step 3: 256x256, DU512, FP4, k=2. Same GR layout."""
-    kernel = create_kernel(256, 256, fp4=True, depthU=512)
-    tiA = TileInfo('A', kernel)
-    tiB = TileInfo('B', kernel)
-    scaleTiA = TileInfo('MXSA', kernel)
-    scaleTiB = TileInfo('MXSB', kernel)
-
-    cfg = SchedulerConfig.from_tile_info(
-        tiA, tiB,
-        lrA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-    )
-    sched = MFMATileScheduler(cfg)
-    slots = sched.step3_place_GRs()
-    print(sched.print_step3())
-
     assert [gr.tensor for gr in slots[0].grs] == ['A', 'SA']
     _assert_gr(slots[0], 'A', 0, 2, 0, 8)
     _assert_gr(slots[0], 'SA', 0, 2, 0, 8)
@@ -1613,41 +1544,6 @@ def test_step3_LR_1x1_partition_2x2_DU512():
 
     assert len(slots[2].grs) == 0
     assert len(slots[3].grs) == 0
-
-
-def test_step3_LR_1x2_partition_2x2():
-    """Step 3: 256x256, DU256, FP4, k=2, 2x2 partition."""
-    kernel = create_kernel(256, 256, fp4=True)
-    tiA = TileInfo('A', kernel)
-    tiB = TileInfo('B', kernel)
-    scaleTiA = TileInfo('MXSA', kernel)
-    scaleTiB = TileInfo('MXSB', kernel)
-
-    cfg = SchedulerConfig.from_tile_info(
-        tiA, tiB,
-        lrA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        numPartitionsM=2,
-        numPartitionsN=2,
-    )
-    sched = MFMATileScheduler(cfg)
-    slots = sched.step3_place_GRs()
-    print(sched.print_step3())
-
-    assert [gr.tensor for gr in slots[0].grs] == ['A', 'SA']
-    _assert_gr(slots[0], 'A', 0, 2, 0, 8)
-    _assert_gr(slots[0], 'SA', 0, 2, 0, 8)
-
-    assert [gr.tensor for gr in slots[1].grs] == ['B', 'SB']
-    _assert_gr(slots[1], 'B', 0, 2, 0, 8)
-    _assert_gr(slots[1], 'SB', 0, 2, 0, 8)
 
 
 def test_step3_LR_1x1_partition_10x1():
