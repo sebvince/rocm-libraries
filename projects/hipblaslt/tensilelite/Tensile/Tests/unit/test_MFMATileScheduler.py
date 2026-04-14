@@ -461,15 +461,23 @@ def test_step1_LR_1x1_partition_2x2():
       P0: A[0-3], B[0-3]   P2: A[0-3], B[4-7]
       P1: A[4-7], B[0-3]   P3: A[4-7], B[4-7]
 
-    Within-partition K-prefetch (non-wrapping) is always placed for all tensors.
-    Wrapping LRs are only placed when the tile range changes for the next partition.
+    Within-partition K-prefetch (non-wrapping) is placed only for LRs not already
+    placed by an earlier partition (tracked by a `placed` set across all partitions).
+    Wrapping LRs are only placed when the tile range changes for the next partition
+    (tracked by `loaded_ranges` dict).
 
-    Loaded ranges tracking:
+    Loaded ranges tracking (wrapping):
       Start: A={(0,4)}, B={(0,4)}
       P0: load A (nxt A=(4,8) not loaded) → A={(0,4),(4,8)}
       P1: load B (nxt B=(4,8) not loaded) → B={(0,4),(4,8)}
       P2: no wrapping LRs (both A and B already loaded)
       P3: last partition → wrapping LRs for all (MT n+1)
+
+    K-prefetch dedup (placed set):
+      P0 places: A[0-3] k[1], B[0-3] k[1]
+      P1 skips:  B[0-3] k[1] (already placed by P0), places A[4-7] k[1]
+      P2 skips:  A[0-3] k[1] (already placed by P0), places B[4-7] k[1]
+      P3 skips:  A[4-7] k[1] (placed by P1), B[4-7] k[1] (placed by P2)
     """
     kernel = create_kernel(256, 256, fp4=True)
     tiA = TileInfo('A', kernel)
@@ -551,22 +559,16 @@ def test_step1_LR_1x1_partition_2x2():
     assert p1[0].mfma.tileB.tileId_start == 0
     assert p1[0].mfma.tileB.tileId_end == 4
 
-    # subIterK=0: LR A + LR B (k=1, within-partition K-prefetch, cur tiles)
+    # subIterK=0: LR A (k=1, K-prefetch, cur tiles [4-7])
     #           + LR SB (k=2, next partition tiles [4-7])
-    assert [lr.tensor for lr in p1[0].lrs] == ['A', 'B', 'SB']
+    #           LR B skipped (B[0-3] k[1] already placed by P0)
+    assert [lr.tensor for lr in p1[0].lrs] == ['A', 'SB']
     lr_a1p = _get_lr(p1[0], 'A')
     assert lr_a1p.tiles.tileId_start == 4
     assert lr_a1p.tiles.tileId_end == 8
     assert lr_a1p.tiles.subIterK_start == 1
     assert lr_a1p.tiles.subIterK_end == 2
     assert lr_a1p.mtIteration == "n"
-
-    lr_b0 = _get_lr(p1[0], 'B')
-    assert lr_b0.tiles.tileId_start == 0
-    assert lr_b0.tiles.tileId_end == 4
-    assert lr_b0.tiles.subIterK_start == 1
-    assert lr_b0.tiles.subIterK_end == 2
-    assert lr_b0.mtIteration == "n"
 
     lr_sb0 = _get_lr(p1[0], 'SB')
     assert lr_sb0.tiles.tileId_start == 4
@@ -590,15 +592,9 @@ def test_step1_LR_1x1_partition_2x2():
     assert p2[0].mfma.tileB.tileId_start == 4
     assert p2[0].mfma.tileB.tileId_end == 8
 
-    # subIterK=0: LR A + LR B (k=1, within-partition K-prefetch, cur tiles)
-    assert [lr.tensor for lr in p2[0].lrs] == ['A', 'B']
-    lr_a2 = _get_lr(p2[0], 'A')
-    assert lr_a2.tiles.tileId_start == 0
-    assert lr_a2.tiles.tileId_end == 4
-    assert lr_a2.tiles.subIterK_start == 1
-    assert lr_a2.tiles.subIterK_end == 2
-    assert lr_a2.mtIteration == "n"
-
+    # subIterK=0: LR B only (k=1, K-prefetch for B[4-7] k[1], new tiles)
+    #           LR A skipped (A[0-3] k[1] already placed by P0)
+    assert [lr.tensor for lr in p2[0].lrs] == ['B']
     lr_b2 = _get_lr(p2[0], 'B')
     assert lr_b2.tiles.tileId_start == 4
     assert lr_b2.tiles.tileId_end == 8
@@ -616,21 +612,10 @@ def test_step1_LR_1x1_partition_2x2():
     assert p3[0].mfma.tileB.tileId_start == 4
     assert p3[0].mfma.tileB.tileId_end == 8
 
-    # subIterK=0: LR A, LR B (k=1, within-partition prefetch, uses P3 tiles [4-7])
-    #           + LR SA (k=2, next partition P0 tiles [0-3])
-    assert [lr.tensor for lr in p3[0].lrs] == ['A', 'B', 'SA']
-    lr_a3 = _get_lr(p3[0], 'A')
-    assert lr_a3.tiles.tileId_start == 4
-    assert lr_a3.tiles.tileId_end == 8
-    assert lr_a3.tiles.subIterK_start == 1
-    assert lr_a3.tiles.subIterK_end == 2
-    assert lr_a3.mtIteration == "n+1"
-
-    lr_b3 = _get_lr(p3[0], 'B')
-    assert lr_b3.tiles.tileId_start == 4
-    assert lr_b3.tiles.tileId_end == 8
-    assert lr_b3.mtIteration == "n+1"
-
+    # subIterK=0: LR SA only (k=2, next partition P0 tiles [0-3])
+    #           LR A skipped (A[4-7] k[1] already placed by P1)
+    #           LR B skipped (B[4-7] k[1] already placed by P2)
+    assert [lr.tensor for lr in p3[0].lrs] == ['SA']
     lr_sa3 = _get_lr(p3[0], 'SA')
     assert lr_sa3.tiles.tileId_start == 0
     assert lr_sa3.tiles.tileId_end == 4

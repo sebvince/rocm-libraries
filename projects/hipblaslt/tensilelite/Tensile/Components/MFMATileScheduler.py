@@ -304,19 +304,24 @@ class MFMATileScheduler:
         Each LR prefetches data for the next subIterK group. Within-partition
         prefetches use current partition tiles; cross-partition prefetches
         (wrapping) use next partition tiles.
-        With VGPR double buffering (2 sets per tensor), loaded data persists
-        until overwritten. A tensor only needs loading when the next partition's
-        tiles aren't already in either VGPR set. Last partition always loads
-        for MT n+1.
+
+        Two tracking mechanisms:
+        - loaded_ranges: tracks tile ranges in VGPR per side. Wrapping LRs
+          are only placed when the next partition's tiles aren't already loaded.
+        - placed: tracks (tensor, k-range, tile-range) of non-wrapping LRs
+          placed so far across partitions. Skips redundant K-prefetch when
+          the same data was already loaded by an earlier partition.
         """
         cfg = self.config
         numP = cfg.numPartitions
-        # Get range per partition index for A and B (COLUMN_MAJOR)
         part_ranges = [self._partition_tile_range(pi) for pi in range(numP)]
 
-        # Track which tile ranges are currently loaded
+        # Track which tile ranges are currently loaded in VGPR (for wrapping decisions).
         loaded_ranges = {'A': {part_ranges[0]['A']},
                          'B': {part_ranges[0]['B']}}
+
+        # Track placed K-prefetch LRs across partitions (for dedup).
+        placed = set()
 
         partitions = []
         for pi in range(numP):
@@ -327,7 +332,7 @@ class MFMATileScheduler:
             for side in ('A', 'B'):
                 load[side] = is_last or nxt[side] not in loaded_ranges[side]
 
-            slots = self._place_LRs_for_partition(cur, nxt, is_last, load)
+            slots = self._place_LRs_for_partition(cur, nxt, is_last, load, placed)
             partitions.append(slots)
 
             for side in ('A', 'B'):
@@ -339,7 +344,8 @@ class MFMATileScheduler:
 
     def _place_LRs_for_partition(self, cur: tuple, nxt: tuple,
                                   is_last: bool,
-                                  load: dict) -> List[SubIterKSlot]:
+                                  load: dict,
+                                  placed: set) -> List[SubIterKSlot]:
         """Place MFMAs and LRs for one partition."""
         cfg = self.config
         numK = cfg.numSubIterK
@@ -355,21 +361,17 @@ class MFMATileScheduler:
                 tileB=MFMATileRange(k, k + 1, cur['B'][0], cur['B'][1]),
             )
 
-        # Collect tensors to load: (name, granularity)
-        tensors = []
-        if load['A']:
-            tensors.append(('A', cfg.lrA))
-        if load['B']:
-            tensors.append(('B', cfg.lrB))
+        # Always include A and B. Scales only when their side needs loading.
+        tensors = [('A', cfg.lrA), ('B', cfg.lrB)]
         if cfg.hasScale:
             if load['A']:
                 tensors.append(('SA', cfg.lrSA))
             if load['B']:
                 tensors.append(('SB', cfg.lrSB))
 
-        # Place LRs grouped by k_gran. Each chunk of k_gran subIterKs loads
-        # the next chunk's data. Non-wrapping chunks use current partition tiles
-        # (within-partition prefetch), wrapping chunks use next partition tiles.
+        # Place LRs grouped by k_gran.
+        # - Non-wrapping (K-prefetch): check placed set, skip if already loaded.
+        # - Wrapping (cross-partition): check load[side], skip if tiles unchanged.
         for k_gran in sorted(set(g.size.k for _, g in tensors)):
             group = [(t, g) for t, g in tensors if g.size.k == k_gran]
             num_chunks = numK // k_gran
@@ -393,6 +395,17 @@ class MFMATileScheduler:
                         tile_range = nxt if (is_wrap or not multi_part) else cur
                         side_key = 'A' if tensor in ('A', 'SA') else 'B'
                         ts, te = tile_range[side_key]
+
+                        # Wrapping: use load dict. Non-wrapping: use placed set.
+                        if is_wrap and multi_part:
+                            if not load[side_key]:
+                                continue
+                        else:
+                            lr_key = (tensor, lr_k_start, lr_k_end, ts, te)
+                            if lr_key in placed:
+                                continue
+                            placed.add(lr_key)
+
                         lr = LRPlacement(
                             tensor=tensor,
                             mtIteration=lr_mt,
