@@ -361,19 +361,29 @@ class MFMATileScheduler:
                 tileB=MFMATileRange(k, k + 1, cur['B'][0], cur['B'][1]),
             )
 
-        # Always include A and B. Scales only when their side needs loading.
+        # Always include A and B. Scales gated by load for wrapping only.
         tensors = [('A', cfg.lrA), ('B', cfg.lrB)]
+        # Scales included in wrapping tensors when load is True;
+        # excluded scales still need K-prefetch (non-wrapping) placement.
+        kprefetch_only_scales = []
         if cfg.hasScale:
             if load['A']:
                 tensors.append(('SA', cfg.lrSA))
+            else:
+                kprefetch_only_scales.append(('SA', cfg.lrSA))
             if load['B']:
                 tensors.append(('SB', cfg.lrSB))
+            else:
+                kprefetch_only_scales.append(('SB', cfg.lrSB))
+
+        all_tensors = tensors + kprefetch_only_scales
 
         # Place LRs grouped by k_gran.
         # - Non-wrapping (K-prefetch): check placed set, skip if already loaded.
         # - Wrapping (cross-partition): check load[side], skip if tiles unchanged.
-        for k_gran in sorted(set(g.size.k for _, g in tensors)):
-            group = [(t, g) for t, g in tensors if g.size.k == k_gran]
+        for k_gran in sorted(set(g.size.k for _, g in all_tensors)):
+            group_base = [(t, g) for t, g in tensors if g.size.k == k_gran]
+            group_kp = [(t, g) for t, g in kprefetch_only_scales if g.size.k == k_gran]
             num_chunks = numK // k_gran
             for chunk_idx in range(num_chunks):
                 next_chunk = (chunk_idx + 1) % num_chunks
@@ -383,6 +393,10 @@ class MFMATileScheduler:
                 lr_k_start = next_chunk * k_gran
                 lr_k_end = lr_k_start + k_gran
                 base_slot = chunk_idx * k_gran
+
+                # For K-prefetch, include excluded scales so they get placed.
+                # For wrapping, use only base group (scales gated by load dict).
+                group = group_base + group_kp if not (is_wrap and multi_part) else group_base
 
                 # Group by side (A/SA together, B/SB together) for slot assignment
                 sides = [[(t, g) for t, g in group if t in ('A', 'SA')],
