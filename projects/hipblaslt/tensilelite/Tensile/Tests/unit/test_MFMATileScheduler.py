@@ -748,106 +748,129 @@ def test_step1_LR_1x2_partition_2x2():
 
 
 
-# def test_step1_LR_1x1_partition_10x1():
-#     """Validate Step 1: MT=320x320, BF16, DU=64, LR A/B k=1, 10x1 partition grid.
+def test_step1_LR_1x1_partition_10x1():
+    """Validate Step 1: MT=320x320, BF16, DU=64, LR A/B k=1, 10x1 partition grid.
 
-#     numMFMATilesM=10, numMFMATilesN=10, numSubIterK=2, no scale.
-#     10 partitions along M, each with 1 A-tile and all 10 B-tiles:
-#       P0: A[0], B[0-9]
-#       P1: A[1], B[0-9]
-#       ...
-#       P9: A[9], B[0-9]
+    numMFMATilesM=10, numMFMATilesN=10, numSubIterK=2, no scale.
+    10 partitions along M, each with 1 A-tile and all 10 B-tiles:
+      P0: A[0], B[0-9]
+      P1: A[1], B[0-9]
+      ...
+      P9: A[9], B[0-9]
 
-#     B never changes across partitions → only A LRs needed (P0-P8).
-#     Each partition's A tile is unique → always needs loading.
-#     P9 (last): loads both A and B for MT n+1.
-#     """
-#     kernel = create_kernel(320, 320, fp4=False)
-#     tiA = TileInfo('A', kernel)
-#     tiB = TileInfo('B', kernel)
+    B never changes across partitions → only A wrapping LRs needed (P0-P8).
+    Each partition's A tile is unique → always needs loading.
+    B K-prefetch (subIterK=1) placed once in P0, then deduped for P1-P9.
+    P9 (last): loads both A and B for MT n+1.
+    """
+    kernel = create_kernel(320, 320, fp4=False)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
 
-#     cfg = SchedulerConfig.from_tile_info(
-#         tiA, tiB,
-#         lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-#         lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-#         grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-#         grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-#         numPartitionsM=10,
-#         numPartitionsN=1,
-#     )
+    cfg = SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        numPartitionsM=10,
+        numPartitionsN=1,
+    )
 
-#     assert cfg.numMFMATilesM == 10
-#     assert cfg.numMFMATilesN == 10
-#     assert cfg.numSubIterK == 2
-#     assert not cfg.hasScale
-#     assert cfg.numPartitions == 10
-#     assert cfg.partitionSizeM == 1
-#     assert cfg.partitionSizeN == 10
+    assert cfg.numMFMATilesM == 10
+    assert cfg.numMFMATilesN == 10
+    assert cfg.numSubIterK == 2
+    assert not cfg.hasScale
+    assert cfg.numPartitions == 10
+    assert cfg.partitionSizeM == 1
+    assert cfg.partitionSizeN == 10
 
-#     sched = MFMATileScheduler(cfg)
-#     partitions = sched.step1_place_LRs()
-#     print(sched.print_step1())
+    sched = MFMATileScheduler(cfg)
+    partitions = sched.step1_place_LRs()
+    print(sched.print_step1())
 
-#     assert len(partitions) == 10
+    assert len(partitions) == 10
 
-#     # ── P0 through P8: only A LRs, B unchanged ──
-#     for pi in range(9):
-#         p = partitions[pi]
-#         assert p[0].mfma.tileA.tileId_start == pi
-#         assert p[0].mfma.tileA.tileId_end == pi + 1
-#         assert p[0].mfma.tileB.tileId_start == 0
-#         assert p[0].mfma.tileB.tileId_end == 10
+    # ── P0: A + B K-prefetch, then A wrapping ──
+    p0 = partitions[0]
+    assert p0[0].mfma.tileA.tileId_start == 0
+    assert p0[0].mfma.tileA.tileId_end == 1
+    assert p0[0].mfma.tileB.tileId_start == 0
+    assert p0[0].mfma.tileB.tileId_end == 10
 
-#         # subIterK=0: LR A within-partition prefetch (current tile)
-#         assert [lr.tensor for lr in p[0].lrs] == ['A']
-#         lr_a0 = _get_lr(p[0], 'A')
-#         assert lr_a0.tiles.tileId_start == pi
-#         assert lr_a0.tiles.tileId_end == pi + 1
-#         assert lr_a0.tiles.subIterK_start == 1
-#         assert lr_a0.mtIteration == "n"
+    # subIterK=0: LR A K-prefetch [0] + LR B K-prefetch [0-9] (both first time)
+    assert [lr.tensor for lr in p0[0].lrs] == ['A', 'B']
+    lr_a0 = _get_lr(p0[0], 'A')
+    assert lr_a0.tiles.tileId_start == 0
+    assert lr_a0.tiles.tileId_end == 1
+    assert lr_a0.tiles.subIterK_start == 1
+    assert lr_a0.mtIteration == "n"
+    lr_b0 = _get_lr(p0[0], 'B')
+    assert lr_b0.tiles.tileId_start == 0
+    assert lr_b0.tiles.tileId_end == 10
+    assert lr_b0.tiles.subIterK_start == 1
+    assert lr_b0.mtIteration == "n"
 
-#         # subIterK=1: LR A wrapping → next partition tile
-#         assert [lr.tensor for lr in p[1].lrs] == ['A']
-#         lr_a1 = _get_lr(p[1], 'A')
-#         assert lr_a1.tiles.tileId_start == pi + 1
-#         assert lr_a1.tiles.tileId_end == pi + 2
-#         assert lr_a1.tiles.subIterK_start == 0
-#         assert lr_a1.mtIteration == "n"
+    # subIterK=1: LR A wrapping → next partition tile [1]
+    assert [lr.tensor for lr in p0[1].lrs] == ['A']
+    lr_a1 = _get_lr(p0[1], 'A')
+    assert lr_a1.tiles.tileId_start == 1
+    assert lr_a1.tiles.tileId_end == 2
+    assert lr_a1.tiles.subIterK_start == 0
+    assert lr_a1.mtIteration == "n"
 
-#     # ── P9 (last): loads both A and B for MT n+1 ──
-#     p9 = partitions[9]
-#     assert p9[0].mfma.tileA.tileId_start == 9
-#     assert p9[0].mfma.tileA.tileId_end == 10
-#     assert p9[0].mfma.tileB.tileId_start == 0
-#     assert p9[0].mfma.tileB.tileId_end == 10
+    # ── P1 through P8: only A LRs (B K-prefetch already placed by P0) ──
+    for pi in range(1, 9):
+        p = partitions[pi]
+        assert p[0].mfma.tileA.tileId_start == pi
+        assert p[0].mfma.tileA.tileId_end == pi + 1
+        assert p[0].mfma.tileB.tileId_start == 0
+        assert p[0].mfma.tileB.tileId_end == 10
 
-#     # subIterK=0: LR A (cur tile [9]), LR B (cur tile [0-9])
-#     assert [lr.tensor for lr in p9[0].lrs] == ['A', 'B']
-#     lr_a_last = _get_lr(p9[0], 'A')
-#     assert lr_a_last.tiles.tileId_start == 9
-#     assert lr_a_last.tiles.tileId_end == 10
-#     assert lr_a_last.tiles.subIterK_start == 1
-#     assert lr_a_last.mtIteration == "n+1"
+        # subIterK=0: LR A K-prefetch (current tile, new each partition)
+        assert [lr.tensor for lr in p[0].lrs] == ['A']
+        lr_a0 = _get_lr(p[0], 'A')
+        assert lr_a0.tiles.tileId_start == pi
+        assert lr_a0.tiles.tileId_end == pi + 1
+        assert lr_a0.tiles.subIterK_start == 1
+        assert lr_a0.mtIteration == "n"
 
-#     lr_b_last = _get_lr(p9[0], 'B')
-#     assert lr_b_last.tiles.tileId_start == 0
-#     assert lr_b_last.tiles.tileId_end == 10
-#     assert lr_b_last.tiles.subIterK_start == 1
-#     assert lr_b_last.mtIteration == "n+1"
+        # subIterK=1: LR A wrapping → next partition tile
+        assert [lr.tensor for lr in p[1].lrs] == ['A']
+        lr_a1 = _get_lr(p[1], 'A')
+        assert lr_a1.tiles.tileId_start == pi + 1
+        assert lr_a1.tiles.tileId_end == pi + 2
+        assert lr_a1.tiles.subIterK_start == 0
+        assert lr_a1.mtIteration == "n"
 
-#     # subIterK=1: LR A (wrapping → P0 tile [0]), LR B (wrapping → [0-9])
-#     assert [lr.tensor for lr in p9[1].lrs] == ['A', 'B']
-#     lr_a_wrap = _get_lr(p9[1], 'A')
-#     assert lr_a_wrap.tiles.tileId_start == 0
-#     assert lr_a_wrap.tiles.tileId_end == 1
-#     assert lr_a_wrap.tiles.subIterK_start == 0
-#     assert lr_a_wrap.mtIteration == "n+1"
+    # ── P9 (last): loads both A and B for MT n+1 ──
+    p9 = partitions[9]
+    assert p9[0].mfma.tileA.tileId_start == 9
+    assert p9[0].mfma.tileA.tileId_end == 10
+    assert p9[0].mfma.tileB.tileId_start == 0
+    assert p9[0].mfma.tileB.tileId_end == 10
 
-#     lr_b_wrap = _get_lr(p9[1], 'B')
-#     assert lr_b_wrap.tiles.tileId_start == 0
-#     assert lr_b_wrap.tiles.tileId_end == 10
-#     assert lr_b_wrap.tiles.subIterK_start == 0
-#     assert lr_b_wrap.mtIteration == "n+1"
+    # subIterK=0: LR A K-prefetch only (B K-prefetch [0-9] k[1] already placed by P0)
+    assert [lr.tensor for lr in p9[0].lrs] == ['A']
+    lr_a_last = _get_lr(p9[0], 'A')
+    assert lr_a_last.tiles.tileId_start == 9
+    assert lr_a_last.tiles.tileId_end == 10
+    assert lr_a_last.tiles.subIterK_start == 1
+    assert lr_a_last.mtIteration == "n+1"
+
+    # subIterK=1: LR A (wrapping → P0 tile [0]), LR B (wrapping → [0-9])
+    assert [lr.tensor for lr in p9[1].lrs] == ['A', 'B']
+    lr_a_wrap = _get_lr(p9[1], 'A')
+    assert lr_a_wrap.tiles.tileId_start == 0
+    assert lr_a_wrap.tiles.tileId_end == 1
+    assert lr_a_wrap.tiles.subIterK_start == 0
+    assert lr_a_wrap.mtIteration == "n+1"
+
+    lr_b_wrap = _get_lr(p9[1], 'B')
+    assert lr_b_wrap.tiles.tileId_start == 0
+    assert lr_b_wrap.tiles.tileId_end == 10
+    assert lr_b_wrap.tiles.subIterK_start == 0
+    assert lr_b_wrap.mtIteration == "n+1"
 
 
 # ── Step 2: Assign VGPR sets ──────────────────────────────
