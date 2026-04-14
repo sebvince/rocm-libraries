@@ -432,13 +432,11 @@ class MFMATileScheduler:
         Rule: MFMA and LR in the same subIterK never share a set.
         The next MFMA reads from whichever set the previous LR wrote to.
 
-        For k_gran < numK (multiple K-chunks): set = (k // k_gran) % 2,
-        independent per partition.
-
-        For k_gran >= numK (single K-chunk): the set depends on which
-        partition loaded the tile range. Tracked across partitions via
-        a tile_set map so that each partition reads from the set that a
-        previous partition's LR wrote into.
+        Single sequential scan across all partitions and subIterKs.
+        A map tracks (tensor, tile_range, k_chunk_start) → set_id.
+        Wrapping LRs (that reload a chunk already consumed) are deferred
+        until the end of the partition so they don't affect remaining
+        MFMAs within the same partition.
         """
         if self._step1_result is None:
             self.step1_place_LRs()
@@ -466,39 +464,52 @@ class MFMATileScheduler:
         part_ranges = [self._partition_tile_range(pi)
                        for pi in range(cfg.numPartitions)]
 
+        # Seed: preloop loads partition 0's tiles, chunk 0, into set 0.
+        # Key: (tensor, tile_range, k_chunk_start) → set_id
+        set_map = {}
         for t in tensor_names:
-            k_gran = tensor_k_gran[t]
             side_key = 'A' if t in ('A', 'SA') else 'B'
+            set_map[(t, part_ranges[0][side_key], 0)] = 0
 
-            if k_gran < numK:
-                # Multiple K-chunks: ping-pong by chunk index, same for
-                # every partition (the wrapping LRs maintain the cycle).
-                for slots in self._step1_result:
-                    for k in range(numK):
-                        mfma_set = (k // k_gran) % 2
-                        slots[k].mfma_sets[t] = mfma_set
-                        lr_for_t = [lr for lr in slots[k].lrs if lr.tensor == t]
-                        if lr_for_t:
-                            slots[k].lr_sets[t] = 1 - mfma_set
-            else:
-                # Single K-chunk: track which set each tile range occupies.
-                # Preloop loads partition 0's tiles into set 0.
-                tile_set = {part_ranges[0][side_key]: 0}
+        # Sequential scan across partitions and subIterKs
+        for pi, slots in enumerate(self._step1_result):
+            deferred = []  # wrapping LR writes, applied after partition
+            for k in range(numK):
+                slot = slots[k]
+                # Assign MFMA sets
+                for t in tensor_names:
+                    k_gran = tensor_k_gran[t]
+                    side_key = 'A' if t in ('A', 'SA') else 'B'
+                    tile_range = part_ranges[pi][side_key]
+                    k_chunk_start = (k // k_gran) * k_gran
+                    mfma_set = set_map.get((t, tile_range, k_chunk_start), 0)
+                    slot.mfma_sets[t] = mfma_set
 
-                for pi, slots in enumerate(self._step1_result):
-                    cur_range = part_ranges[pi][side_key]
-                    mfma_set = tile_set.get(cur_range, 0)
+                # Assign LR sets
+                for lr in slot.lrs:
+                    t = lr.tensor
+                    k_gran = tensor_k_gran[t]
+                    mfma_set = slot.mfma_sets[t]
+                    lr_set = 1 - mfma_set
+                    slot.lr_sets[t] = lr_set
 
-                    for k in range(numK):
-                        slots[k].mfma_sets[t] = mfma_set
-                        lr_for_t = [lr for lr in slots[k].lrs if lr.tensor == t]
-                        if lr_for_t:
-                            lr_set = 1 - mfma_set
-                            slots[k].lr_sets[t] = lr_set
-                            # LR loads a new tile range into lr_set
-                            lr = lr_for_t[0]
-                            lr_range = (lr.tiles.tileId_start, lr.tiles.tileId_end)
-                            tile_set[lr_range] = lr_set
+                    # Record what this LR loaded
+                    lr_tiles = (lr.tiles.tileId_start, lr.tiles.tileId_end)
+                    lr_k_start = lr.tiles.subIterK_start
+                    key = (t, lr_tiles, lr_k_start)
+
+                    # Wrapping LR: reloads a chunk at or before current chunk.
+                    # Defer so it doesn't affect this partition's remaining MFMAs.
+                    current_chunk = k // k_gran
+                    lr_chunk = lr_k_start // k_gran
+                    if lr_chunk <= current_chunk:
+                        deferred.append((key, lr_set))
+                    else:
+                        set_map[key] = lr_set
+
+            # Apply deferred wrapping writes for next partition / iteration
+            for key, val in deferred:
+                set_map[key] = val
 
         self._step2_partitions = self._step1_result
         self._step2_result = self._step2_partitions[0]
