@@ -638,111 +638,113 @@ def test_step1_LR_1x1_partition_2x2():
 
 
 
-# def test_step1_LR_1x2_partition_2x2():
-#     """Validate Step 1: MT=256x256, DU=256, FP4, LR A/B with k=2, 2x2 partition grid.
+def test_step1_LR_1x2_partition_2x2():
+    """Validate Step 1: MT=256x256, DU=256, FP4, LR A/B with k=2, 2x2 partition grid.
 
-#     8x8 MFMA tiles split into 4 partitions of 4x4 tiles each.
-#     Partition layout (column-major):
-#       P0: A[0-3], B[0-3]   P2: A[0-3], B[4-7]
-#       P1: A[4-7], B[0-3]   P3: A[4-7], B[4-7]
+    8x8 MFMA tiles split into 4 partitions of 4x4 tiles each.
+    Partition layout (column-major):
+      P0: A[0-3], B[0-3]   P2: A[0-3], B[4-7]
+      P1: A[4-7], B[0-3]   P3: A[4-7], B[4-7]
 
-#     Each partition has same subIterK structure as non-partitioned case,
-#     but with partition-local tile ranges.
-#     """
-#     kernel = create_kernel(256, 256, fp4=True)
-#     tiA = TileInfo('A', kernel)
-#     tiB = TileInfo('B', kernel)
-#     scaleTiA = TileInfo('MXSA', kernel)
-#     scaleTiB = TileInfo('MXSB', kernel)
+    Each partition has same subIterK structure as non-partitioned case,
+    but with partition-local tile ranges.
+    """
+    kernel = create_kernel(256, 256, fp4=True)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
 
-#     cfg = SchedulerConfig.from_tile_info(
-#         tiA, tiB,
-#         lrA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-#         lrB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-#         grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-#         grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-#         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-#         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-#         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-#         grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-#         grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-#         numPartitionsM=2,
-#         numPartitionsN=2,
-#     )
+    cfg = SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        numPartitionsM=2,
+        numPartitionsN=2,
+    )
 
-#     assert cfg.numPartitions == 4
-#     assert cfg.partitionSizeM == 4
-#     assert cfg.partitionSizeN == 4
+    assert cfg.numPartitions == 4
+    assert cfg.partitionSizeM == 4
+    assert cfg.partitionSizeN == 4
 
-#     sched = MFMATileScheduler(cfg)
-#     partitions = sched.step1_place_LRs()
-#     print(sched.print_step1())
+    sched = MFMATileScheduler(cfg)
+    partitions = sched.step1_place_LRs()
+    print(sched.print_step1())
 
-#     assert len(partitions) == 4
+    assert len(partitions) == 4
 
-#     # ── Partition 0: MFMA A[0-3],B[0-3] → LR loads A[4-7] for P1 (only A changes) ──
-#     p0 = partitions[0]
-#     assert len(p0) == 2
-#     assert p0[0].mfma.tileA.tileId_start == 0
-#     assert p0[0].mfma.tileA.tileId_end == 4
-#     assert p0[0].mfma.tileB.tileId_start == 0
-#     assert p0[0].mfma.tileB.tileId_end == 4
+    # ── Partition 0: MFMA A[0-3],B[0-3] → LR loads A[4-7] for P1 (only A changes) ──
+    p0 = partitions[0]
+    assert len(p0) == 2
+    assert p0[0].mfma.tileA.tileId_start == 0
+    assert p0[0].mfma.tileA.tileId_end == 4
+    assert p0[0].mfma.tileB.tileId_start == 0
+    assert p0[0].mfma.tileB.tileId_end == 4
 
-#     # Only A-side LRs (A changes P0→P1: [0-3]→[4-7], B stays [0-3])
-#     assert [lr.tensor for lr in p0[0].lrs] == ['A', 'SA']
-#     lr_a = _get_lr(p0[0], 'A')
-#     assert lr_a.tiles.tileId_start == 4
-#     assert lr_a.tiles.tileId_end == 8
-#     assert lr_a.mtIteration == "n"
-#     # No B or SB LRs
-#     assert len(p0[1].lrs) == 0
+    # Only A-side LRs (A changes P0→P1: [0-3]→[4-7], B stays [0-3])
+    assert [lr.tensor for lr in p0[0].lrs] == ['A', 'SA']
+    lr_a = _get_lr(p0[0], 'A')
+    assert lr_a.tiles.tileId_start == 4
+    assert lr_a.tiles.tileId_end == 8
+    assert lr_a.mtIteration == "n"
+    # No B or SB LRs
+    assert len(p0[1].lrs) == 0
 
-#     # ── Partition 1: MFMA A[4-7],B[0-3] → LR loads B[4-7] for P2 ──
-#     # Only B-side: A[0-3] already in VGPR set 0 (from MT start), A[4-7] in set 1 (P0 loaded).
-#     # B[4-7] not in either set → load it.
-#     p1 = partitions[1]
-#     assert p1[0].mfma.tileA.tileId_start == 4
-#     assert p1[0].mfma.tileA.tileId_end == 8
-#     assert p1[0].mfma.tileB.tileId_start == 0
-#     assert p1[0].mfma.tileB.tileId_end == 4
+    # ── Partition 1: MFMA A[4-7],B[0-3] → LR loads B[4-7] for P2 ──
+    # Only B-side: B[4-7] not yet loaded → load it.
+    # A stays [0-3]→[0-3] for P2 so no A wrapping needed.
+    p1 = partitions[1]
+    assert p1[0].mfma.tileA.tileId_start == 4
+    assert p1[0].mfma.tileA.tileId_end == 8
+    assert p1[0].mfma.tileB.tileId_start == 0
+    assert p1[0].mfma.tileB.tileId_end == 4
 
-#     assert [lr.tensor for lr in p1[0].lrs] == ['B', 'SB']
-#     lr_b1 = _get_lr(p1[0], 'B')
-#     assert lr_b1.tiles.tileId_start == 4
-#     assert lr_b1.tiles.tileId_end == 8
-#     assert lr_b1.mtIteration == "n"
-#     assert len(p1[1].lrs) == 0
+    # subIterK=0: no LRs
+    assert len(p1[0].lrs) == 0
+    # subIterK=1: LR B + SB (wrapping, B changes [0-3]→[4-7] for P2)
+    assert [lr.tensor for lr in p1[1].lrs] == ['B', 'SB']
+    lr_b1 = _get_lr(p1[1], 'B')
+    assert lr_b1.tiles.tileId_start == 4
+    assert lr_b1.tiles.tileId_end == 8
+    assert lr_b1.mtIteration == "n"
 
-#     # ── Partition 2: MFMA A[0-3],B[4-7] → No LRs needed ──
-#     # A[0-3] in set 0, A[4-7] in set 1. P3 needs A[4-7] → already in set 1.
-#     # B[0-3] in set 0, B[4-7] in set 1. P3 needs B[4-7] → already in set 1.
-#     p2 = partitions[2]
-#     assert p2[0].mfma.tileA.tileId_start == 0
-#     assert p2[0].mfma.tileA.tileId_end == 4
-#     assert p2[0].mfma.tileB.tileId_start == 4
-#     assert p2[0].mfma.tileB.tileId_end == 8
+    # ── Partition 2: MFMA A[0-3],B[4-7] → No LRs needed ──
+    # A[0-3] in set 0, A[4-7] in set 1. P3 needs A[4-7] → already in set 1.
+    # B[0-3] in set 0, B[4-7] in set 1. P3 needs B[4-7] → already in set 1.
+    p2 = partitions[2]
+    assert p2[0].mfma.tileA.tileId_start == 0
+    assert p2[0].mfma.tileA.tileId_end == 4
+    assert p2[0].mfma.tileB.tileId_start == 4
+    assert p2[0].mfma.tileB.tileId_end == 8
 
-#     assert len(p2[0].lrs) == 0
-#     assert len(p2[1].lrs) == 0
+    assert len(p2[0].lrs) == 0
+    assert len(p2[1].lrs) == 0
 
-#     # ── Partition 3: MFMA A[4-7],B[4-7] → LR loads A[0-3]+B[0-3] for P0 of MT n+1 ──
-#     p3 = partitions[3]
-#     assert p3[0].mfma.tileA.tileId_start == 4
-#     assert p3[0].mfma.tileA.tileId_end == 8
-#     assert p3[0].mfma.tileB.tileId_start == 4
-#     assert p3[0].mfma.tileB.tileId_end == 8
+    # ── Partition 3: MFMA A[4-7],B[4-7] → LR loads A[0-3]+B[0-3] for P0 of MT n+1 ──
+    p3 = partitions[3]
+    assert p3[0].mfma.tileA.tileId_start == 4
+    assert p3[0].mfma.tileA.tileId_end == 8
+    assert p3[0].mfma.tileB.tileId_start == 4
+    assert p3[0].mfma.tileB.tileId_end == 8
 
-#     # Both A and B change (wraps to P0 of next MT)
-#     assert [lr.tensor for lr in p3[0].lrs] == ['A', 'SA']
-#     assert [lr.tensor for lr in p3[1].lrs] == ['B', 'SB']
-#     lr_a3 = _get_lr(p3[0], 'A')
-#     assert lr_a3.tiles.tileId_start == 0
-#     assert lr_a3.tiles.tileId_end == 4
-#     assert lr_a3.mtIteration == "n+1"
-#     lr_b3 = _get_lr(p3[1], 'B')
-#     assert lr_b3.tiles.tileId_start == 0
-#     assert lr_b3.tiles.tileId_end == 4
-#     assert lr_b3.mtIteration == "n+1"
+    # Both A and B change (wraps to P0 of next MT)
+    assert [lr.tensor for lr in p3[0].lrs] == ['A', 'SA']
+    assert [lr.tensor for lr in p3[1].lrs] == ['B', 'SB']
+    lr_a3 = _get_lr(p3[0], 'A')
+    assert lr_a3.tiles.tileId_start == 0
+    assert lr_a3.tiles.tileId_end == 4
+    assert lr_a3.mtIteration == "n+1"
+    lr_b3 = _get_lr(p3[1], 'B')
+    assert lr_b3.tiles.tileId_start == 0
+    assert lr_b3.tiles.tileId_end == 4
+    assert lr_b3.mtIteration == "n+1"
 
 
 
