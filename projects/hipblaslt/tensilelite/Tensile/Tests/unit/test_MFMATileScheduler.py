@@ -1323,6 +1323,80 @@ def test_step2_DU512():
                 f"LR {t} at k={k} should write opposite of MFMA set"
 
 
+def test_step2_DU512_partition_2x2():
+    """Step 2: DU=512 + 2x2 partition, FP4. numSubIterK=4.
+
+    A/B k_gran=1 (< numK=4): chunk-based 0,1,0,1, same for all partitions.
+    SA/SB k_gran=2 (< numK=4): chunk-based 0,0,1,1, same for all partitions.
+
+    Unlike the DU256 2x2 case (k_gran >= numK → tile-range tracking),
+    here k_gran < numK so the chunk formula applies uniformly.
+    """
+    kernel = create_kernel(256, 256, fp4=True, depthU=512)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+
+    cfg = SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        numPartitionsM=2,
+        numPartitionsN=2,
+    )
+    assert cfg.numPartitions == 4
+    assert cfg.numSubIterK == 4
+    assert cfg.hasScale
+
+    sched = MFMATileScheduler(cfg)
+    sched.step2_assign_vgpr_sets()
+    print(sched.print_step2())
+    parts = sched._step2_partitions
+
+    # MFMA sets: chunk-based, identical across all 4 partitions.
+    # A/B: 0,1,0,1.  SA/SB: 0,0,1,1.
+    ab_expected = [0, 1, 0, 1]
+    sa_sb_expected = [0, 0, 1, 1]
+    for pi in range(4):
+        for k in range(4):
+            assert parts[pi][k].mfma_sets['A'] == ab_expected[k], \
+                f"P{pi} A mfma set at k={k}"
+            assert parts[pi][k].mfma_sets['B'] == ab_expected[k], \
+                f"P{pi} B mfma set at k={k}"
+            assert parts[pi][k].mfma_sets['SA'] == sa_sb_expected[k], \
+                f"P{pi} SA mfma set at k={k}"
+            assert parts[pi][k].mfma_sets['SB'] == sa_sb_expected[k], \
+                f"P{pi} SB mfma set at k={k}"
+
+    # LR sets: every LR writes opposite of its MFMA set.
+    for pi in range(4):
+        for k in range(4):
+            for t in parts[pi][k].lr_sets:
+                assert parts[pi][k].lr_sets[t] == 1 - parts[pi][k].mfma_sets[t], \
+                    f"P{pi} LR {t} at k={k} should write opposite of MFMA set"
+
+    # Spot-check LR presence per partition (different from 1x1 due to dedup).
+    # P0: all 4 subIterKs have LRs for A,B; SA at s0,s2; SB at s1
+    assert [lr.tensor for lr in parts[0][0].lrs] == ['A', 'B', 'SA']
+    assert [lr.tensor for lr in parts[0][1].lrs] == ['A', 'B', 'SB']
+    assert [lr.tensor for lr in parts[0][2].lrs] == ['A', 'B', 'SA']
+    assert [lr.tensor for lr in parts[0][3].lrs] == ['A']
+
+    # P3 (last): only s2 has LR SA, s3 has LR A,B,SB (all for MT n+1)
+    assert len(parts[3][0].lrs) == 0
+    assert len(parts[3][1].lrs) == 0
+    assert [lr.tensor for lr in parts[3][2].lrs] == ['SA']
+    assert [lr.tensor for lr in parts[3][3].lrs] == ['A', 'B', 'SB']
+
+
 # ── Step 3: Place GRs ────────────────────────────────────
 
 def test_step3_place_GRs():
