@@ -283,8 +283,12 @@ class MFMATileScheduler:
     # ── Step 1: Place LRs ─────────────────────────────────
 
     def _partition_tile_range(self, pi: int) -> dict:
-        """Return {'A': (start, end), 'B': (start, end)} for partition pi."""
+        """Return {'A': (start, end), 'B': (start, end)} for partition pi.
+
+        Uses COLUMN_MAJOR ordering: M (A) varies fastest, N (B) varies slowest.
+        """
         cfg = self.config
+        # COLUMN_MAJOR: M is inner (pi % M), N is outer (pi // M)
         piM = pi % cfg.numPartitionsM
         piN = pi // cfg.numPartitionsM
         a0 = piM * cfg.partitionSizeM
@@ -307,13 +311,12 @@ class MFMATileScheduler:
         """
         cfg = self.config
         numP = cfg.numPartitions
+        # Get range per partition index for A and B (COLUMN_MAJOR)
         part_ranges = [self._partition_tile_range(pi) for pi in range(numP)]
 
-        # VGPR set tracking: 2 sets per side, ping-pong.
-        # At MT start both sets hold P0's tiles.
-        vgpr = {'A': [part_ranges[0]['A']] * 2,
-                'B': [part_ranges[0]['B']] * 2}
-        write_set = {'A': 1, 'B': 1}
+        # Track which tile ranges are currently loaded
+        loaded_ranges = {'A': {part_ranges[0]['A']},
+                         'B': {part_ranges[0]['B']}}
 
         partitions = []
         for pi in range(numP):
@@ -322,16 +325,14 @@ class MFMATileScheduler:
 
             load = {}
             for side in ('A', 'B'):
-                load[side] = is_last or numP == 1 or nxt[side] not in vgpr[side]
+                load[side] = is_last or nxt[side] not in loaded_ranges[side]
 
             slots = self._place_LRs_for_partition(cur, nxt, is_last, load)
             partitions.append(slots)
 
             for side in ('A', 'B'):
                 if load[side]:
-                    ws = write_set[side]
-                    vgpr[side][ws] = nxt[side]
-                    write_set[side] = 1 - ws
+                    loaded_ranges[side] = {cur[side], nxt[side]}
 
         self._step1_result = partitions
         return partitions
