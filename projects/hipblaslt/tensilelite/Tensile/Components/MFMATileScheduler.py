@@ -570,7 +570,7 @@ class MFMATileScheduler:
         # ── Phase 2: Split across subIterKs by load count ──
         def _gr_loads(t_start, t_end, gr_gran):
             return ((t_end - t_start) // gr_gran.size.mn) * \
-                   (gr_gran.size.k // gr_gran.size.k)  # k_range/k = 1 per GR
+                   (numK // gr_gran.size.k)
 
         total_loads = sum(_gr_loads(ts, te, g) for _, _, ts, te, g in gr_list)
         loads_per_slot = total_loads // numK
@@ -581,27 +581,30 @@ class MFMATileScheduler:
 
         for tensor, mt_str, t_start, t_end, gr_gran in gr_list:
             mn = gr_gran.size.mn
-            k_size = gr_gran.size.k
+            k_factor = numK // gr_gran.size.k
             pos = t_start
 
             while pos < t_end:
                 space = loads_per_slot - cur_loads
-                remaining = (t_end - pos) // mn
+                mn_tiles = (t_end - pos) // mn
+                remaining = mn_tiles * k_factor
 
                 if remaining <= space or cur_slot == numK - 1:
                     slot_grs[cur_slot].append(GRPlacement(
                         tensor=tensor, mtIteration=mt_str,
-                        tiles=MFMATileRange(0, k_size, pos, t_end),
+                        tiles=MFMATileRange(0, numK, pos, t_end),
                         subIterK_slot=cur_slot))
                     cur_loads += remaining
                     pos = t_end
                 else:
-                    chunk_end = pos + space * mn
+                    # Split at mn boundary: ceiling division avoids tiny fragments
+                    mn_fit = max(1, (space + k_factor - 1) // k_factor)
+                    chunk_end = pos + mn_fit * mn
                     slot_grs[cur_slot].append(GRPlacement(
                         tensor=tensor, mtIteration=mt_str,
-                        tiles=MFMATileRange(0, k_size, pos, chunk_end),
+                        tiles=MFMATileRange(0, numK, pos, chunk_end),
                         subIterK_slot=cur_slot))
-                    cur_loads += space
+                    cur_loads += mn_fit * k_factor
                     pos = chunk_end
 
                 if cur_loads >= loads_per_slot and cur_slot < numK - 1:
