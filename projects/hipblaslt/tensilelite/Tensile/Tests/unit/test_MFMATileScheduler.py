@@ -1141,6 +1141,185 @@ def test_step2_assign_vgpr_sets():
     assert s1.lr_sets['SB'] == 1
 
 
+def test_step2_no_scale_k_gran_1():
+    """Step 2: no scales, A/B k_gran=1 → sets alternate every subIterK."""
+    cfg = SchedulerConfig(
+        numMFMATilesM=2,
+        numMFMATilesN=2,
+        numSubIterK=2,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+    )
+    assert not cfg.hasScale
+
+    sched = MFMATileScheduler(cfg)
+    slots = sched.step2_assign_vgpr_sets()
+    print(sched.print_step2())
+
+    # subIterK=0: MFMA reads set 0, LR writes set 1
+    s0 = slots[0]
+    assert s0.mfma_sets == {'A': 0, 'B': 0}
+    assert s0.lr_sets['A'] == 1
+    assert s0.lr_sets['B'] == 1
+
+    # subIterK=1: MFMA reads set 1 (flipped), LR writes set 0
+    s1 = slots[1]
+    assert s1.mfma_sets == {'A': 1, 'B': 1}
+    assert s1.lr_sets['A'] == 0
+    assert s1.lr_sets['B'] == 0
+
+
+def test_step2_no_scale_k_gran_numK():
+    """Step 2: no scales, A/B k_gran=numSubIterK → sets never advance."""
+    cfg = SchedulerConfig(
+        numMFMATilesM=2,
+        numMFMATilesN=2,
+        numSubIterK=2,
+        lrA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+    )
+    assert not cfg.hasScale
+
+    sched = MFMATileScheduler(cfg)
+    slots = sched.step2_assign_vgpr_sets()
+    print(sched.print_step2())
+
+    # Both subIterKs: MFMA stays on set 0 (k_gran == numK, no advance)
+    assert slots[0].mfma_sets == {'A': 0, 'B': 0}
+    assert slots[1].mfma_sets == {'A': 0, 'B': 0}
+
+    # LR A at slot 0 writes set 1 (opposite of MFMA set 0)
+    assert slots[0].lr_sets['A'] == 1
+    # LR B at slot 1 writes set 1
+    assert slots[1].lr_sets['B'] == 1
+
+
+def test_step2_partition_2x2():
+    """Step 2: 2x2 partition, FP4. All 4 partitions get VGPR set assignments.
+
+    A/B k_gran=1 → sets alternate. SA/SB k_gran=2 → sets stay at 0.
+    Each partition has different LR placements (from step1), so lr_sets differ.
+
+    Partition LR placements (from step1):
+      P0 (A[0-3],B[0-3]): s0: LR A,B,SA   s1: LR A
+      P1 (A[4-7],B[0-3]): s0: LR A,SB     s1: LR B
+      P2 (A[0-3],B[4-7]): s0: LR B        s1: (none)
+      P3 (A[4-7],B[4-7]): s0: LR SA       s1: LR A,B,SB
+    """
+    kernel = create_kernel(256, 256, fp4=True)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+
+    cfg = SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        numPartitionsM=2,
+        numPartitionsN=2,
+    )
+    assert cfg.numPartitions == 4
+    assert cfg.hasScale
+
+    sched = MFMATileScheduler(cfg)
+    sched.step2_assign_vgpr_sets()
+    print(sched.print_step2())
+    parts = sched._step2_partitions
+
+    # MFMA sets are now chunk-based, independent of LR presence.
+    # A/B k_gran=1: chunk_idx = k → set = k % 2 → s0=0, s1=1
+    # SA/SB k_gran=2 with numK=2: k_gran >= numK → always 0
+    for pi in range(4):
+        assert parts[pi][0].mfma_sets == {'A': 0, 'B': 0, 'SA': 0, 'SB': 0}
+        assert parts[pi][1].mfma_sets == {'A': 1, 'B': 1, 'SA': 0, 'SB': 0}
+
+    # LR sets differ per partition (depend on which LRs were placed by step1).
+    # LR always writes opposite of MFMA set in that slot.
+
+    # ── P0: s0 LR A,B,SA.  s1 LR A. ──
+    p0 = parts[0]
+    assert p0[0].lr_sets == {'A': 1, 'B': 1, 'SA': 1}
+    assert p0[1].lr_sets == {'A': 0}
+
+    # ── P1: s0 LR A,SB.  s1 LR B. ──
+    p1 = parts[1]
+    assert p1[0].lr_sets == {'A': 1, 'SB': 1}
+    assert p1[1].lr_sets == {'B': 0}
+
+    # ── P2: s0 LR B.  s1 no LRs. ──
+    p2 = parts[2]
+    assert p2[0].lr_sets == {'B': 1}
+    assert p2[1].lr_sets == {}
+
+    # ── P3: s0 LR SA.  s1 LR A,B,SB. ──
+    p3 = parts[3]
+    assert p3[0].lr_sets == {'SA': 1}
+    assert p3[1].lr_sets == {'A': 0, 'B': 0, 'SB': 1}
+
+
+def test_step2_DU512():
+    """Step 2: DU=512, FP4. numSubIterK=4, A/B k_gran=1, SA/SB k_gran=2.
+
+    A/B: sets flip every subIterK → 0,1,0,1
+    SA/SB: sets flip every 2 subIterKs → 0,0,1,1
+    """
+    kernel = create_kernel(256, 256, fp4=True, depthU=512)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+
+    cfg = SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+    )
+    assert cfg.numSubIterK == 4
+    assert cfg.hasScale
+
+    sched = MFMATileScheduler(cfg)
+    slots = sched.step2_assign_vgpr_sets()
+    print(sched.print_step2())
+
+    # A/B: k_gran=1 → sets alternate 0,1,0,1
+    ab_expected = [0, 1, 0, 1]
+    for k in range(4):
+        assert slots[k].mfma_sets['A'] == ab_expected[k], f"A mfma set at k={k}"
+        assert slots[k].mfma_sets['B'] == ab_expected[k], f"B mfma set at k={k}"
+
+    # SA/SB: k_gran=2 with numK=4 → 2 chunks, ping-pong by chunk index.
+    # Chunk 0 (k=0,1): set 0.  Chunk 1 (k=2,3): set 1.
+    sa_sb_expected = [0, 0, 1, 1]
+    for k in range(4):
+        assert slots[k].mfma_sets['SA'] == sa_sb_expected[k], f"SA mfma set at k={k}"
+        assert slots[k].mfma_sets['SB'] == sa_sb_expected[k], f"SB mfma set at k={k}"
+
+    # LR sets: each LR writes opposite of its MFMA set
+    for k in range(4):
+        for t in slots[k].lr_sets:
+            assert slots[k].lr_sets[t] == 1 - slots[k].mfma_sets[t], \
+                f"LR {t} at k={k} should write opposite of MFMA set"
+
+
 # ── Step 3: Place GRs ────────────────────────────────────
 
 def test_step3_place_GRs():

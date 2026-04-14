@@ -188,7 +188,7 @@ class SubIterKSlot:
     mfma: Optional[MFMAPlacement] = None
     lrs: List[LRPlacement] = field(default_factory=list)
     grs: List[GRPlacement] = field(default_factory=list)
-    # Step 2 annotations
+    # Step 2 annotations . TODO. Check if we keep this info like this. TBD when implementing unrolling.
     mfma_sets: Optional[dict] = None   # {'A': int, 'B': int, 'SA': int, 'SB': int}
     lr_sets: Optional[dict] = None     # tensor -> set id per LR
 
@@ -426,24 +426,10 @@ class MFMATileScheduler:
 
     # ── Step 2: Assign VGPR sets ──────────────────────────
 
-    def step2_assign_vgpr_sets(self) -> List[SubIterKSlot]:
-        """Assign VGPR set IDs (0 or 1) to MFMAs and LRs.
-
-        Rule: MFMA at subIterK=k reads from the set that was written by the
-        LR that loaded that subIterK's data. The LR writes to the *other* set
-        so that MFMA and LR never collide.
-        """
-        if self._step1_result is None:
-            self.step1_place_LRs()
-        slots = self._step1_result[0]  # operate on partition 0
+    def _assign_vgpr_sets_for_partition(self, slots: List[SubIterKSlot]) -> List[SubIterKSlot]:
+        """Assign VGPR set IDs (0 or 1) to MFMAs and LRs for one partition."""
         cfg = self.config
         numK = cfg.numSubIterK
-
-        # For each tensor, track which set the MFMA reads at each subIterK.
-        # subIterK=0 MFMA always reads set 0.
-        # If LR at subIterK=k loads data for subIterK=k+1,
-        # then LR writes to set != MFMA[k].set (the other set),
-        # and MFMA[k+1] reads from that written set.
 
         tensor_names = ['A', 'B']
         if cfg.hasScale:
@@ -461,25 +447,42 @@ class MFMATileScheduler:
             tensor_k_gran['SA'] = cfg.lrSA.size.k
             tensor_k_gran['SB'] = cfg.lrSB.size.k
 
-        # Assign sets per tensor across subIterKs
+        # Assign sets per tensor across subIterKs.
+        # MFMA set is determined by the chunk index (k // k_gran):
+        #   - k_gran == numK (single chunk): always set 0
+        #   - k_gran < numK (multiple chunks): ping-pong by chunk index
+        # LR always writes to the opposite set so MFMA and LR never collide.
         for t in tensor_names:
-            current_set = 0
+            k_gran = tensor_k_gran[t]
             for k in range(numK):
-                slots[k].mfma_sets[t] = current_set
+                if k_gran >= numK:
+                    mfma_set = 0
+                else:
+                    mfma_set = (k // k_gran) % 2
+                slots[k].mfma_sets[t] = mfma_set
                 # Find LR in this slot for this tensor
                 lr_for_t = [lr for lr in slots[k].lrs if lr.tensor == t]
                 if lr_for_t:
-                    # LR writes to the *other* set
-                    lr_set = 1 - current_set
-                    slots[k].lr_sets[t] = lr_set
-                    # Only advance MFMA set if k_gran == 1 (per-subIterK loads).
-                    # For k_gran == numSubIterK, the LR loads for next MT,
-                    # so current MT's MFMAs keep reading the same set.
-                    if tensor_k_gran[t] == 1:
-                        current_set = lr_set
+                    slots[k].lr_sets[t] = 1 - mfma_set
 
-        self._step2_result = slots
         return slots
+
+    def step2_assign_vgpr_sets(self) -> List[SubIterKSlot]:
+        """Assign VGPR set IDs (0 or 1) to MFMAs and LRs.
+
+        Rule: MFMA at subIterK=k reads from the set that was written by the
+        LR that loaded that subIterK's data. The LR writes to the *other* set
+        so that MFMA and LR never collide.
+        """
+        if self._step1_result is None:
+            self.step1_place_LRs()
+
+        self._step2_partitions = [
+            self._assign_vgpr_sets_for_partition(slots)
+            for slots in self._step1_result
+        ]
+        self._step2_result = self._step2_partitions[0]
+        return self._step2_result
 
     # ── Step 3: Place GRs ─────────────────────────────────
 
@@ -837,34 +840,34 @@ class MFMATileScheduler:
                           f"{lr.tiles.fmt_tiles()}\n")
         return buf.getvalue()
 
-    def print_step2(self, slots: List[SubIterKSlot] = None) -> str:
+    def print_step2(self) -> str:
         """Print Step 2 output: same as Step 1 but with set annotations."""
-        if slots is None:
-            slots = self._step2_result
+        partitions = self._step2_partitions
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
-        buf.write("  Partition 0:\n")
-        for slot in slots:
-            buf.write(f"    subIterK={slot.subIterK}:\n")
-            if slot.mfma:
-                m = slot.mfma
-                sets_str = ""
-                if slot.mfma_sets:
-                    sets_str = " " + ", ".join(
-                        f"set{t}:{slot.mfma_sets[t]}"
-                        for t in sorted(slot.mfma_sets.keys())
-                    )
-                buf.write(f"      MFMAs (MT n, subIterK {m.subIterK}  ) "
-                          f"A : {m.tileA.fmt_tiles()} , "
-                          f"B : {m.tileB.fmt_tiles()}{sets_str}\n")
-            for lr in slot.lrs:
-                set_str = ""
-                if slot.lr_sets and lr.tensor in slot.lr_sets:
-                    set_str = f" set{lr.tensor}:{slot.lr_sets[lr.tensor]}"
-                t = self._fmt_tensor(lr.tensor)
-                buf.write(f"      LR {t} (MT {lr.mtIteration}, "
-                          f"subIterK {lr.tiles.fmt_k()}) "
-                          f"{lr.tiles.fmt_tiles()}{set_str}\n")
+        for pi, slots in enumerate(partitions):
+            buf.write(f"  Partition {pi}:\n")
+            for slot in slots:
+                buf.write(f"    subIterK={slot.subIterK}:\n")
+                if slot.mfma:
+                    m = slot.mfma
+                    sets_str = ""
+                    if slot.mfma_sets:
+                        sets_str = " " + ", ".join(
+                            f"set{t}:{slot.mfma_sets[t]}"
+                            for t in sorted(slot.mfma_sets.keys())
+                        )
+                    buf.write(f"      MFMAs (MT n, subIterK {m.subIterK}  ) "
+                              f"A : {m.tileA.fmt_tiles()} , "
+                              f"B : {m.tileB.fmt_tiles()}{sets_str}\n")
+                for lr in slot.lrs:
+                    set_str = ""
+                    if slot.lr_sets and lr.tensor in slot.lr_sets:
+                        set_str = f" set{lr.tensor}:{slot.lr_sets[lr.tensor]}"
+                    t = self._fmt_tensor(lr.tensor)
+                    buf.write(f"      LR {t} (MT {lr.mtIteration}, "
+                              f"subIterK {lr.tiles.fmt_k()}) "
+                              f"{lr.tiles.fmt_tiles()}{set_str}\n")
         return buf.getvalue()
 
     def print_step3(self, slots: List[SubIterKSlot] = None) -> str:
