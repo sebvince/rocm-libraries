@@ -1238,35 +1238,38 @@ def test_step2_partition_2x2():
     print(sched.print_step2())
     parts = sched._step2_partitions
 
-    # MFMA sets are now chunk-based, independent of LR presence.
-    # A/B k_gran=1: chunk_idx = k → set = k % 2 → s0=0, s1=1
-    # SA/SB k_gran=2 with numK=2: k_gran >= numK → always 0
-    for pi in range(4):
-        assert parts[pi][0].mfma_sets == {'A': 0, 'B': 0, 'SA': 0, 'SB': 0}
-        assert parts[pi][1].mfma_sets == {'A': 1, 'B': 1, 'SA': 0, 'SB': 0}
+    # A/B k_gran=1 (< numK=2): chunk-based, same for all partitions.
+    # SA/SB k_gran=2 (>= numK=2): tile-range tracking across partitions.
+    #   SA follows A-side tiles: P0/P2=[0-3]→set 0, P1/P3=[4-7]→set 1
+    #   SB follows B-side tiles: P0/P1=[0-3]→set 0, P2/P3=[4-7]→set 1
 
-    # LR sets differ per partition (depend on which LRs were placed by step1).
-    # LR always writes opposite of MFMA set in that slot.
-
-    # ── P0: s0 LR A,B,SA.  s1 LR A. ──
+    # ── P0: SA[0-3]=set0, SB[0-3]=set0. LR A,B,SA at s0; LR A at s1. ──
     p0 = parts[0]
+    assert p0[0].mfma_sets == {'A': 0, 'B': 0, 'SA': 0, 'SB': 0}
+    assert p0[1].mfma_sets == {'A': 1, 'B': 1, 'SA': 0, 'SB': 0}
     assert p0[0].lr_sets == {'A': 1, 'B': 1, 'SA': 1}
     assert p0[1].lr_sets == {'A': 0}
 
-    # ── P1: s0 LR A,SB.  s1 LR B. ──
+    # ── P1: SA[4-7]=set1 (loaded by P0 LR), SB[0-3]=set0. ──
     p1 = parts[1]
+    assert p1[0].mfma_sets == {'A': 0, 'B': 0, 'SA': 1, 'SB': 0}
+    assert p1[1].mfma_sets == {'A': 1, 'B': 1, 'SA': 1, 'SB': 0}
     assert p1[0].lr_sets == {'A': 1, 'SB': 1}
     assert p1[1].lr_sets == {'B': 0}
 
-    # ── P2: s0 LR B.  s1 no LRs. ──
+    # ── P2: SA[0-3]=set0, SB[4-7]=set1 (loaded by P1 LR). ──
     p2 = parts[2]
+    assert p2[0].mfma_sets == {'A': 0, 'B': 0, 'SA': 0, 'SB': 1}
+    assert p2[1].mfma_sets == {'A': 1, 'B': 1, 'SA': 0, 'SB': 1}
     assert p2[0].lr_sets == {'B': 1}
     assert p2[1].lr_sets == {}
 
-    # ── P3: s0 LR SA.  s1 LR A,B,SB. ──
+    # ── P3: SA[4-7]=set1, SB[4-7]=set1. LR SA at s0; LR A,B,SB at s1. ──
     p3 = parts[3]
-    assert p3[0].lr_sets == {'SA': 1}
-    assert p3[1].lr_sets == {'A': 0, 'B': 0, 'SB': 1}
+    assert p3[0].mfma_sets == {'A': 0, 'B': 0, 'SA': 1, 'SB': 1}
+    assert p3[1].mfma_sets == {'A': 1, 'B': 1, 'SA': 1, 'SB': 1}
+    assert p3[0].lr_sets == {'SA': 0}
+    assert p3[1].lr_sets == {'A': 0, 'B': 0, 'SB': 0}
 
 
 def test_step2_DU512():

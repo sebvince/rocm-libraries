@@ -426,8 +426,23 @@ class MFMATileScheduler:
 
     # ── Step 2: Assign VGPR sets ──────────────────────────
 
-    def _assign_vgpr_sets_for_partition(self, slots: List[SubIterKSlot]) -> List[SubIterKSlot]:
-        """Assign VGPR set IDs (0 or 1) to MFMAs and LRs for one partition."""
+    def step2_assign_vgpr_sets(self) -> List[SubIterKSlot]:
+        """Assign VGPR set IDs (0 or 1) to MFMAs and LRs.
+
+        Rule: MFMA and LR in the same subIterK never share a set.
+        The next MFMA reads from whichever set the previous LR wrote to.
+
+        For k_gran < numK (multiple K-chunks): set = (k // k_gran) % 2,
+        independent per partition.
+
+        For k_gran >= numK (single K-chunk): the set depends on which
+        partition loaded the tile range. Tracked across partitions via
+        a tile_set map so that each partition reads from the set that a
+        previous partition's LR wrote into.
+        """
+        if self._step1_result is None:
+            self.step1_place_LRs()
+
         cfg = self.config
         numK = cfg.numSubIterK
 
@@ -435,52 +450,57 @@ class MFMATileScheduler:
         if cfg.hasScale:
             tensor_names += ['SA', 'SB']
 
-        for slot in slots:
-            slot.mfma_sets = {}
-            slot.lr_sets = {}
-
-        # Determine k granularity per tensor for set-advance logic
         tensor_k_gran = {}
-        for t, gran, _ in [('A', cfg.lrA, 0), ('B', cfg.lrB, 0)]:
+        for t, gran in [('A', cfg.lrA), ('B', cfg.lrB)]:
             tensor_k_gran[t] = gran.size.k
         if cfg.hasScale:
             tensor_k_gran['SA'] = cfg.lrSA.size.k
             tensor_k_gran['SB'] = cfg.lrSB.size.k
 
-        # Assign sets per tensor across subIterKs.
-        # MFMA set is determined by the chunk index (k // k_gran):
-        #   - k_gran == numK (single chunk): always set 0
-        #   - k_gran < numK (multiple chunks): ping-pong by chunk index
-        # LR always writes to the opposite set so MFMA and LR never collide.
+        # Initialize all slots across all partitions
+        for partition_slots in self._step1_result:
+            for slot in partition_slots:
+                slot.mfma_sets = {}
+                slot.lr_sets = {}
+
+        part_ranges = [self._partition_tile_range(pi)
+                       for pi in range(cfg.numPartitions)]
+
         for t in tensor_names:
             k_gran = tensor_k_gran[t]
-            for k in range(numK):
-                if k_gran >= numK:
-                    mfma_set = 0
-                else:
-                    mfma_set = (k // k_gran) % 2
-                slots[k].mfma_sets[t] = mfma_set
-                # Find LR in this slot for this tensor
-                lr_for_t = [lr for lr in slots[k].lrs if lr.tensor == t]
-                if lr_for_t:
-                    slots[k].lr_sets[t] = 1 - mfma_set
+            side_key = 'A' if t in ('A', 'SA') else 'B'
 
-        return slots
+            if k_gran < numK:
+                # Multiple K-chunks: ping-pong by chunk index, same for
+                # every partition (the wrapping LRs maintain the cycle).
+                for slots in self._step1_result:
+                    for k in range(numK):
+                        mfma_set = (k // k_gran) % 2
+                        slots[k].mfma_sets[t] = mfma_set
+                        lr_for_t = [lr for lr in slots[k].lrs if lr.tensor == t]
+                        if lr_for_t:
+                            slots[k].lr_sets[t] = 1 - mfma_set
+            else:
+                # Single K-chunk: track which set each tile range occupies.
+                # Preloop loads partition 0's tiles into set 0.
+                tile_set = {part_ranges[0][side_key]: 0}
 
-    def step2_assign_vgpr_sets(self) -> List[SubIterKSlot]:
-        """Assign VGPR set IDs (0 or 1) to MFMAs and LRs.
+                for pi, slots in enumerate(self._step1_result):
+                    cur_range = part_ranges[pi][side_key]
+                    mfma_set = tile_set.get(cur_range, 0)
 
-        Rule: MFMA at subIterK=k reads from the set that was written by the
-        LR that loaded that subIterK's data. The LR writes to the *other* set
-        so that MFMA and LR never collide.
-        """
-        if self._step1_result is None:
-            self.step1_place_LRs()
+                    for k in range(numK):
+                        slots[k].mfma_sets[t] = mfma_set
+                        lr_for_t = [lr for lr in slots[k].lrs if lr.tensor == t]
+                        if lr_for_t:
+                            lr_set = 1 - mfma_set
+                            slots[k].lr_sets[t] = lr_set
+                            # LR loads a new tile range into lr_set
+                            lr = lr_for_t[0]
+                            lr_range = (lr.tiles.tileId_start, lr.tiles.tileId_end)
+                            tile_set[lr_range] = lr_set
 
-        self._step2_partitions = [
-            self._assign_vgpr_sets_for_partition(slots)
-            for slots in self._step1_result
-        ]
+        self._step2_partitions = self._step1_result
         self._step2_result = self._step2_partitions[0]
         return self._step2_result
 
