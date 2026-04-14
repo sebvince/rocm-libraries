@@ -518,54 +518,105 @@ class MFMATileScheduler:
     # ── Step 3: Place GRs ─────────────────────────────────
 
     def step3_place_GRs(self) -> List[SubIterKSlot]:
-        """Place Global Reads for MT n+2.
+        """Place Global Reads by building an ordered list across partitions.
 
-        GRs are split across subIterKs:
-        - subIterK=0: GR SA + GR A
-        - subIterK=1: GR SB + GR B
-        (or further split if more subIterKs available)
+        1. For each partition (column-major), determine target partition/MT:
+           target = (pi + offsetPartition) % numP
+           MT = n + offsetMT + (1 if wraps else 0)
+        2. Add GRs in local order: SA, SB, A, B. Dedup identical requests.
+        3. Flatten into a single ordered list.
+        4. Split evenly across subIterKs by load count, splitting tile
+           ranges at mn boundaries when a GR doesn't fit in one slot.
         """
         if self._step2_result is None:
             self.step2_assign_vgpr_sets()
-        slots = self._step2_result
         cfg = self.config
         numK = cfg.numSubIterK
+        numP = cfg.numPartitions
 
-        # GR for A and SA go in subIterK=0, B and SB go in subIterK=1
-        # Each tensor gets one GR per subIterK covering all its M/N tiles.
-        # The mn granularity is metadata for emission (how many buffer_loads),
-        # not for splitting at the logical level.
+        # TODO: cover PGR3 (offsetMT and offsetPartition may differ)
+        offsetMT = 1
+        offsetPartition = 1
 
-        gr_a_slot = 0
-        gr_b_slot = min(1, numK - 1)
+        part_ranges = [self._partition_tile_range(pi) for pi in range(numP)]
 
-        # Place GR A (all M tiles)
-        slots[gr_a_slot].grs.append(GRPlacement(
-            tensor='A', mtIteration='n+2',
-            tiles=MFMATileRange(0, cfg.grA.size.k, 0, cfg.numMFMATilesM),
-            subIterK_slot=gr_a_slot))
+        # ── Phase 1: Build ordered GR list ──
+        seen = set()
+        gr_list = []  # (tensor, mt_str, tile_start, tile_end, gr_gran)
 
-        # Place GR B (all N tiles)
-        slots[gr_b_slot].grs.append(GRPlacement(
-            tensor='B', mtIteration='n+2',
-            tiles=MFMATileRange(0, cfg.grB.size.k, 0, cfg.numMFMATilesN),
-            subIterK_slot=gr_b_slot))
+        for pi in range(numP):
+            target_pi = (pi + offsetPartition) % numP
+            wraps = (pi + offsetPartition) >= numP
+            mt_offset = offsetMT + (1 if wraps else 0)
+            mt_str = f"n+{mt_offset}"
 
-        if cfg.hasScale:
-            # GR SA in same slot as GR A
-            slots[gr_a_slot].grs.append(GRPlacement(
-                tensor='SA', mtIteration='n+2',
-                tiles=MFMATileRange(0, cfg.grSA.size.k, 0, cfg.numMFMATilesM),
-                subIterK_slot=gr_a_slot))
+            target = part_ranges[target_pi]
 
-            # GR SB in same slot as GR B
-            slots[gr_b_slot].grs.append(GRPlacement(
-                tensor='SB', mtIteration='n+2',
-                tiles=MFMATileRange(0, cfg.grSB.size.k, 0, cfg.numMFMATilesN),
-                subIterK_slot=gr_b_slot))
+            # Local order: SA, SB, A, B
+            items = []
+            if cfg.hasScale:
+                items.append(('SA', target['A'], cfg.grSA))
+                items.append(('SB', target['B'], cfg.grSB))
+            items.append(('A', target['A'], cfg.grA))
+            items.append(('B', target['B'], cfg.grB))
 
-        self._step3_result = slots
-        return slots
+            for tensor, (t_start, t_end), gr_gran in items:
+                key = (tensor, t_start, t_end, mt_str)
+                if key in seen:
+                    continue
+                seen.add(key)
+                gr_list.append((tensor, mt_str, t_start, t_end, gr_gran))
+
+        # ── Phase 2: Split across subIterKs by load count ──
+        def _gr_loads(t_start, t_end, gr_gran):
+            return ((t_end - t_start) // gr_gran.size.mn) * \
+                   (gr_gran.size.k // gr_gran.size.k)  # k_range/k = 1 per GR
+
+        total_loads = sum(_gr_loads(ts, te, g) for _, _, ts, te, g in gr_list)
+        loads_per_slot = total_loads // numK
+
+        slot_grs = [[] for _ in range(numK)]
+        cur_slot = 0
+        cur_loads = 0
+
+        for tensor, mt_str, t_start, t_end, gr_gran in gr_list:
+            mn = gr_gran.size.mn
+            k_size = gr_gran.size.k
+            pos = t_start
+
+            while pos < t_end:
+                space = loads_per_slot - cur_loads
+                remaining = (t_end - pos) // mn
+
+                if remaining <= space or cur_slot == numK - 1:
+                    slot_grs[cur_slot].append(GRPlacement(
+                        tensor=tensor, mtIteration=mt_str,
+                        tiles=MFMATileRange(0, k_size, pos, t_end),
+                        subIterK_slot=cur_slot))
+                    cur_loads += remaining
+                    pos = t_end
+                else:
+                    chunk_end = pos + space * mn
+                    slot_grs[cur_slot].append(GRPlacement(
+                        tensor=tensor, mtIteration=mt_str,
+                        tiles=MFMATileRange(0, k_size, pos, chunk_end),
+                        subIterK_slot=cur_slot))
+                    cur_loads += space
+                    pos = chunk_end
+
+                if cur_loads >= loads_per_slot and cur_slot < numK - 1:
+                    cur_slot += 1
+                    cur_loads = 0
+
+        # Place GRs in all partitions
+        for partition_slots in self._step2_partitions:
+            for slot_idx, grs in enumerate(slot_grs):
+                for gr in grs:
+                    partition_slots[slot_idx].grs.append(gr)
+
+        self._step3_partitions = self._step2_partitions
+        self._step3_result = self._step3_partitions[0]
+        return self._step3_result
 
     # ── Step 4: Annotate dependencies ─────────────────────
 
@@ -901,38 +952,38 @@ class MFMATileScheduler:
                               f"{lr.tiles.fmt_tiles()}{set_str}\n")
         return buf.getvalue()
 
-    def print_step3(self, slots: List[SubIterKSlot] = None) -> str:
-        """Print Step 3 output: Step 2 + GR placements."""
-        if slots is None:
-            slots = self._step3_result
+    def print_step3(self) -> str:
+        """Print Step 3 output: Step 2 + GR placements, all partitions."""
+        partitions = self._step3_partitions
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
-        buf.write("  Partition 0:\n")
-        for slot in slots:
-            buf.write(f"    subIterK={slot.subIterK}:\n")
-            if slot.mfma:
-                m = slot.mfma
-                sets_str = ""
-                if slot.mfma_sets:
-                    sets_str = " " + ", ".join(
-                        f"set{t}:{slot.mfma_sets[t]}"
-                        for t in sorted(slot.mfma_sets.keys())
-                    )
-                buf.write(f"      MFMAs (MT n, subIterK {m.subIterK}  ) "
-                          f"A : {m.tileA.fmt_tiles()} , "
-                          f"B : {m.tileB.fmt_tiles()}{sets_str}\n")
-            for lr in slot.lrs:
-                set_str = ""
-                if slot.lr_sets and lr.tensor in slot.lr_sets:
-                    set_str = f" set{lr.tensor}:{slot.lr_sets[lr.tensor]}"
-                t = self._fmt_tensor(lr.tensor)
-                buf.write(f"      LR {t} (MT {lr.mtIteration}, "
-                          f"subIterK {lr.tiles.fmt_k()}) "
-                          f"{lr.tiles.fmt_tiles()}{set_str}\n")
-            for gr in slot.grs:
-                buf.write(f"      GR {gr.tensor} (MT {gr.mtIteration}, "
-                          f"subIterK {gr.tiles.fmt_k()}) "
-                          f"ids {gr.tiles.fmt_tiles()}\n")
+        for pi, slots in enumerate(partitions):
+            buf.write(f"  Partition {pi}:\n")
+            for slot in slots:
+                buf.write(f"    subIterK={slot.subIterK}:\n")
+                if slot.mfma:
+                    m = slot.mfma
+                    sets_str = ""
+                    if slot.mfma_sets:
+                        sets_str = " " + ", ".join(
+                            f"set{t}:{slot.mfma_sets[t]}"
+                            for t in sorted(slot.mfma_sets.keys())
+                        )
+                    buf.write(f"      MFMAs (MT n, subIterK {m.subIterK}  ) "
+                              f"A : {m.tileA.fmt_tiles()} , "
+                              f"B : {m.tileB.fmt_tiles()}{sets_str}\n")
+                for lr in slot.lrs:
+                    set_str = ""
+                    if slot.lr_sets and lr.tensor in slot.lr_sets:
+                        set_str = f" set{lr.tensor}:{slot.lr_sets[lr.tensor]}"
+                    t = self._fmt_tensor(lr.tensor)
+                    buf.write(f"      LR {t} (MT {lr.mtIteration}, "
+                              f"subIterK {lr.tiles.fmt_k()}) "
+                              f"{lr.tiles.fmt_tiles()}{set_str}\n")
+                for gr in slot.grs:
+                    buf.write(f"      GR {gr.tensor} (MT {gr.mtIteration}, "
+                              f"subIterK {gr.tiles.fmt_k()}) "
+                              f"ids {gr.tiles.fmt_tiles()}\n")
         return buf.getvalue()
 
     def print_step4(self, grouped: List[GroupedSubIterK] = None) -> str:

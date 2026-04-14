@@ -103,8 +103,8 @@ def make_256x256_fp4():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
     )
 
 
@@ -212,8 +212,8 @@ def test_step1_LR_1x2_partition_1x1():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
     )
 
     assert cfg.numMFMATilesM == 8
@@ -281,8 +281,8 @@ def test_step1_LR_1x1_partition_1x1_DU512():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
     )
 
     assert cfg.numMFMATilesM == 8
@@ -379,8 +379,8 @@ def test_step1_LR_1x2_partition_1x1_DU512():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
     )
 
     assert cfg.numMFMATilesM == 8
@@ -494,8 +494,8 @@ def test_step1_LR_1x1_partition_2x2():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
         numPartitionsM=2,
         numPartitionsN=2,
     )
@@ -674,8 +674,8 @@ def test_step1_LR_1x1_partition_2x2_DU512():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
         numPartitionsM=2,
         numPartitionsN=2,
     )
@@ -895,8 +895,8 @@ def test_step1_LR_1x2_partition_2x2():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
         numPartitionsM=2,
         numPartitionsN=2,
     )
@@ -1225,8 +1225,8 @@ def test_step2_partition_2x2():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
         numPartitionsM=2,
         numPartitionsN=2,
     )
@@ -1293,8 +1293,8 @@ def test_step2_DU512():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
     )
     assert cfg.numSubIterK == 4
     assert cfg.hasScale
@@ -1347,8 +1347,8 @@ def test_step2_DU512_partition_2x2():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
         numPartitionsM=2,
         numPartitionsN=2,
     )
@@ -1399,12 +1399,18 @@ def test_step2_DU512_partition_2x2():
 
 # ── Step 3: Place GRs ────────────────────────────────────
 
-def _assert_gr(slot, tensor, k_start, k_end, tile_start, tile_end):
-    """Assert a GR for tensor exists in slot with expected tile range."""
+def _assert_gr(slot, tensor, k_start, k_end, tile_start, tile_end, mt='n+2', idx=0):
+    """Assert a GR for tensor exists in slot with expected tile range.
+
+    idx selects which GR for the tensor (0-based) when a tensor appears
+    multiple times in one slot (e.g. after a split).
+    """
     grs = [gr for gr in slot.grs if gr.tensor == tensor]
-    assert len(grs) == 1, f"Expected 1 GR for {tensor} in slot {slot.subIterK}, got {len(grs)}"
-    gr = grs[0]
-    assert gr.mtIteration == 'n+2'
+    assert len(grs) > idx, \
+        f"Expected at least {idx+1} GR(s) for {tensor} in slot {slot.subIterK}, got {len(grs)}"
+    gr = grs[idx]
+    assert gr.mtIteration == mt, \
+        f"GR {tensor}[{idx}] in slot {slot.subIterK}: expected mt={mt}, got {gr.mtIteration}"
     assert gr.tiles.subIterK_start == k_start
     assert gr.tiles.subIterK_end == k_end
     assert gr.tiles.tileId_start == tile_start
@@ -1412,27 +1418,41 @@ def _assert_gr(slot, tensor, k_start, k_end, tile_start, tile_end):
 
 
 def test_step3_LR_1x1_partition_1x1():
-    """Step 3: 256x256, DU256, FP4, k=1. GR A+SA at s0, GR B+SB at s1."""
+    """Step 3: 256x256, DU256, FP4, k=1.
+
+    1 partition, numK=2. GR order: SA, SB, A, B.
+    Scale GR mn=8 (covers entire MT in 1 load).
+    Load counts: SA(1), SB(1), A(8), B(8) = 18 total, 9 per slot.
+    s0: SA[0-7](1) + SB[0-7](1) + A[0-6](7) = 9
+    s1: A[7-7](1) + B[0-7](8) = 9
+    """
     cfg = make_256x256_fp4()
     sched = MFMATileScheduler(cfg)
     slots = sched.step3_place_GRs()
     print(sched.print_step3())
 
-    # subIterK=0: GR A [0-7] + GR SA [0-7]
-    assert [gr.tensor for gr in slots[0].grs] == ['A', 'SA']
-    _assert_gr(slots[0], 'A', 0, 2, 0, 8)
+    # subIterK=0: SA[0-7], SB[0-7], A[0-6]
+    assert [gr.tensor for gr in slots[0].grs] == ['SA', 'SB', 'A']
     _assert_gr(slots[0], 'SA', 0, 2, 0, 8)
+    _assert_gr(slots[0], 'SB', 0, 2, 0, 8)
+    _assert_gr(slots[0], 'A', 0, 2, 0, 7)
 
-    # subIterK=1: GR B [0-7] + GR SB [0-7]
-    assert [gr.tensor for gr in slots[1].grs] == ['B', 'SB']
+    # subIterK=1: A[7-7], B[0-7]
+    assert [gr.tensor for gr in slots[1].grs] == ['A', 'B']
+    _assert_gr(slots[1], 'A', 0, 2, 7, 8)
     _assert_gr(slots[1], 'B', 0, 2, 0, 8)
-    _assert_gr(slots[1], 'SB', 0, 2, 0, 8)
 
 
 def test_step3_LR_1x1_partition_1x1_DU512():
-    """Step 3: 256x256, DU512, FP4, k=1. GR A+SA at s0, GR B+SB at s1.
+    """Step 3: 256x256, DU512, FP4, k=1.
 
-    numSubIterK=4 but GR still only goes in s0 and s1. GR k range = grX.size.k = 2.
+    1 partition, numK=4. GR order: SA, SB, A, B.
+    Scale GR mn=8 (1 load each).
+    Load counts: SA(1), SB(1), A(8), B(8) = 18 total, per_slot=4.
+    s0: SA[0-7](1) + SB[0-7](1) + A[0-1](2) = 4
+    s1: A[2-5](4) = 4
+    s2: A[6-7](2) + B[0-1](2) = 4
+    s3: B[2-7](6)
     """
     kernel = create_kernel(256, 256, fp4=True, depthU=512)
     tiA = TileInfo('A', kernel)
@@ -1449,30 +1469,46 @@ def test_step3_LR_1x1_partition_1x1_DU512():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
     )
     sched = MFMATileScheduler(cfg)
     slots = sched.step3_place_GRs()
     print(sched.print_step3())
 
-    # GRs only in s0 and s1, none in s2/s3
-    assert [gr.tensor for gr in slots[0].grs] == ['A', 'SA']
-    _assert_gr(slots[0], 'A', 0, 2, 0, 8)
+    # s0: SA[0-7](1), SB[0-7](1), A[0-1](2)
+    assert [gr.tensor for gr in slots[0].grs] == ['SA', 'SB', 'A']
     _assert_gr(slots[0], 'SA', 0, 2, 0, 8)
+    _assert_gr(slots[0], 'SB', 0, 2, 0, 8)
+    _assert_gr(slots[0], 'A', 0, 2, 0, 2)
 
-    assert [gr.tensor for gr in slots[1].grs] == ['B', 'SB']
-    _assert_gr(slots[1], 'B', 0, 2, 0, 8)
-    _assert_gr(slots[1], 'SB', 0, 2, 0, 8)
+    # s1: A[2-5](4)
+    assert [gr.tensor for gr in slots[1].grs] == ['A']
+    _assert_gr(slots[1], 'A', 0, 2, 2, 6)
 
-    assert len(slots[2].grs) == 0
-    assert len(slots[3].grs) == 0
+    # s2: A[6-7](2), B[0-1](2)
+    assert [gr.tensor for gr in slots[2].grs] == ['A', 'B']
+    _assert_gr(slots[2], 'A', 0, 2, 6, 8)
+    _assert_gr(slots[2], 'B', 0, 2, 0, 2)
+
+    # s3: B[2-7](6)
+    assert [gr.tensor for gr in slots[3].grs] == ['B']
+    _assert_gr(slots[3], 'B', 0, 2, 2, 8)
 
 
 def test_step3_LR_1x1_partition_2x2():
     """Step 3: 256x256, DU256, FP4, k=1, 2x2 partition.
 
-    Step3 runs on partition 0 only. GR uses full tile counts (numMFMATilesM/N=8).
+    Scale GR mn=8, partition tiles=4 → scale loads=0 (4//8=0).
+    Only A/B count toward load balancing.
+    Partition traversal (column-major):
+      P0→P1 (n+1): SA[4-7](0), SB[0-3](0), A[4-7](4), B[0-3](4) = 8
+      P1→P2 (n+1): SA[0-3](0), SB[4-7](0), A[0-3](4), B[4-7](4) = 8
+      P2→P3 (n+1): all deduped
+      P3→P0 (n+2): SA[0-3](0), SB[0-3](0), A[0-3](4), B[0-3](4) = 8
+    Total=24, per_slot=12.
+    s0: SA[4-7] SB[0-3] A[4-7] B[0-3] SA[0-3] SB[4-7] A[0-3] (n+1, 12 loads)
+    s1: B[4-7] (n+1) + SA[0-3] SB[0-3] A[0-3] B[0-3] (n+2, 12 loads)
     """
     kernel = create_kernel(256, 256, fp4=True)
     tiA = TileInfo('A', kernel)
@@ -1489,27 +1525,50 @@ def test_step3_LR_1x1_partition_2x2():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
         numPartitionsM=2,
         numPartitionsN=2,
     )
     sched = MFMATileScheduler(cfg)
     slots = sched.step3_place_GRs()
     print(sched.print_step3())
+    parts = sched._step3_partitions
 
-    # GR covers full numMFMATilesM/N=8, not partition size
-    assert [gr.tensor for gr in slots[0].grs] == ['A', 'SA']
-    _assert_gr(slots[0], 'A', 0, 2, 0, 8)
-    _assert_gr(slots[0], 'SA', 0, 2, 0, 8)
+    # All partitions get the same GR layout
+    for pi in range(4):
+        p = parts[pi]
+        # s0: SA[4-7] SB[0-3] A[4-7] B[0-3] SA[0-3] SB[4-7] A[0-3], all n+1
+        assert [gr.tensor for gr in p[0].grs] == \
+            ['SA', 'SB', 'A', 'B', 'SA', 'SB', 'A'], f"P{pi} s0"
+        _assert_gr(p[0], 'SA', 0, 2, 4, 8, mt='n+1', idx=0)
+        _assert_gr(p[0], 'SB', 0, 2, 0, 4, mt='n+1', idx=0)
+        _assert_gr(p[0], 'A', 0, 2, 4, 8, mt='n+1', idx=0)
+        _assert_gr(p[0], 'B', 0, 2, 0, 4, mt='n+1', idx=0)
+        _assert_gr(p[0], 'SA', 0, 2, 0, 4, mt='n+1', idx=1)
+        _assert_gr(p[0], 'SB', 0, 2, 4, 8, mt='n+1', idx=1)
+        _assert_gr(p[0], 'A', 0, 2, 0, 4, mt='n+1', idx=1)
 
-    assert [gr.tensor for gr in slots[1].grs] == ['B', 'SB']
-    _assert_gr(slots[1], 'B', 0, 2, 0, 8)
-    _assert_gr(slots[1], 'SB', 0, 2, 0, 8)
+        # s1: B[4-7] (n+1) + SA[0-3] SB[0-3] A[0-3] B[0-3] (n+2)
+        assert [gr.tensor for gr in p[1].grs] == \
+            ['B', 'SA', 'SB', 'A', 'B'], f"P{pi} s1"
+        _assert_gr(p[1], 'B', 0, 2, 4, 8, mt='n+1', idx=0)
+        _assert_gr(p[1], 'SA', 0, 2, 0, 4, mt='n+2', idx=0)
+        _assert_gr(p[1], 'SB', 0, 2, 0, 4, mt='n+2', idx=0)
+        _assert_gr(p[1], 'A', 0, 2, 0, 4, mt='n+2', idx=0)
+        _assert_gr(p[1], 'B', 0, 2, 0, 4, mt='n+2', idx=1)
 
 
 def test_step3_LR_1x1_partition_2x2_DU512():
-    """Step 3: 256x256, DU512, FP4, k=1, 2x2 partition."""
+    """Step 3: 256x256, DU512, FP4, k=1, 2x2 partition.
+
+    Scale GR mn=8, partition tiles=4 → scale loads=0.
+    Same GR list as DU256 2x2 but numK=4. Total A/B loads=24, per_slot=6.
+    s0: SA[4-7](0) SB[0-3](0) A[4-7](4) B[0-1](2) n+1
+    s1: B[2-3](2) SA[0-3](0) SB[4-7](0) A[0-3](4) n+1
+    s2: B[4-7](4) SA[0-3](0) SB[0-3](0) A[0-1](2) n+2
+    s3: A[2-3](2) B[0-3](4) n+2
+    """
     kernel = create_kernel(256, 256, fp4=True, depthU=512)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
@@ -1525,31 +1584,54 @@ def test_step3_LR_1x1_partition_2x2_DU512():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
         numPartitionsM=2,
         numPartitionsN=2,
     )
     sched = MFMATileScheduler(cfg)
     slots = sched.step3_place_GRs()
     print(sched.print_step3())
+    parts = sched._step3_partitions
 
-    assert [gr.tensor for gr in slots[0].grs] == ['A', 'SA']
-    _assert_gr(slots[0], 'A', 0, 2, 0, 8)
-    _assert_gr(slots[0], 'SA', 0, 2, 0, 8)
+    for pi in range(4):
+        p = parts[pi]
+        # s0: SA[4-7] SB[0-3] A[4-7] B[0-1], all n+1
+        assert [gr.tensor for gr in p[0].grs] == ['SA', 'SB', 'A', 'B'], f"P{pi} s0"
+        _assert_gr(p[0], 'SA', 0, 2, 4, 8, mt='n+1')
+        _assert_gr(p[0], 'SB', 0, 2, 0, 4, mt='n+1')
+        _assert_gr(p[0], 'A', 0, 2, 4, 8, mt='n+1')
+        _assert_gr(p[0], 'B', 0, 2, 0, 2, mt='n+1')
 
-    assert [gr.tensor for gr in slots[1].grs] == ['B', 'SB']
-    _assert_gr(slots[1], 'B', 0, 2, 0, 8)
-    _assert_gr(slots[1], 'SB', 0, 2, 0, 8)
+        # s1: B[2-3] SA[0-3] SB[4-7] A[0-3], all n+1
+        assert [gr.tensor for gr in p[1].grs] == ['B', 'SA', 'SB', 'A'], f"P{pi} s1"
+        _assert_gr(p[1], 'B', 0, 2, 2, 4, mt='n+1')
+        _assert_gr(p[1], 'SA', 0, 2, 0, 4, mt='n+1')
+        _assert_gr(p[1], 'SB', 0, 2, 4, 8, mt='n+1')
+        _assert_gr(p[1], 'A', 0, 2, 0, 4, mt='n+1')
 
-    assert len(slots[2].grs) == 0
-    assert len(slots[3].grs) == 0
+        # s2: B[4-7] (n+1) + SA[0-3] SB[0-3] A[0-1] (n+2)
+        assert [gr.tensor for gr in p[2].grs] == ['B', 'SA', 'SB', 'A'], f"P{pi} s2"
+        _assert_gr(p[2], 'B', 0, 2, 4, 8, mt='n+1')
+        _assert_gr(p[2], 'SA', 0, 2, 0, 4, mt='n+2')
+        _assert_gr(p[2], 'SB', 0, 2, 0, 4, mt='n+2')
+        _assert_gr(p[2], 'A', 0, 2, 0, 2, mt='n+2')
+
+        # s3: A[2-3] B[0-3] (n+2)
+        assert [gr.tensor for gr in p[3].grs] == ['A', 'B'], f"P{pi} s3"
+        _assert_gr(p[3], 'A', 0, 2, 2, 4, mt='n+2')
+        _assert_gr(p[3], 'B', 0, 2, 0, 4, mt='n+2')
 
 
 def test_step3_LR_1x1_partition_10x1():
     """Step 3: 320x320, BF16, k=1, 10x1 partition. No scales.
 
-    GR covers full numMFMATilesM/N=10. No GR SA/SB.
+    Partition traversal: P0→P1, ..., P8→P9 (n+1), P9→P0 (n+2, wraps).
+    B deduped after P0→P1. GR list:
+      A[1..9] n+1 (9 loads), B[0-9] n+1 (10), A[0-0] n+2 (1), B[0-9] n+2 (10)
+    Total=30, per_slot=15.
+    s0: A[1-1] B[0-9] A[2-2] A[3-3] A[4-4] A[5-5] (n+1, 15 loads)
+    s1: A[6-6] A[7-7] A[8-8] A[9-9] (n+1) + A[0-0] B[0-9] (n+2, 15 loads)
     """
     kernel = create_kernel(320, 320, fp4=False)
     tiA = TileInfo('A', kernel)
@@ -1567,14 +1649,29 @@ def test_step3_LR_1x1_partition_10x1():
     sched = MFMATileScheduler(cfg)
     slots = sched.step3_place_GRs()
     print(sched.print_step3())
+    parts = sched._step3_partitions
 
-    # subIterK=0: GR A only (no scales)
-    assert [gr.tensor for gr in slots[0].grs] == ['A']
-    _assert_gr(slots[0], 'A', 0, 2, 0, 10)
+    for pi in range(10):
+        p = parts[pi]
+        # s0: A[1-1] B[0-9] A[2-2] A[3-3] A[4-4] A[5-5], all n+1
+        assert [gr.tensor for gr in p[0].grs] == \
+            ['A', 'B', 'A', 'A', 'A', 'A'], f"P{pi} s0"
+        _assert_gr(p[0], 'A', 0, 2, 1, 2, mt='n+1', idx=0)
+        _assert_gr(p[0], 'B', 0, 2, 0, 10, mt='n+1')
+        _assert_gr(p[0], 'A', 0, 2, 2, 3, mt='n+1', idx=1)
+        _assert_gr(p[0], 'A', 0, 2, 3, 4, mt='n+1', idx=2)
+        _assert_gr(p[0], 'A', 0, 2, 4, 5, mt='n+1', idx=3)
+        _assert_gr(p[0], 'A', 0, 2, 5, 6, mt='n+1', idx=4)
 
-    # subIterK=1: GR B only
-    assert [gr.tensor for gr in slots[1].grs] == ['B']
-    _assert_gr(slots[1], 'B', 0, 2, 0, 10)
+        # s1: A[6-6] A[7-7] A[8-8] A[9-9] (n+1) + A[0-0] B[0-9] (n+2)
+        assert [gr.tensor for gr in p[1].grs] == \
+            ['A', 'A', 'A', 'A', 'A', 'B'], f"P{pi} s1"
+        _assert_gr(p[1], 'A', 0, 2, 6, 7, mt='n+1', idx=0)
+        _assert_gr(p[1], 'A', 0, 2, 7, 8, mt='n+1', idx=1)
+        _assert_gr(p[1], 'A', 0, 2, 8, 9, mt='n+1', idx=2)
+        _assert_gr(p[1], 'A', 0, 2, 9, 10, mt='n+1', idx=3)
+        _assert_gr(p[1], 'A', 0, 2, 0, 1, mt='n+2', idx=4)
+        _assert_gr(p[1], 'B', 0, 2, 0, 10, mt='n+2')
 
 
 # ── Step 5: Group and serialize ──────────────────────────
@@ -1649,9 +1746,9 @@ def test_step6_emit():
     assert second_lr.before is not None
     assert e0[second_lr.before].opType == 'lr'
 
-    # GRs: 2 (SA, A)
+    # GRs: 3 (SA, A[0-0], SB)
     grs = [e for e in e0 if e.opType == 'gr']
-    assert len(grs) == 2
+    assert len(grs) == 3
 
     # First GR's chain: ref(LR A) → wait_lr → sync → GR
     first_gr = grs[0]
@@ -1660,9 +1757,11 @@ def test_step6_emit():
     assert 'sync' in chain_types
     assert 'wait_lr' in chain_types
 
-    # Second GR links to first GR
+    # Subsequent GRs link to previous GR
     assert grs[1].before is not None
     assert e0[grs[1].before].opType == 'gr'
+    assert grs[2].before is not None
+    assert e0[grs[2].before].opType == 'gr'
 
     # ── subIterK=1 ──
     e1 = all_emitted[1]
@@ -1674,7 +1773,7 @@ def test_step6_emit():
     assert len(lrs1) == 3  # A, B, SB
 
     grs1 = [e for e in e1 if e.opType == 'gr']
-    assert len(grs1) == 2  # SB, B
+    assert len(grs1) == 2  # A[1-1], B[0-1]
 
 
 def _walk_before_chain(emitted, start_id):
@@ -1706,8 +1805,8 @@ def test_from_tile_info_64x64_fp4():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
     )
 
     # MT=64, MatrixInstM=16, MIWaveGroup=[2,2] → localMMATileGrid[0] = 64/16/2 = 2
@@ -1768,8 +1867,8 @@ if __name__ == "__main__":
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
     )
 
     print(f"Config: numMFMATilesM={cfg.numMFMATilesM}, "
