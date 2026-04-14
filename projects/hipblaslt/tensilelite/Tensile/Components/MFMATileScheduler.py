@@ -523,10 +523,13 @@ class MFMATileScheduler:
         1. For each partition (column-major), determine target partition/MT:
            target = (pi + offsetPartition) % numP
            MT = n + offsetMT + (1 if wraps else 0)
-        2. Add GRs in local order: SA, SB, A, B. Dedup identical requests.
+        2. Add GRs in local order: A, B, SA, SB. Dedup identical requests.
         3. Flatten into a single ordered list.
-        4. Split evenly across subIterKs by load count, splitting tile
-           ranges at mn boundaries when a GR doesn't fit in one slot.
+        4. Compute min_slot per tensor from LDS double-buffer constraint:
+           GR (MT n+2) must not be in subIterK k if LR (MT n) for the
+           same tensor exists at any subIterK > k. Sort by min_slot.
+        5. Split across subIterKs by load count, respecting min_slot
+           and recalculating balance when jumping to a later slot.
         """
         if self._step2_result is None:
             self.step2_assign_vgpr_sets()
@@ -552,13 +555,12 @@ class MFMATileScheduler:
 
             target = part_ranges[target_pi]
 
-            # Local order: SA, SB, A, B
-            items = []
+            # Local order: A, B, SA, SB
+            items = [('A', target['A'], cfg.grA),
+                     ('B', target['B'], cfg.grB)]
             if cfg.hasScale:
                 items.append(('SA', target['A'], cfg.grSA))
                 items.append(('SB', target['B'], cfg.grSB))
-            items.append(('A', target['A'], cfg.grA))
-            items.append(('B', target['B'], cfg.grB))
 
             for tensor, (t_start, t_end), gr_gran in items:
                 key = (tensor, t_start, t_end, mt_str)
@@ -567,12 +569,37 @@ class MFMATileScheduler:
                 seen.add(key)
                 gr_list.append((tensor, mt_str, t_start, t_end, gr_gran))
 
+        # ── Phase 1b: Compute min_slot per tensor (LDS double-buffer) ──
+        # GR (MT n+2) writes to the same LDS buffer as MT n.
+        # If any LR for tensor T with mtIteration="n" exists at subIterK k',
+        # then GR T must not be placed at any subIterK k < k'.
+        # min_slot[T] = last subIterK with LR T (MT n), across all partitions.
+        last_lr_mt_n = {}
+        for partition_slots in self._step2_partitions:
+            for slot in partition_slots:
+                for lr in slot.lrs:
+                    if lr.mtIteration == "n":
+                        t = lr.tensor
+                        k = slot.subIterK
+                        if t not in last_lr_mt_n or k > last_lr_mt_n[t]:
+                            last_lr_mt_n[t] = k
+
+        min_slot = {t: last_lr_mt_n.get(t, 0) for t in
+                    (['A', 'B'] + (['SA', 'SB'] if cfg.hasScale else []))}
+
+        # Sort by min_slot (ascending), preserving original order as tiebreaker
+        gr_list_sorted = sorted(
+            enumerate(gr_list),
+            key=lambda idx_gr: (min_slot.get(idx_gr[1][0], 0), idx_gr[0]))
+        gr_list = [gr for _, gr in gr_list_sorted]
+
         # ── Phase 2: Split across subIterKs by load count ──
         def _gr_loads(t_start, t_end, gr_gran):
             return ((t_end - t_start) // gr_gran.size.mn) * \
                    (numK // gr_gran.size.k)
 
         total_loads = sum(_gr_loads(ts, te, g) for _, _, ts, te, g in gr_list)
+        placed_loads = 0
         loads_per_slot = total_loads // numK
 
         slot_grs = [[] for _ in range(numK)]
@@ -583,6 +610,16 @@ class MFMATileScheduler:
             mn = gr_gran.size.mn
             k_factor = numK // gr_gran.size.k
             pos = t_start
+
+            # Enforce min_slot: jump forward if needed
+            tensor_min = min_slot.get(tensor, 0)
+            if cur_slot < tensor_min:
+                placed_loads += cur_loads
+                cur_slot = tensor_min
+                cur_loads = 0
+                slots_left = numK - cur_slot
+                remaining_total = total_loads - placed_loads
+                loads_per_slot = remaining_total // max(1, slots_left)
 
             while pos < t_end:
                 space = loads_per_slot - cur_loads
@@ -608,6 +645,7 @@ class MFMATileScheduler:
                     pos = chunk_end
 
                 if cur_loads >= loads_per_slot and cur_slot < numK - 1:
+                    placed_loads += cur_loads
                     cur_slot += 1
                     cur_loads = 0
 

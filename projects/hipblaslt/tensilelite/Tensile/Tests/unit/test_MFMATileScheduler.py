@@ -1420,39 +1420,41 @@ def _assert_gr(slot, tensor, k_start, k_end, tile_start, tile_end, mt='n+2', idx
 def test_step3_LR_1x1_partition_1x1():
     """Step 3: 256x256, DU256, FP4, k=1.
 
-    1 partition, numK=2. GR order: SA, SB, A, B.
-    Scale GR mn=8 (covers entire MT in 1 load).
-    Load counts: SA(1), SB(1), A(8), B(8) = 18 total, 9 per slot.
-    s0: SA[0-7](1) + SB[0-7](1) + A[0-6](7) = 9
-    s1: A[7-7](1) + B[0-7](8) = 9
+    1 partition, numK=2. GR order: A, B, SA, SB.
+    Scale GRs placed after data GRs to avoid LDS conflicts.
+    Load counts: A(8), B(8), SA(1), SB(1) = 18 total, 9 per slot.
+    s0: A[0-7](8) + B[0-0](1) = 9
+    s1: B[1-7](7) + SA[0-7](1) + SB[0-7](1) = 9
     """
     cfg = make_256x256_fp4()
     sched = MFMATileScheduler(cfg)
     slots = sched.step3_place_GRs()
     print(sched.print_step3())
 
-    # subIterK=0: SA[0-7], SB[0-7], A[0-6]
-    assert [gr.tensor for gr in slots[0].grs] == ['SA', 'SB', 'A']
-    _assert_gr(slots[0], 'SA', 0, 2, 0, 8)
-    _assert_gr(slots[0], 'SB', 0, 2, 0, 8)
-    _assert_gr(slots[0], 'A', 0, 2, 0, 7)
+    # subIterK=0: A[0-7], B[0-0]
+    assert [gr.tensor for gr in slots[0].grs] == ['A', 'B']
+    _assert_gr(slots[0], 'A', 0, 2, 0, 8)
+    _assert_gr(slots[0], 'B', 0, 2, 0, 1)
 
-    # subIterK=1: A[7-7], B[0-7]
-    assert [gr.tensor for gr in slots[1].grs] == ['A', 'B']
-    _assert_gr(slots[1], 'A', 0, 2, 7, 8)
-    _assert_gr(slots[1], 'B', 0, 2, 0, 8)
+    # subIterK=1: B[1-7], SA[0-7], SB[0-7]
+    assert [gr.tensor for gr in slots[1].grs] == ['B', 'SA', 'SB']
+    _assert_gr(slots[1], 'B', 0, 2, 1, 8)
+    _assert_gr(slots[1], 'SA', 0, 2, 0, 8)
+    _assert_gr(slots[1], 'SB', 0, 2, 0, 8)
 
-#OK
 def test_step3_LR_1x1_partition_1x1_DU512():
     """Step 3: 256x256, DU512, FP4, k=1.
 
     1 partition, numK=4, k_factor=numK//grK=4//2=2 (each tile = 2 loads).
-    Scale GR mn=8 (1 mn tile * k_factor=2 → 2 loads each).
-    Load counts: SA(2), SB(2), A(16), B(16) = 36 total, per_slot=9.
-    s0: SA[0-7](2) + SB[0-7](2) + A[0-2](6) = 10
-    s1: A[3-7](10)
-    s2: B[0-4](10)
-    s3: B[5-7](6)
+    GR order: A, B, SA, SB — then sorted by min_slot from LDS constraint.
+    min_slot: SA=0 (last LR SA MT n at s0), SB=1 (last LR SB MT n at s1),
+              A=2 (last LR A MT n at s2), B=2 (last LR B MT n at s2).
+    Sorted order: SA(0), SB(1), A(2), B(2).
+    Loads: SA(2), SB(2), A(16), B(16) = 36 total.
+    s0: SA[0-7](2)   — loads_per_slot=9, then jump to s1
+    s1: SB[0-7](2)   — jump to s2, recalc: 32 loads / 2 slots = 16/slot
+    s2: A[0-7](16)
+    s3: B[0-7](16)
     """
     kernel = create_kernel(256, 256, fp4=True, depthU=512)
     tiA = TileInfo('A', kernel)
@@ -1476,23 +1478,21 @@ def test_step3_LR_1x1_partition_1x1_DU512():
     slots = sched.step3_place_GRs()
     print(sched.print_step3())
 
-    # s0: SA[0-7], SB[0-7], A[0-2]
-    assert [gr.tensor for gr in slots[0].grs] == ['SA', 'SB', 'A']
+    # s0: SA[0-7]
+    assert [gr.tensor for gr in slots[0].grs] == ['SA']
     _assert_gr(slots[0], 'SA', 0, 4, 0, 8)
-    _assert_gr(slots[0], 'SB', 0, 4, 0, 8)
-    _assert_gr(slots[0], 'A', 0, 4, 0, 3)
 
-    # s1: A[3-7]
-    assert [gr.tensor for gr in slots[1].grs] == ['A']
-    _assert_gr(slots[1], 'A', 0, 4, 3, 8)
+    # s1: SB[0-7]
+    assert [gr.tensor for gr in slots[1].grs] == ['SB']
+    _assert_gr(slots[1], 'SB', 0, 4, 0, 8)
 
-    # s2: B[0-4]
-    assert [gr.tensor for gr in slots[2].grs] == ['B']
-    _assert_gr(slots[2], 'B', 0, 4, 0, 5)
+    # s2: A[0-7]
+    assert [gr.tensor for gr in slots[2].grs] == ['A']
+    _assert_gr(slots[2], 'A', 0, 4, 0, 8)
 
-    # s3: B[5-7]
+    # s3: B[0-7]
     assert [gr.tensor for gr in slots[3].grs] == ['B']
-    _assert_gr(slots[3], 'B', 0, 4, 5, 8)
+    _assert_gr(slots[3], 'B', 0, 4, 0, 8)
 
 
 # def test_step3_LR_1x1_partition_2x2():
@@ -1684,7 +1684,7 @@ def test_step5_group():
     output = sched.print_step5()
     print(output)
 
-    # subIterK=0: MFMA, LR A, LR B, LR SA, GR SA, GR A
+    # subIterK=0: MFMA, LR A, LR B, LR SA, GR A, GR B[0-0]
     g0 = grouped[0]
     op_kinds_0 = [op.kind for op in g0.ops]
     assert op_kinds_0[0] == 'MFMA'
@@ -1698,7 +1698,7 @@ def test_step5_group():
     # First LR has WaitGROp before
     assert any(dep.kind == 'wait_gr' for dep in g0.ops[1].before)
 
-    # subIterK=1: MFMA, LR A, LR B, LR SB, GR SB, GR B
+    # subIterK=1: MFMA, LR A, LR B, LR SB, GR B[1-1], GR SA, GR SB
     g1 = grouped[1]
     lr_tensors = [op.placement.tensor for op in g1.ops if op.kind == 'LR']
     assert lr_tensors == ['A', 'B', 'SB']
@@ -1745,9 +1745,9 @@ def test_step6_emit():
     assert second_lr.before is not None
     assert e0[second_lr.before].opType == 'lr'
 
-    # GRs: 3 (SA, A[0-0], SB)
+    # GRs: 2 (A[0-1], B[0-0])
     grs = [e for e in e0 if e.opType == 'gr']
-    assert len(grs) == 3
+    assert len(grs) == 2
 
     # First GR's chain: ref(LR A) → wait_lr → sync → GR
     first_gr = grs[0]
@@ -1759,8 +1759,6 @@ def test_step6_emit():
     # Subsequent GRs link to previous GR
     assert grs[1].before is not None
     assert e0[grs[1].before].opType == 'gr'
-    assert grs[2].before is not None
-    assert e0[grs[2].before].opType == 'gr'
 
     # ── subIterK=1 ──
     e1 = all_emitted[1]
@@ -1772,7 +1770,7 @@ def test_step6_emit():
     assert len(lrs1) == 3  # A, B, SB
 
     grs1 = [e for e in e1 if e.opType == 'gr']
-    assert len(grs1) == 2  # A[1-1], B[0-1]
+    assert len(grs1) == 3  # B[1-1], SA[0-1], SB[0-1]
 
 
 def _walk_before_chain(emitted, start_id):
