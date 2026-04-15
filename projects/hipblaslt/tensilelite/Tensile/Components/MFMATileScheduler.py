@@ -517,33 +517,24 @@ class MFMATileScheduler:
 
     # ── Step 3: Place GRs ─────────────────────────────────
 
-    def step3_place_GRs(self) -> List[SubIterKSlot]:
-        """Place Global Reads by iterating step2 MFMAs across partitions.
+    def _step3_build_gr_list(self, part_ranges, offsetMT, offsetPartition):
+        """Phase 1: Build ordered GR list from step2 MFMAs.
 
-        1. For each partition × subIterK, derive target partition/MT from
-           the MFMA and offsets. Add GRs (A, B, SA, SB) with tile and K
-           ranges snapped to GR granularity. Dedup identical requests.
-        2. Compute min_slot per tensor from LDS double-buffer constraint:
-           GR (MT n+2) must not be in subIterK k if LR (MT n) for the
-           same tensor exists at any subIterK > k. Sort by min_slot.
-        3. Split across subIterKs by load count, respecting min_slot
-           and recalculating balance when jumping to a later slot.
+        For each partition × subIterK, derive target partition/MT from
+        the MFMA and offsets. Add GRs (A, B, SA, SB) with tile and K
+        ranges snapped to GR granularity. Dedup within same MT level,
+        then remove n+1 entries that also appear at n+2 (cross-MT dedup).
+        
+        For each subIterK, we apply offsetMT on MT and offsetPartition on partition.
+
+        Returns list of (tensor, mt_str, tile_start, tile_end,
+                         k_start, k_end, gr_gran).
         """
-        if self._step2_result is None:
-            self.step2_assign_vgpr_sets()
         cfg = self.config
-        numK = cfg.numSubIterK
         numP = cfg.numPartitions
 
-        # TODO: cover PGR3 (offsetMT and offsetPartition may differ)
-        offsetMT = 1
-        offsetPartition = 1
-
-        part_ranges = [self._partition_tile_range(pi) for pi in range(numP)]
-
-        # ── Phase 1: Build ordered GR list from step2 MFMAs ──
         seen = set()
-        gr_list = []  # (tensor, mt_str, tile_start, tile_end, k_start, k_end, gr_gran)
+        gr_list = []
 
         for pi in range(numP):
             partition_slots = self._step2_partitions[pi]
@@ -558,7 +549,6 @@ class MFMATileScheduler:
             for slot in partition_slots:
                 k = slot.mfma.subIterK
 
-                # Local order: A, B, SA, SB
                 items = [('A', target_range['A'], cfg.grA),
                          ('B', target_range['B'], cfg.grB)]
                 if cfg.hasScale:
@@ -569,15 +559,12 @@ class MFMATileScheduler:
                     mn = gr_gran.size.mn
                     k_gran = gr_gran.size.k
 
-                    # Snap tile range to GR granularity boundaries
                     gr_tile_start = (t_start // mn) * mn
                     gr_tile_end = ((t_end + mn - 1) // mn) * mn
 
-                    # Snap subIterK to GR k-granularity
                     gr_k_start = (k // k_gran) * k_gran
                     gr_k_end = gr_k_start + k_gran
 
-                    # Dedup within same MT level
                     key = (tensor, mt_str, gr_tile_start, gr_tile_end,
                            gr_k_start, gr_k_end)
                     if key in seen:
@@ -590,31 +577,31 @@ class MFMATileScheduler:
         # Cross-MT dedup: if a tile/k range appears at both n+1 and n+2,
         # the n+1 load is redundant — the previous iteration's n+2 already
         # wrote the same data into LDS.  Remove the n+1 duplicate.
+        base_mt = f"n+{offsetMT}"
         n2_keys = {(t, ts, te, ks, ke)
                    for t, mt, ts, te, ks, ke, _ in gr_list
-                   if mt != f"n+{offsetMT}"}
+                   if mt != base_mt}
         gr_list = [entry for entry in gr_list
-                   if entry[1] != f"n+{offsetMT}" or
+                   if entry[1] != base_mt or
                    (entry[0], entry[2], entry[3], entry[4], entry[5])
                    not in n2_keys]
 
-        # Debug: display ordered GR list after Phase 1
+        # Debug
         print(f"Phase 1: {len(gr_list)} GR entries")
         for i, (t, mt, ts, te, ks, ke, g) in enumerate(gr_list):
             loads = ((te - ts) // g.size.mn) * ((ke - ks) // g.size.k)
             print(f"  [{i}] {t:2s} {mt} tiles[{ts},{te - 1}] k[{ks},{ke - 1}] "
                   f"gr_gran(mn={g.size.mn},k={g.size.k}) loads={loads}")
 
-        # ── Phase 2: Distribute GRs across partition × subIterK slots ──
-        # The GR list is common — each GR appears exactly once across the
-        # full pool of (partition, subIterK) slots.
-        numSlots = numP * numK
+        return gr_list
 
-        # Precompute LR(MT n) per (partition, tensor): list of (slot_idx, k_start, k_end).
-        # GR(MT n+2) writes the same LDS buffer as MT n, so it conflicts
-        # only if a later LR(MT n) in the SAME partition accesses the same
-        # subIterK range.
-        lr_mt_n_info = {}  # (pi, tensor) -> list of (slot_idx, k_start, k_end)
+    def _step3_build_lr_conflict_map(self):
+        """Build per-partition LR(MT n) info for LDS conflict checking.
+
+        Returns dict: (partition_idx, tensor) -> list of
+                      (subIterK_slot, k_start, k_end).
+        """
+        lr_mt_n_info = {}
         for pi, partition_slots in enumerate(self._step2_partitions):
             for slot in partition_slots:
                 for lr in slot.lrs:
@@ -623,18 +610,38 @@ class MFMATileScheduler:
                             (slot.subIterK,
                              lr.tiles.subIterK_start,
                              lr.tiles.subIterK_end))
+        return lr_mt_n_info
 
-        def _has_lr_conflict(tensor, mt_str, pi, subIterK, gr_k_start, gr_k_end):
-            """Return True if placing GR(mt_str) at (pi, subIterK) conflicts."""
-            if "n+2" not in mt_str:
-                return False
-            for lr_slot, lr_ks, lr_ke in lr_mt_n_info.get((pi, tensor), []):
-                if lr_slot > subIterK and gr_k_start < lr_ke and lr_ks < gr_k_end:
-                    return True
+    @staticmethod
+    def _has_lr_conflict(lr_mt_n_info, tensor, mt_str, pi, subIterK,
+                         gr_k_start, gr_k_end):
+        """Return True if placing GR(mt_str) at (pi, subIterK) conflicts.
+
+        GR(MT n+2) writes the same LDS buffer as MT n, so it conflicts
+        only if a later LR(MT n) in the same partition accesses an
+        overlapping subIterK range.
+        """
+        if "n+2" not in mt_str:
             return False
+        for lr_slot, lr_ks, lr_ke in lr_mt_n_info.get((pi, tensor), []):
+            if lr_slot > subIterK and gr_k_start < lr_ke and lr_ks < gr_k_end:
+                return True
+        return False
+
+    def _step3_distribute_grs(self, gr_list, lr_mt_n_info):
+        """Phase 2: Distribute GR atoms across partition × subIterK slots.
+
+        Explodes GR entries into atomic loads, distributes them into flat
+        buckets respecting LDS conflict constraints and load balance,
+        then remerges consecutive atoms and places them into partitions.
+        """
+        cfg = self.config
+        numK = cfg.numSubIterK
+        numP = cfg.numPartitions
+        numSlots = numP * numK
 
         # 2a. Explode GR entries into atomic loads (1 load each)
-        atoms = []  # (tensor, mt_str, tile_pos, tile_pos+mn, k_start, k_end)
+        atoms = []
         for tensor, mt_str, t_start, t_end, k_start, k_end, gr_gran in gr_list:
             mn = gr_gran.size.mn
             for pos in range(t_start, t_end, mn):
@@ -651,13 +658,14 @@ class MFMATileScheduler:
             while cur < numSlots - 1:
                 pi = cur // numK
                 subK = cur % numK
-                if (not _has_lr_conflict(tensor, mt_str, pi, subK, ks, ke) and
+                if (not self._has_lr_conflict(lr_mt_n_info, tensor, mt_str,
+                                              pi, subK, ks, ke) and
                         len(buckets[cur]) < loads_per_slot):
                     break
                 cur += 1
             buckets[cur].append(atom)
 
-        # Debug: display bucket distribution after 2b
+        # Debug
         print(f"Phase 2b: {len(atoms)} atoms, {numSlots} slots, "
               f"{loads_per_slot} per slot")
         for flat, bucket in enumerate(buckets):
@@ -677,7 +685,6 @@ class MFMATileScheduler:
             target_slot = self._step2_partitions[pi][si]
             for atom in bucket:
                 tensor, mt_str, ts, te, ks, ke = atom
-                # Try to extend the last GR in this slot
                 if target_slot.grs:
                     prev = target_slot.grs[-1]
                     if (prev.tensor == tensor and
@@ -691,6 +698,34 @@ class MFMATileScheduler:
                     tensor=tensor, mtIteration=mt_str,
                     tiles=MFMATileRange(ks, ke, ts, te),
                     subIterK_slot=si))
+
+    def step3_place_GRs(self) -> List[SubIterKSlot]:
+        """Place Global Reads by iterating step2 MFMAs across partitions.
+
+        Phase 1: Build ordered GR list from partition traversal respecting gr granularities.
+        Phase 2: Distribute evenly GR atoms across all (partition, subIterK) slots. GR atoms being the smallest load granularity for a specific tensor.
+
+        This should give a sheduling respecting the following rules:
+         - GR are in the order we expect them from the LR pov
+         - we respect the GR granularities (can change the above rule a bit)
+         - Overall loads are spread accross all subIterKs of all partitions.
+        """
+        if self._step2_result is None:
+            self.step2_assign_vgpr_sets()
+
+
+        part_ranges = [self._partition_tile_range(pi)
+                       for pi in range(self.config.numPartitions)]
+
+        # TODO: cover PGR3 (offsetMT and offsetPartition may differ)
+        offsetMT = 1
+        offsetPartition = 1
+        # Build ordered list of GRs to place for the entire MT based on the partitioning ordering and the GR granularities.
+        gr_list = self._step3_build_gr_list(part_ranges, offsetMT, offsetPartition)
+        # Map to keep track of LR(MT n) for each partiion and tensor, used for LDS double buffer conflict checking when placing GRs.
+        lr_mt_n_info = self._step3_build_lr_conflict_map()
+        # Distribute GRs accross partition.
+        self._step3_distribute_grs(gr_list, lr_mt_n_info)
 
         self._step3_partitions = self._step2_partitions
         self._step3_result = self._step3_partitions[0]
