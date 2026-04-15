@@ -115,7 +115,7 @@ def _get_lr(slot, tensor):
     return matches[0]
 
 #OK
-def test_step1_LR_1x1_partition_1x1():
+def test_place_LRs_LR_1x1_partition_1x1():
     """Validate Step 1: MT=256x256, DU=256, FP4.
 
     Config: numMFMATilesM=8, numMFMATilesN=8, numSubIterK=2
@@ -128,9 +128,9 @@ def test_step1_LR_1x1_partition_1x1():
     assert cfg.hasScale
 
     sched = MFMATileScheduler(cfg)
-    partitions = sched.step1_place_LRs()
+    partitions = sched.place_LRs()
     slots = partitions[0]
-    print(sched.print_step1())
+    print(sched.print_lr())
 
     assert len(slots) == 2
 
@@ -187,7 +187,7 @@ def test_step1_LR_1x1_partition_1x1():
     assert lr_sb.tiles.tileId_end == 8
 
 #OK
-def test_step1_LR_1x2_partition_1x1():
+def test_place_LRs_LR_1x2_partition_1x1():
     """Validate Step 1: MT=256x256, DU=256, FP4, LR A/B with k=2.
 
     This matches design doc Example Granularities 2:
@@ -221,9 +221,9 @@ def test_step1_LR_1x2_partition_1x1():
     assert cfg.numSubIterK == 2
 
     sched = MFMATileScheduler(cfg)
-    partitions = sched.step1_place_LRs()
+    partitions = sched.place_LRs()
     slots = partitions[0]
-    print(sched.print_step1())
+    print(sched.print_lr())
 
     assert len(slots) == 2
 
@@ -258,7 +258,7 @@ def test_step1_LR_1x2_partition_1x1():
     assert lr_sb.tiles.subIterK_end == 2
 
 #OK
-def test_step1_LR_1x1_partition_1x1_DU512():
+def test_place_LRs_LR_1x1_partition_1x1_DU512():
     """Validate Step 1: MT=256x256, DU=512, FP4.
 
     DU=512 gives localMMATileGrid=[8,4] → numSubIterK=4, numMFMATilesM/N=8.
@@ -291,9 +291,9 @@ def test_step1_LR_1x1_partition_1x1_DU512():
     assert cfg.hasScale
 
     sched = MFMATileScheduler(cfg)
-    partitions = sched.step1_place_LRs()
+    partitions = sched.place_LRs()
     slots = partitions[0]
-    print(sched.print_step1())
+    print(sched.print_lr())
 
     assert len(slots) == 4
 
@@ -356,7 +356,7 @@ def test_step1_LR_1x1_partition_1x1_DU512():
     assert lr_sb1.tiles.subIterK_end == 2
 
 #OK
-def test_step1_LR_1x2_partition_1x1_DU512():
+def test_place_LRs_LR_1x2_partition_1x1_DU512():
     """Validate Step 1: MT=256x256, DU=512, FP4, LR A/B with k=2.
 
     DU=512 gives numSubIterK=4. All tensors have k=2 granularity.
@@ -388,9 +388,9 @@ def test_step1_LR_1x2_partition_1x1_DU512():
     assert cfg.numSubIterK == 4
 
     sched = MFMATileScheduler(cfg)
-    partitions = sched.step1_place_LRs()
+    partitions = sched.place_LRs()
     slots = partitions[0]
-    print(sched.print_step1())
+    print(sched.print_lr())
 
     assert len(slots) == 4
 
@@ -451,10 +451,10 @@ def test_step1_LR_1x2_partition_1x1_DU512():
     assert lr_sb1.tiles.subIterK_end == 2
 
 
-def test_step1_LR_1x1_partition_2x2():
+def test_place_LRs_LR_1x1_partition_2x2():
     """Validate Step 1: MT=256x256, DU=256, FP4, LR A/B with k=1, 2x2 partition grid.
 
-    Same partition layout as test_step1_LR_1x2_2x2 but with k=1 LR granularity
+    Same partition layout as test_place_LRs_LR_1x2_2x2 but with k=1 LR granularity
     for A and B: each subIterK gets its own LR per tensor.
 
     Partition layout (column-major):
@@ -505,8 +505,8 @@ def test_step1_LR_1x1_partition_2x2():
     assert cfg.partitionSizeN == 4
 
     sched = MFMATileScheduler(cfg)
-    partitions = sched.step1_place_LRs()
-    print(sched.print_step1())
+    partitions = sched.place_LRs()
+    print(sched.print_lr())
 
     assert len(partitions) == 4
 
@@ -638,7 +638,7 @@ def test_step1_LR_1x1_partition_2x2():
 
 
 
-def test_step1_LR_1x1_partition_2x2_DU512():
+def test_place_LRs_LR_1x1_partition_2x2_DU512():
     """Validate Step 1: MT=256x256, DU=512, FP4, LR A/B k=1, 2x2 partition grid.
 
     DU=512 gives numSubIterK=4. 8x8 tiles split into 4 partitions of 4x4.
@@ -686,8 +686,8 @@ def test_step1_LR_1x1_partition_2x2_DU512():
     assert cfg.partitionSizeN == 4
 
     sched = MFMATileScheduler(cfg)
-    partitions = sched.step1_place_LRs()
-    print(sched.print_step1())
+    partitions = sched.place_LRs()
+    print(sched.print_lr())
 
     assert len(partitions) == 4
 
@@ -869,7 +869,7 @@ def test_step1_LR_1x1_partition_2x2_DU512():
     assert lr.mtIteration == "n+1"
 
 
-def test_step1_LR_1x2_partition_2x2():
+def test_place_LRs_LR_1x2_partition_2x2():
     """Validate Step 1: MT=256x256, DU=256, FP4, LR A/B with k=2, 2x2 partition grid.
 
     8x8 MFMA tiles split into 4 partitions of 4x4 tiles each.
@@ -906,8 +906,8 @@ def test_step1_LR_1x2_partition_2x2():
     assert cfg.partitionSizeN == 4
 
     sched = MFMATileScheduler(cfg)
-    partitions = sched.step1_place_LRs()
-    print(sched.print_step1())
+    partitions = sched.place_LRs()
+    print(sched.print_lr())
 
     assert len(partitions) == 4
 
@@ -979,7 +979,7 @@ def test_step1_LR_1x2_partition_2x2():
 
 
 
-def test_step1_LR_1x1_partition_10x1():
+def test_place_LRs_LR_1x1_partition_10x1():
     """Validate Step 1: MT=320x320, BF16, DU=64, LR A/B k=1, 10x1 partition grid.
 
     numMFMATilesM=10, numMFMATilesN=10, numSubIterK=2, no scale.
@@ -1017,8 +1017,8 @@ def test_step1_LR_1x1_partition_10x1():
     assert cfg.partitionSizeN == 10
 
     sched = MFMATileScheduler(cfg)
-    partitions = sched.step1_place_LRs()
-    print(sched.print_step1())
+    partitions = sched.place_LRs()
+    print(sched.print_lr())
 
     assert len(partitions) == 10
 
@@ -1106,13 +1106,13 @@ def test_step1_LR_1x1_partition_10x1():
 
 # ── Step 2: Assign VGPR sets ──────────────────────────────
 
-def test_step2_assign_vgpr_sets():
+def test_assign_vgpr_sets():
     """Validate Step 2: VGPR set assignments match design doc."""
     cfg = make_example_granularities_1()
     sched = MFMATileScheduler(cfg)
-    slots = sched.step2_assign_vgpr_sets()
+    slots = sched.assign_vgpr_sets()
 
-    output = sched.print_step2()
+    output = sched.print_vgpr()
     print(output)
 
     # subIterK=0: MFMA reads set 0 for all tensors
@@ -1141,7 +1141,7 @@ def test_step2_assign_vgpr_sets():
     assert s1.lr_sets['SB'] == 1
 
 
-def test_step2_no_scale_k_gran_1():
+def test_assign_vgpr_no_scale_k_gran_1():
     """Step 2: no scales, A/B k_gran=1 → sets alternate every subIterK."""
     cfg = SchedulerConfig(
         numMFMATilesM=2,
@@ -1155,8 +1155,8 @@ def test_step2_no_scale_k_gran_1():
     assert not cfg.hasScale
 
     sched = MFMATileScheduler(cfg)
-    slots = sched.step2_assign_vgpr_sets()
-    print(sched.print_step2())
+    slots = sched.assign_vgpr_sets()
+    print(sched.print_vgpr())
 
     # subIterK=0: MFMA reads set 0, LR writes set 1
     s0 = slots[0]
@@ -1171,7 +1171,7 @@ def test_step2_no_scale_k_gran_1():
     assert s1.lr_sets['B'] == 0
 
 
-def test_step2_no_scale_k_gran_numK():
+def test_assign_vgpr_no_scale_k_gran_numK():
     """Step 2: no scales, A/B k_gran=numSubIterK → sets never advance."""
     cfg = SchedulerConfig(
         numMFMATilesM=2,
@@ -1185,8 +1185,8 @@ def test_step2_no_scale_k_gran_numK():
     assert not cfg.hasScale
 
     sched = MFMATileScheduler(cfg)
-    slots = sched.step2_assign_vgpr_sets()
-    print(sched.print_step2())
+    slots = sched.assign_vgpr_sets()
+    print(sched.print_vgpr())
 
     # Both subIterKs: MFMA stays on set 0 (k_gran == numK, no advance)
     assert slots[0].mfma_sets == {'A': 0, 'B': 0}
@@ -1198,13 +1198,13 @@ def test_step2_no_scale_k_gran_numK():
     assert slots[1].lr_sets['B'] == 1
 
 
-def test_step2_partition_2x2():
+def test_assign_vgpr_partition_2x2():
     """Step 2: 2x2 partition, FP4. All 4 partitions get VGPR set assignments.
 
     A/B k_gran=1 → sets alternate. SA/SB k_gran=2 → sets stay at 0.
-    Each partition has different LR placements (from step1), so lr_sets differ.
+    Each partition has different LR placements (from place_LRs), so lr_sets differ.
 
-    Partition LR placements (from step1):
+    Partition LR placements (from place_LRs):
       P0 (A[0-3],B[0-3]): s0: LR A,B,SA   s1: LR A
       P1 (A[4-7],B[0-3]): s0: LR A,SB     s1: LR B
       P2 (A[0-3],B[4-7]): s0: LR B        s1: (none)
@@ -1234,9 +1234,9 @@ def test_step2_partition_2x2():
     assert cfg.hasScale
 
     sched = MFMATileScheduler(cfg)
-    sched.step2_assign_vgpr_sets()
-    print(sched.print_step2())
-    parts = sched._step2_partitions
+    sched.assign_vgpr_sets()
+    print(sched.print_vgpr())
+    parts = sched._partitions
 
     # A/B k_gran=1 (< numK=2): chunk-based, same for all partitions.
     # SA/SB k_gran=2 (>= numK=2): tile-range tracking across partitions.
@@ -1272,7 +1272,7 @@ def test_step2_partition_2x2():
     assert p3[1].lr_sets == {'A': 0, 'B': 0, 'SB': 0}
 
 
-def test_step2_DU512():
+def test_assign_vgpr_DU512():
     """Step 2: DU=512, FP4. numSubIterK=4, A/B k_gran=1, SA/SB k_gran=2.
 
     A/B: sets flip every subIterK → 0,1,0,1
@@ -1300,8 +1300,8 @@ def test_step2_DU512():
     assert cfg.hasScale
 
     sched = MFMATileScheduler(cfg)
-    slots = sched.step2_assign_vgpr_sets()
-    print(sched.print_step2())
+    slots = sched.assign_vgpr_sets()
+    print(sched.print_vgpr())
 
     # A/B: k_gran=1 → sets alternate 0,1,0,1
     ab_expected = [0, 1, 0, 1]
@@ -1323,7 +1323,7 @@ def test_step2_DU512():
                 f"LR {t} at k={k} should write opposite of MFMA set"
 
 
-def test_step2_DU512_partition_2x2():
+def test_assign_vgpr_DU512_partition_2x2():
     """Step 2: DU=512 + 2x2 partition, FP4. numSubIterK=4.
 
     A/B k_gran=1 (< numK=4): chunk-based 0,1,0,1, same for all partitions.
@@ -1357,9 +1357,9 @@ def test_step2_DU512_partition_2x2():
     assert cfg.hasScale
 
     sched = MFMATileScheduler(cfg)
-    sched.step2_assign_vgpr_sets()
-    print(sched.print_step2())
-    parts = sched._step2_partitions
+    sched.assign_vgpr_sets()
+    print(sched.print_vgpr())
+    parts = sched._partitions
 
     # MFMA sets: chunk-based, identical across all 4 partitions.
     # A/B: 0,1,0,1.  SA/SB: 0,0,1,1.
@@ -1417,7 +1417,7 @@ def _assert_gr(slot, tensor, k_start, k_end, tile_start, tile_end, mt='n+2', idx
     assert gr.tiles.tileId_end == tile_end
 
 #OK
-def test_step3_LR_1x1_partition_1x1():
+def test_place_GRs_LR_1x1_partition_1x1():
     """Step 3: 256x256, DU256, FP4, k=1.
 
     1 partition, numK=2. GR order: A, B, SA, SB.
@@ -1428,8 +1428,8 @@ def test_step3_LR_1x1_partition_1x1():
     """
     cfg = make_256x256_fp4()
     sched = MFMATileScheduler(cfg)
-    slots = sched.step3_place_GRs()
-    print(sched.print_step3())
+    slots = sched.place_GRs()
+    print(sched.print_gr())
 
     # subIterK=0: A[0-7], B[0-0]
     assert [gr.tensor for gr in slots[0].grs] == ['A', 'B']
@@ -1442,7 +1442,7 @@ def test_step3_LR_1x1_partition_1x1():
     _assert_gr(slots[1], 'SA', 0, 2, 0, 8)
     _assert_gr(slots[1], 'SB', 0, 2, 0, 8)
 
-def test_step3_LR_1x1_partition_1x1_DU512():
+def test_place_GRs_LR_1x1_partition_1x1_DU512():
     """Step 3: 256x256, DU512, FP4, k=1.
 
     1 partition, numK=4. grA/B.k=2, grSA/SB.k=4 (full MT).
@@ -1488,8 +1488,8 @@ def test_step3_LR_1x1_partition_1x1_DU512():
         grSB=ReadGranularity(MFMATileSize(k=4, mn=8)),
     )
     sched = MFMATileScheduler(cfg)
-    slots = sched.step3_place_GRs()
-    print(sched.print_step3())
+    slots = sched.place_GRs()
+    print(sched.print_gr())
 
     # s0: A k[0,2)
     assert [gr.tensor for gr in slots[0].grs] == ['A']
@@ -1511,7 +1511,7 @@ def test_step3_LR_1x1_partition_1x1_DU512():
     _assert_gr(slots[3], 'B', 2, 4, 0, 8)
 
 
-def test_step3_LR_1x1_partition_2x2():
+def test_place_GRs_LR_1x1_partition_2x2():
     """Step 3: 256x256, DU256, FP4, k=1, 2x2 partition.
 
     Scale GR mn=8 > partition tiles=4 → range snaps to [0,8), deduped.
@@ -1551,9 +1551,9 @@ def test_step3_LR_1x1_partition_2x2():
         numPartitionsN=2,
     )
     sched = MFMATileScheduler(cfg)
-    slots = sched.step3_place_GRs()
-    print(sched.print_step3())
-    parts = sched._step3_partitions
+    slots = sched.place_GRs()
+    print(sched.print_gr())
+    parts = sched._partitions
 
     # GRs are distributed across all 8 slots (4 partitions × 2 subIterKs).
     # 18 atoms / 8 slots = 2 per slot (remainder goes to later slots).
@@ -1594,7 +1594,7 @@ def test_step3_LR_1x1_partition_2x2():
     _assert_gr(p[1], 'SB', 0, 2, 0, 8, mt='n+2')
 
 
-def test_step3_LR_1x1_partition_2x2_DU512():
+def test_place_GRs_LR_1x1_partition_2x2_DU512():
     """Step 3: 256x256, DU512, FP4, k=1, 2x2 partition.
 
     DU512 → numK=4. GR k-gran=2 → two k-chunks: k[0,1] and k[2,3].
@@ -1628,9 +1628,9 @@ def test_step3_LR_1x1_partition_2x2_DU512():
         numPartitionsN=2,
     )
     sched = MFMATileScheduler(cfg)
-    slots = sched.step3_place_GRs()
-    print(sched.print_step3())
-    parts = sched._step3_partitions
+    slots = sched.place_GRs()
+    print(sched.print_gr())
+    parts = sched._partitions
 
     # 10 GR entries, 34 atoms, 16 slots, 2 per slot.
     # SA/SB k=4 → one entry each covering k[0,3] (deduped across k-chunks).
@@ -1684,7 +1684,7 @@ def test_step3_LR_1x1_partition_2x2_DU512():
     _assert_gr(p[3], 'B', 2, 4, 0, 4, mt='n+2')
 
 
-def test_step3_LR_1x1_partition_10x1():
+def test_place_GRs_LR_1x1_partition_10x1():
     """Step 3: 320x320, BF16, k=1, 10x1 partition. No scales.
 
     10 M-partitions, 1 N-partition → B range [0-9] is the same for all.
@@ -1709,9 +1709,9 @@ def test_step3_LR_1x1_partition_10x1():
         numPartitionsN=1,
     )
     sched = MFMATileScheduler(cfg)
-    slots = sched.step3_place_GRs()
-    print(sched.print_step3())
-    parts = sched._step3_partitions
+    slots = sched.place_GRs()
+    print(sched.print_gr())
+    parts = sched._partitions
 
     # 1 atom per slot across 20 slots (10 partitions × 2 subIterKs).
     # P0..P3: each slot gets one A n+1 tile
@@ -1741,13 +1741,13 @@ def test_step3_LR_1x1_partition_10x1():
 
 # ── Step 5: Group and serialize ──────────────────────────
 
-def test_step5_group():
+def test_group():
     """Validate Step 5: grouped output matches design doc."""
     cfg = make_example_granularities_1()
     sched = MFMATileScheduler(cfg)
-    grouped = sched.step5_group()
+    grouped = sched.group()
 
-    output = sched.print_step5()
+    output = sched.print_group()
     print(output)
 
     # subIterK=0: MFMA, LR A, LR B, LR SA, GR A, GR B[0-0]
@@ -1772,13 +1772,13 @@ def test_step5_group():
 
 # ── Step 6: EmittedModules ──────────────────────────────────
 
-def test_step6_emit():
+def test_emit():
     """Validate Step 6: EmittedModule list with correct before-links."""
     cfg = make_example_granularities_1()
     sched = MFMATileScheduler(cfg)
-    all_emitted = sched.step6_emit()
+    all_emitted = sched.emit()
 
-    output = sched.print_step6()
+    output = sched.print_emit()
     print(output)
 
     assert len(all_emitted) == 2  # 2 subIterKs
@@ -1881,8 +1881,8 @@ def test_from_tile_info_64x64_fp4():
 
     # Should produce same schedule as manual config
     sched = MFMATileScheduler(cfg)
-    partitions = sched.step1_place_LRs()
-    print(sched.print_step1())
+    partitions = sched.place_LRs()
+    print(sched.print_lr())
     output = partitions[0]
     assert len(output) == 2
     assert output[0].mfma.tileA.tileId_end == 2  # 2 MFMA tiles in M
@@ -1943,12 +1943,12 @@ if __name__ == "__main__":
     sched = MFMATileScheduler(cfg)
 
     steps = [
-        ("Step 1: Place LRs",          lambda: (sched.step1_place_LRs(), sched.print_step1())),
-        ("Step 2: Assign VGPR sets",    lambda: (sched.step2_assign_vgpr_sets(), sched.print_step2())),
-        ("Step 3: Place GRs",           lambda: (sched.step3_place_GRs(), sched.print_step3())),
-        ("Step 4: Annotate deps",       lambda: (sched.step4_annotate_deps(), sched.print_step4())),
-        ("Step 5: Group and serialize", lambda: (sched.step5_group(), sched.print_step5())),
-        ("Step 6: EmittedModules",      lambda: (sched.step6_emit(), sched.print_step6())),
+        ("Step 1: Place LRs",          lambda: (sched.place_LRs(), sched.print_lr())),
+        ("Step 2: Assign VGPR sets",    lambda: (sched.assign_vgpr_sets(), sched.print_vgpr())),
+        ("Step 3: Place GRs",           lambda: (sched.place_GRs(), sched.print_gr())),
+        ("Step 4: Annotate deps",       lambda: (sched.annotate_deps(), sched.print_deps())),
+        ("Step 5: Group and serialize", lambda: (sched.group(), sched.print_group())),
+        ("Step 6: EmittedModules",      lambda: (sched.emit(), sched.print_emit())),
     ]
 
     interactive = "--interactive" in sys.argv or "-i" in sys.argv

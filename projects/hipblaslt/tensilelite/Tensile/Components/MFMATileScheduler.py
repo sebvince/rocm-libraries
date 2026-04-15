@@ -3,13 +3,13 @@
 Builds a logical schedule using MFMA tile indices as the core primitive,
 with explicit per-operation load granularity for GR/LR on A, B, SA, SB.
 
-The schedule is built in 6 steps:
-  1. Place LRs based on their granularities
-  2. Assign VGPR tile sets (ping-pong) based on subIterK dependencies
-  3. Place GRs
-  4. Annotate dependencies
-  5. Group and serialize (produce paths for instructionSchedule)
-  6. Produce List[EmittedModule] with before-link chains
+The schedule is built in 6 passes:
+  place_LRs        — place LRs based on their granularities
+  assign_vgpr_sets — assign VGPR tile sets (ping-pong) based on subIterK dependencies
+  place_GRs        — place GRs
+  annotate_deps    — annotate raw per-op dependencies
+  group            — serialize and group (produce paths for instructionSchedule)
+  emit             — produce List[EmittedModule] with before-link chains
 """
 
 from __future__ import annotations
@@ -188,12 +188,12 @@ class SubIterKSlot:
     mfma: Optional[MFMAPlacement] = None
     lrs: List[LRPlacement] = field(default_factory=list)
     grs: List[GRPlacement] = field(default_factory=list)
-    # Step 2 annotations . TODO. Check if we keep this info like this. TBD when implementing unrolling.
+    # VGPR set annotations. TODO. Check if we keep this info like this. TBD when implementing unrolling.
     mfma_sets: Optional[dict] = None   # {'A': int, 'B': int, 'SA': int, 'SB': int}
     lr_sets: Optional[dict] = None     # tensor -> set id per LR
 
 
-# ── Step 2 output ───────────────────────────────────────────
+# ── VGPR set assignment output ───────────────────────────────
 
 @dataclass
 class VGPRSetAssignment:
@@ -216,8 +216,8 @@ class DepOp:
       'lr_inc'       — LDS buffer swap for LR (needs tensor)
       'gr_inc'       — pointer update + LDS swap for GR (needs tensor)
       'ref'          — reference to another AnnotatedOp in same subIterK
-      'lr_ref'       — dependency on LR for a tensor (Step 4, cross-subIterK)
-      'gr_ref'       — dependency on GR for a tensor (Step 4, cross-subIterK)
+      'lr_ref'       — dependency on LR for a tensor (annotate_deps, cross-subIterK)
+      'gr_ref'       — dependency on GR for a tensor (annotate_deps, cross-subIterK)
     """
     kind: str
     tensor: str = ""
@@ -238,16 +238,16 @@ class AnnotatedOp:
     placement: object = None
 
 
-# ── Step 5 grouped output ──────────────────────────────────
+# ── Grouped output ─────────────────────────────────────────
 
 @dataclass
 class GroupedSubIterK:
-    """Step 5 output: serialized ops within one subIterK."""
+    """Serialized ops within one subIterK (output of group/annotate_deps)."""
     subIterK: int
     ops: List[AnnotatedOp] = field(default_factory=list)
 
 
-# ── Step 6 output ──────────────────────────────────────────
+# ── Emitted output ─────────────────────────────────────────
 
 @dataclass
 class EmittedModule:
@@ -268,19 +268,19 @@ class EmittedModule:
 class MFMATileScheduler:
     """MFMATile-based logical scheduler.
 
-    Builds the schedule in 5 steps, each producing testable intermediate output.
+    Builds the schedule in 6 passes, each producing testable intermediate output.
+    Each pass auto-runs its prerequisites if needed (tracked via self._completed).
     """
 
     def __init__(self, config: SchedulerConfig):
         self.config = config
-        self._step1_result: Optional[List[List[SubIterKSlot]]] = None
-        self._step2_result: Optional[List[SubIterKSlot]] = None
-        self._step3_result: Optional[List[SubIterKSlot]] = None
-        self._step4_result: Optional[List[SubIterKSlot]] = None
-        self._step5_result: Optional[List[GroupedSubIterK]] = None
-        self._step6_result: Optional[List[EmittedModule]] = None
+        self._completed: set = set()   # tracks which passes have run: {'lr', 'vgpr', 'gr', 'deps', 'group', 'emit'}
+        self._partitions: Optional[List[List[SubIterKSlot]]] = None  # shared mutable state across passes
+        self._deps: Optional[List[GroupedSubIterK]] = None
+        self._grouped: Optional[List[GroupedSubIterK]] = None
+        self._emitted: Optional[List[List[EmittedModule]]] = None
 
-    # ── Step 1: Place LRs ─────────────────────────────────
+    # ── Place LRs ─────────────────────────────────────────
 
     def _partition_tile_range(self, pi: int) -> dict:
         """Return {'A': (start, end), 'B': (start, end)} for partition pi.
@@ -296,7 +296,7 @@ class MFMATileScheduler:
         return {'A': (a0, a0 + cfg.partitionSizeM),
                 'B': (b0, b0 + cfg.partitionSizeN)}
 
-    def step1_place_LRs(self) -> List[List[SubIterKSlot]]:
+    def place_LRs(self) -> List[List[SubIterKSlot]]:
         """Place MFMAs and LRs based on read granularities.
 
         Returns a list of partitions, each containing a list of SubIterKSlots.
@@ -339,7 +339,8 @@ class MFMATileScheduler:
                 if load[side]:
                     loaded_ranges[side] = {cur[side], nxt[side]}
 
-        self._step1_result = partitions
+        self._partitions = partitions
+        self._completed.add('lr')
         return partitions
 
     def _place_LRs_for_partition(self, cur: tuple, nxt: tuple,
@@ -424,9 +425,9 @@ class MFMATileScheduler:
 
         return slots
 
-    # ── Step 2: Assign VGPR sets ──────────────────────────
+    # ── Assign VGPR sets ──────────────────────────────────
 
-    def step2_assign_vgpr_sets(self) -> List[SubIterKSlot]:
+    def assign_vgpr_sets(self) -> List[SubIterKSlot]:
         """Assign VGPR set IDs (0 or 1) to MFMAs and LRs.
 
         Rule: MFMA and LR in the same subIterK never share a set.
@@ -438,8 +439,8 @@ class MFMATileScheduler:
         until the end of the partition so they don't affect remaining
         MFMAs within the same partition.
         """
-        if self._step1_result is None:
-            self.step1_place_LRs()
+        if 'lr' not in self._completed:
+            self.place_LRs()
 
         cfg = self.config
         numK = cfg.numSubIterK
@@ -456,7 +457,7 @@ class MFMATileScheduler:
             tensor_k_gran['SB'] = cfg.lrSB.size.k
 
         # Initialize all slots across all partitions
-        for partition_slots in self._step1_result:
+        for partition_slots in self._partitions:
             for slot in partition_slots:
                 slot.mfma_sets = {}
                 slot.lr_sets = {}
@@ -472,7 +473,7 @@ class MFMATileScheduler:
             set_map[(t, part_ranges[0][side_key], 0)] = 0
 
         # Sequential scan across partitions and subIterKs
-        for pi, slots in enumerate(self._step1_result):
+        for pi, slots in enumerate(self._partitions):
             deferred = []  # wrapping LR writes, applied after partition
             for k in range(numK):
                 slot = slots[k]
@@ -511,15 +512,14 @@ class MFMATileScheduler:
             for key, val in deferred:
                 set_map[key] = val
 
-        self._step2_partitions = self._step1_result
-        self._step2_result = self._step2_partitions[0]
-        return self._step2_result
+        self._completed.add('vgpr')
+        return self._partitions[0]
 
-    # ── Step 3: Place GRs ─────────────────────────────────
+    # ── Place GRs ─────────────────────────────────────────
 
-    def _step3_build_gr_list(self, part_ranges, offsetMT, offsetPartition,
+    def _build_gr_list(self, part_ranges, offsetMT, offsetPartition,
                              debug=False):
-        """Phase 1: Build ordered GR list from step2 MFMAs.
+        """Phase 1: Build ordered GR list from assign_vgpr_sets MFMAs.
 
         For each partition × subIterK, derive target partition/MT from
         the MFMA and offsets. Add GRs (A, B, SA, SB) with tile and K
@@ -538,7 +538,7 @@ class MFMATileScheduler:
         gr_list = []
 
         for pi in range(numP):
-            partition_slots = self._step2_partitions[pi]
+            partition_slots = self._partitions[pi]
 
             target_pi = (pi + offsetPartition) % numP
             wraps = (pi + offsetPartition) >= numP
@@ -596,14 +596,14 @@ class MFMATileScheduler:
 
         return gr_list
 
-    def _step3_build_lr_conflict_map(self):
+    def _build_lr_conflict_map(self):
         """Build per-partition LR(MT n) info for LDS conflict checking.
 
         Returns dict: (partition_idx, tensor) -> list of
                       (subIterK_slot, k_start, k_end).
         """
         lr_mt_n_info = {}
-        for pi, partition_slots in enumerate(self._step2_partitions):
+        for pi, partition_slots in enumerate(self._partitions):
             for slot in partition_slots:
                 for lr in slot.lrs:
                     if lr.mtIteration == "n":
@@ -629,7 +629,7 @@ class MFMATileScheduler:
                 return True
         return False
 
-    def _step3_distribute_grs(self, gr_list, lr_mt_n_info, debug=False):
+    def _distribute_grs(self, gr_list, lr_mt_n_info, debug=False):
         """Phase 2: Distribute GR atoms across partition × subIterK slots.
 
         Explodes GR entries into atomic loads, distributes them into flat
@@ -684,7 +684,7 @@ class MFMATileScheduler:
         for flat, bucket in enumerate(buckets):
             pi = flat // numK
             si = flat % numK
-            target_slot = self._step2_partitions[pi][si]
+            target_slot = self._partitions[pi][si]
             for atom in bucket:
                 tensor, mt_str, ts, te, ks, ke = atom
                 if target_slot.grs:
@@ -701,8 +701,8 @@ class MFMATileScheduler:
                     tiles=MFMATileRange(ks, ke, ts, te),
                     subIterK_slot=si))
 
-    def step3_place_GRs(self) -> List[SubIterKSlot]:
-        """Place Global Reads by iterating step2 MFMAs across partitions.
+    def place_GRs(self) -> List[SubIterKSlot]:
+        """Place Global Reads by iterating MFMAs across partitions.
 
         Phase 1: Build ordered GR list from partition traversal respecting gr granularities.
         Phase 2: Distribute evenly GR atoms across all (partition, subIterK) slots. GR atoms being the smallest load granularity for a specific tensor.
@@ -712,8 +712,8 @@ class MFMATileScheduler:
          - we respect the GR granularities (can change the above rule a bit)
          - Overall loads are spread accross all subIterKs of all partitions.
         """
-        if self._step2_result is None:
-            self.step2_assign_vgpr_sets()
+        if 'vgpr' not in self._completed:
+            self.assign_vgpr_sets()
 
 
         part_ranges = [self._partition_tile_range(pi)
@@ -723,22 +723,21 @@ class MFMATileScheduler:
         offsetMT = 1
         offsetPartition = 1
         # Build ordered list of GRs to place for the entire MT based on the partitioning ordering and the GR granularities.
-        gr_list = self._step3_build_gr_list(part_ranges, offsetMT, offsetPartition)
+        gr_list = self._build_gr_list(part_ranges, offsetMT, offsetPartition)
         # Map to keep track of LR(MT n) for each partiion and tensor, used for LDS double buffer conflict checking when placing GRs.
-        lr_mt_n_info = self._step3_build_lr_conflict_map()
+        lr_mt_n_info = self._build_lr_conflict_map()
         # Distribute GRs accross partition.
-        self._step3_distribute_grs(gr_list, lr_mt_n_info)
+        self._distribute_grs(gr_list, lr_mt_n_info)
 
-        self._step3_partitions = self._step2_partitions
-        self._step3_result = self._step3_partitions[0]
-        return self._step3_result
+        self._completed.add('gr')
+        return self._partitions[0]
 
-    # ── Step 4: Annotate dependencies ─────────────────────
+    # ── Annotate dependencies ─────────────────────────────
 
-    def step4_annotate_deps(self) -> List[GroupedSubIterK]:
+    def annotate_deps(self) -> List[GroupedSubIterK]:
         """Annotate each operation with its raw before-dependencies.
 
-        These are the per-op dependencies before Step 5 grouping. They may
+        These are the per-op dependencies before group() serialization. They may
         reference operations in other subIterKs or iterations (descriptive).
 
         Rules:
@@ -748,9 +747,9 @@ class MFMATileScheduler:
         - GR depends on GRInc for same tensor (pointer update)
         - GR depends on collision LR for same tensor (LDS double-buffer)
         """
-        if self._step3_result is None:
-            self.step3_place_GRs()
-        slots = self._step3_result
+        if 'gr' not in self._completed:
+            self.place_GRs()
+        slots = self._partitions[0]
         cfg = self.config
         numK = cfg.numSubIterK
 
@@ -793,28 +792,27 @@ class MFMATileScheduler:
 
             grouped.append(gslot)
 
-        self._step4_result = grouped
+        self._deps = grouped
+        self._completed.add('deps')
         return grouped
 
-    # ── Step 5: Group and serialize ───────────────────────
+    # ── Group and serialize ───────────────────────────────
 
-    def step5_group(self) -> List[GroupedSubIterK]:
+    def group(self) -> List[GroupedSubIterK]:
         """Serialize operations within each subIterK.
 
-        Takes Step 4's raw deps and transforms them:
+        Takes annotate_deps' raw deps and transforms them:
         - Cross-subIterK LR deps → WaitLROp barrier
         - Cross-subIterK GR deps → WaitGROp barrier
         - Same-subIterK deps → node refs for serialization
         - LRs serialized: A → B → SA → SB with WaitGROp before first
         - GRs serialized: SA → A (or SB → B) with merged deps
         """
-        if self._step3_result is None:
-            self.step3_place_GRs()
-        # Step 5 operates on the raw slot placements from Step 3
-        slots = self._step3_result
-        # Ensure Step 4 has been run (for its own output/display)
-        if self._step4_result is None:
-            self.step4_annotate_deps()
+        if 'gr' not in self._completed:
+            self.place_GRs()
+        slots = self._partitions[0]
+        if 'deps' not in self._completed:
+            self.annotate_deps()
         cfg = self.config
         numK = cfg.numSubIterK
 
@@ -883,13 +881,14 @@ class MFMATileScheduler:
 
             grouped.append(gslot)
 
-        self._step5_result = grouped
+        self._grouped = grouped
+        self._completed.add('group')
         return grouped
 
     def _needs_collision_wait(self, subIterK: int, ordered_lrs: list) -> bool:
         """Check if GRs at this subIterK need explicit wait_lr_sync.
 
-        At Step 5, only same-subIterK node refs survive; cross-subIterK deps
+        In group(), only same-subIterK node refs survive; cross-subIterK deps
         are absorbed by WaitLROp/WaitGROp barriers.
 
         At subIterK=0: the LRs in this slot just ran (async ds_reads). GR is
@@ -913,10 +912,10 @@ class MFMATileScheduler:
                 last_lr = op
         return last_lr
 
-    # ── Step 6: Produce EmittedModules ────────────────────
+    # ── Produce EmittedModules ────────────────────────────
 
-    def step6_emit(self) -> List[List[EmittedModule]]:
-        """Convert Step 5 grouped ops into a flat List[EmittedModule] per subIterK.
+    def emit(self) -> List[List[EmittedModule]]:
+        """Convert grouped ops into a flat List[EmittedModule] per subIterK.
 
         Each AnnotatedOp becomes one EmittedModule. Its DepOp before-deps are
         flattened into chained EmittedModules, with the primary op's .before
@@ -926,9 +925,9 @@ class MFMATileScheduler:
         'wait_lr_sync' expands to two modules (wait_lr → sync).
         All other dep kinds become one EmittedModule each.
         """
-        if self._step5_result is None:
-            self.step5_group()
-        grouped = self._step5_result
+        if 'group' not in self._completed:
+            self.group()
+        grouped = self._grouped
 
         all_emitted = []
         for gslot in grouped:
@@ -964,7 +963,8 @@ class MFMATileScheduler:
 
             all_emitted.append(emitted)
 
-        self._step6_result = all_emitted
+        self._emitted = all_emitted
+        self._completed.add('emit')
         return all_emitted
 
     # ── Print helpers ───────────────────────────────────────
@@ -975,16 +975,16 @@ class MFMATileScheduler:
         return tensor.ljust(2)
 
     def _get_slot_data(self, subIterK: int) -> Optional[SubIterKSlot]:
-        """Get Step 3 slot for set annotations (mfma_sets, lr_sets)."""
-        if self._step3_result and subIterK < len(self._step3_result):
-            return self._step3_result[subIterK]
+        """Get slot for VGPR set annotations (mfma_sets, lr_sets)."""
+        if self._partitions and subIterK < len(self._partitions[0]):
+            return self._partitions[0][subIterK]
         return None
 
     def _format_op_label(self, op: AnnotatedOp, gslot) -> str:
         """Compute a human-readable label from an AnnotatedOp's placement.
 
         Labels are only for display — never stored in the data structure.
-        Set annotations come from the Step 3 slot data.
+        Set annotations come from the assign_vgpr_sets slot data.
         """
         p = op.placement
         k = gslot.subIterK if hasattr(gslot, 'subIterK') else 0
@@ -1012,18 +1012,18 @@ class MFMATileScheduler:
                     f"ids {p.tiles.fmt_tiles()}")
         return op.kind
 
-    def print_step1(self, partitions: List[List[SubIterKSlot]] = None) -> str:
-        """Print Step 1 output in design doc format."""
+    def print_lr(self, partitions: List[List[SubIterKSlot]] = None) -> str:
+        """Print place_LRs output in design doc format."""
         if partitions is None:
-            partitions = self._step1_result
+            partitions = self._partitions
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
         for pi, slots in enumerate(partitions):
             buf.write(f"  Partition {pi}:\n")
-            self._print_step1_partition(buf, slots)
+            self._print_lr_partition(buf, slots)
         return buf.getvalue()
 
-    def _print_step1_partition(self, buf, slots):
+    def _print_lr_partition(self, buf, slots):
         for slot in slots:
             buf.write(f"    subIterK={slot.subIterK}:\n")
             if slot.mfma:
@@ -1037,9 +1037,9 @@ class MFMATileScheduler:
                           f"{lr.tiles.fmt_tiles()}\n")
         return buf.getvalue()
 
-    def print_step2(self) -> str:
-        """Print Step 2 output: same as Step 1 but with set annotations."""
-        partitions = self._step2_partitions
+    def print_vgpr(self) -> str:
+        """Print assign_vgpr_sets output: LRs + MFMAs with set annotations."""
+        partitions = self._partitions
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
         for pi, slots in enumerate(partitions):
@@ -1067,9 +1067,9 @@ class MFMATileScheduler:
                               f"{lr.tiles.fmt_tiles()}{set_str}\n")
         return buf.getvalue()
 
-    def print_step3(self) -> str:
-        """Print Step 3 output: Step 2 + GR placements, all partitions."""
-        partitions = self._step3_partitions
+    def print_gr(self) -> str:
+        """Print place_GRs output: LRs + MFMAs + GR placements, all partitions."""
+        partitions = self._partitions
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
         for pi, slots in enumerate(partitions):
@@ -1101,16 +1101,16 @@ class MFMATileScheduler:
                               f"ids {gr.tiles.fmt_tiles()}\n")
         return buf.getvalue()
 
-    def print_step4(self, grouped: List[GroupedSubIterK] = None) -> str:
-        """Print Step 4 output: ops with raw per-op dependencies."""
-        if grouped is None:
-            grouped = self._step4_result
-        return self.print_step5(grouped)
+    def print_deps(self, grouped: List[GroupedSubIterK] = None) -> str:
+        """Print annotate_deps output: ops with raw per-op dependencies."""
+        return self._print_grouped(grouped or self._deps)
 
-    def print_step5(self, grouped: List[GroupedSubIterK] = None) -> str:
-        """Print Step 5 output: grouped and serialized with dependencies."""
-        if grouped is None:
-            grouped = self._step5_result
+    def print_group(self, grouped: List[GroupedSubIterK] = None) -> str:
+        """Print group output: serialized ops with dependencies."""
+        return self._print_grouped(grouped or self._grouped)
+
+    def _print_grouped(self, grouped: List[GroupedSubIterK]) -> str:
+        """Shared format for annotate_deps and group output."""
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
         buf.write("  Partition 0:\n")
@@ -1132,10 +1132,10 @@ class MFMATileScheduler:
             return self._format_op_label(dep.ref, gslot)
         return str(dep)
 
-    def print_step6(self, all_emitted: List[List[EmittedModule]] = None) -> str:
-        """Print Step 6 output: EmittedModule list with before-links."""
+    def print_emit(self, all_emitted: List[List[EmittedModule]] = None) -> str:
+        """Print emit output: EmittedModule list with before-links."""
         if all_emitted is None:
-            all_emitted = self._step6_result
+            all_emitted = self._emitted
         buf = io.StringIO()
         for k, emitted in enumerate(all_emitted):
             buf.write(f"subIterK={k}:\n")
