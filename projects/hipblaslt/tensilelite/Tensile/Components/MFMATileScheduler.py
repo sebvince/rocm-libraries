@@ -159,6 +159,7 @@ class MFMAPlacement:
     subIterK: int
     tileA: MFMATileRange       # A tiles consumed
     tileB: MFMATileRange       # B tiles consumed
+    before: List['DepOp'] = field(default_factory=list)  # populated by annotate_deps()
 
 
 @dataclass
@@ -168,6 +169,8 @@ class LRPlacement:
     mtIteration: str           # 'n', 'n+1'
     tiles: MFMATileRange
     subIterK_slot: int         # which subIterK this LR is placed in
+    partition: int = 0         # which partition this LR belongs to
+    before: List['DepOp'] = field(default_factory=list)  # populated by annotate_deps()
 
 
 @dataclass
@@ -177,6 +180,8 @@ class GRPlacement:
     mtIteration: str           # 'n+2'
     tiles: MFMATileRange
     subIterK_slot: int         # which subIterK this GR is placed in
+    partition: int = 0         # which partition this GR belongs to
+    before: List['DepOp'] = field(default_factory=list)  # populated by annotate_deps()
 
 
 # ── Per-subIterK container ──────────────────────────────────
@@ -215,13 +220,13 @@ class DepOp:
                         to ensure LR finished reading LDS before GR overwrites it)
       'lr_inc'       — LDS buffer swap for LR (needs tensor)
       'gr_inc'       — pointer update + LDS swap for GR (needs tensor)
-      'ref'          — reference to another AnnotatedOp in same subIterK
-      'lr_ref'       — dependency on LR for a tensor (annotate_deps, cross-subIterK)
-      'gr_ref'       — dependency on GR for a tensor (annotate_deps, cross-subIterK)
+      'ref'          — reference to another AnnotatedOp in same subIterK (group)
+      'lr_ref'       — dependency on a specific LR placement (annotate_deps)
+      'gr_ref'       — dependency on a specific GR placement (annotate_deps)
     """
     kind: str
     tensor: str = ""
-    ref: Optional['AnnotatedOp'] = None
+    ref: Optional[object] = None  # placement (annotate_deps) or AnnotatedOp (group)
 
     def __str__(self):
         if self.tensor:
@@ -244,6 +249,7 @@ class AnnotatedOp:
 class GroupedSubIterK:
     """Serialized ops within one subIterK (output of group/annotate_deps)."""
     subIterK: int
+    partition: int = 0
     ops: List[AnnotatedOp] = field(default_factory=list)
 
 
@@ -276,7 +282,6 @@ class MFMATileScheduler:
         self.config = config
         self._completed: set = set()   # tracks which passes have run: {'lr', 'vgpr', 'gr', 'deps', 'group', 'emit'}
         self._partitions: Optional[List[List[SubIterKSlot]]] = None  # shared mutable state across passes
-        self._deps: Optional[List[GroupedSubIterK]] = None
         self._grouped: Optional[List[GroupedSubIterK]] = None
         self._emitted: Optional[List[List[EmittedModule]]] = None
 
@@ -333,6 +338,9 @@ class MFMATileScheduler:
                 load[side] = is_last or nxt[side] not in loaded_ranges[side]
 
             slots = self._place_LRs_for_partition(cur, nxt, is_last, load, placed)
+            for slot in slots:
+                for lr in slot.lrs:
+                    lr.partition = pi
             partitions.append(slots)
 
             for side in ('A', 'B'):
@@ -699,7 +707,8 @@ class MFMATileScheduler:
                 target_slot.grs.append(GRPlacement(
                     tensor=tensor, mtIteration=mt_str,
                     tiles=MFMATileRange(ks, ke, ts, te),
-                    subIterK_slot=si))
+                    subIterK_slot=si,
+                    partition=pi))
 
     def place_GRs(self) -> List[SubIterKSlot]:
         """Place Global Reads by iterating MFMAs across partitions.
@@ -734,11 +743,16 @@ class MFMATileScheduler:
 
     # ── Annotate dependencies ─────────────────────────────
 
-    def annotate_deps(self) -> List[GroupedSubIterK]:
-        """Annotate each operation with its raw before-dependencies.
+    def annotate_deps(self):
+        """Annotate each placement with its raw before-dependencies.
 
-        These are the per-op dependencies before group() serialization. They may
-        reference operations in other subIterKs or iterations (descriptive).
+        Populates the `before` field on MFMAPlacement, LRPlacement, and
+        GRPlacement objects in self._partitions. Each lr_ref/gr_ref DepOp
+        is resolved to point at the specific placement it depends on.
+
+        Iterates all partitions. Two-pass per partition:
+        - Pass 1: build lookups from existing placements
+        - Pass 2: populate .before on each placement
 
         Rules:
         - MFMA(subIterK=k) depends on all LRs that loaded subIterK=k data
@@ -749,52 +763,74 @@ class MFMATileScheduler:
         """
         if 'gr' not in self._completed:
             self.place_GRs()
-        slots = self._partitions[0]
         cfg = self.config
-        numK = cfg.numSubIterK
 
-        grouped = []
-        for k, slot in enumerate(slots):
-            gslot = GroupedSubIterK(subIterK=k)
+        for pi, slots in enumerate(self._partitions):
+            self._annotate_deps_partition(pi, slots, cfg)
 
-            # ── MFMA deps ──
-            # MFMA(subIterK=k) depends on all LRs that loaded subIterK=k data.
-            # These are from the previous iteration (MT n).
+        self._completed.add('deps')
+
+    def _annotate_deps_partition(self, pi: int, slots: List[SubIterKSlot],
+                                 cfg: SchedulerConfig):
+        """Annotate deps for a single partition (in-place on placements)."""
+        numK = len(slots)
+
+        # Clear any previous annotations (idempotent re-runs)
+        for slot in slots:
             if slot.mfma:
-                before = []
+                slot.mfma.before.clear()
+            for lr in slot.lrs:
+                lr.before.clear()
+            for gr in slot.grs:
+                gr.before.clear()
+
+        # ── Pass 1: build lookups from existing placements ──
+        # lr_by_slot[k][tensor] → LRPlacement at subIterK=k
+        # lr_by_data[data_k][tensor] → list of LRPlacements loading subIterK=data_k
+        # gr_by_slot[k][tensor] → GRPlacement at subIterK=k
+        lr_by_slot = [{} for _ in range(numK)]
+        lr_by_data = [{} for _ in range(numK)]
+        gr_by_slot = [{} for _ in range(numK)]
+
+        for k, slot in enumerate(slots):
+            for lr in slot.lrs:
+                lr_by_slot[k][lr.tensor] = lr
+                for data_k in lr.tiles.subIterK_list:
+                    lr_by_data[data_k].setdefault(lr.tensor, []).append(lr)
+
+            for gr in slot.grs:
+                gr_by_slot[k][gr.tensor] = gr
+
+        # ── Pass 2: populate .before on each placement ──
+        for k, slot in enumerate(slots):
+            # MFMA deps: depends on LRs that loaded subIterK=k data
+            if slot.mfma:
                 tensor_names = ['A', 'B']
                 if cfg.hasScale:
                     tensor_names += ['SA', 'SB']
                 for t in tensor_names:
-                    before.append(DepOp(kind='lr_ref', tensor=t))
+                    for lr in lr_by_data[slot.mfma.subIterK].get(t, []):
+                        slot.mfma.before.append(DepOp(kind='lr_ref', tensor=t, ref=lr))
 
-                gslot.ops.append(AnnotatedOp(
-                    kind='MFMA', before=before, placement=slot.mfma))
-
-            # ── LR deps ──
+            # LR deps: lr_inc + gr_ref
             for lr in slot.lrs:
-                before = []
                 if lr.mtIteration != "n":
-                    before.append(DepOp(kind='lr_inc', tensor=lr.tensor))
-                before.append(DepOp(kind='gr_ref', tensor=lr.tensor))
+                    lr.before.append(DepOp(kind='lr_inc', tensor=lr.tensor))
+                gr = gr_by_slot[k].get(lr.tensor)
+                if not gr:
+                    for other_k in range(numK):
+                        gr = gr_by_slot[other_k].get(lr.tensor)
+                        if gr:
+                            break
+                if gr:
+                    lr.before.append(DepOp(kind='gr_ref', tensor=lr.tensor, ref=gr))
 
-                gslot.ops.append(AnnotatedOp(
-                    kind='LR', before=before, placement=lr))
-
-            # ── GR deps ──
+            # GR deps: gr_inc + lr_ref (collision)
             for gr in slot.grs:
-                before = [
-                    DepOp(kind='gr_inc', tensor=gr.tensor),
-                    DepOp(kind='lr_ref', tensor=gr.tensor),
-                ]
-                gslot.ops.append(AnnotatedOp(
-                    kind='GR', before=before, placement=gr))
-
-            grouped.append(gslot)
-
-        self._deps = grouped
-        self._completed.add('deps')
-        return grouped
+                gr.before.append(DepOp(kind='gr_inc', tensor=gr.tensor))
+                lr = lr_by_slot[k].get(gr.tensor)
+                if lr:
+                    gr.before.append(DepOp(kind='lr_ref', tensor=gr.tensor, ref=lr))
 
     # ── Group and serialize ───────────────────────────────
 
@@ -1101,19 +1137,69 @@ class MFMATileScheduler:
                               f"ids {gr.tiles.fmt_tiles()}\n")
         return buf.getvalue()
 
-    def print_deps(self, grouped: List[GroupedSubIterK] = None) -> str:
-        """Print annotate_deps output: ops with raw per-op dependencies."""
-        return self._print_grouped(grouped or self._deps)
+    def print_deps(self) -> str:
+        """Print annotate_deps output: placements with their before-dependencies."""
+        buf = io.StringIO()
+        buf.write("MAINLOOP:\n")
+        for pi, slots in enumerate(self._partitions):
+            buf.write(f"  Partition {pi}:\n")
+            for slot in slots:
+                buf.write(f"    subIterK={slot.subIterK}:\n")
+                if slot.mfma:
+                    self._print_placement_with_deps(buf, slot.mfma, slot)
+                for lr in slot.lrs:
+                    self._print_placement_with_deps(buf, lr, slot)
+                for gr in slot.grs:
+                    self._print_placement_with_deps(buf, gr, slot)
+        return buf.getvalue()
+
+    def _print_placement_with_deps(self, buf, placement, slot: SubIterKSlot):
+        """Print a placement label followed by its before-deps."""
+        label = self._format_placement_label(placement, slot)
+        buf.write(f"      {label}\n")
+        if placement.before:
+            buf.write("        before:\n")
+            for dep in placement.before:
+                dep_str = self._format_dep(dep)
+                buf.write(f"            - {dep_str}\n")
+
+    def _format_placement_label(self, placement, slot: SubIterKSlot) -> str:
+        """Format a placement (MFMA/LR/GR) into a human-readable label."""
+        if isinstance(placement, MFMAPlacement):
+            m = placement
+            label = (f"MFMAs (MT n, subIterK {m.subIterK}  ) "
+                     f"A : {m.tileA.fmt_tiles()} , B : {m.tileB.fmt_tiles()}")
+            if slot.mfma_sets:
+                label += " " + ", ".join(
+                    f"set{t}:{slot.mfma_sets[t]}"
+                    for t in sorted(slot.mfma_sets.keys()))
+            return label
+        elif isinstance(placement, LRPlacement):
+            t = self._fmt_tensor(placement.tensor)
+            label = (f"LR {t} (MT {placement.mtIteration}, "
+                     f"subIterK {placement.tiles.fmt_k()}) "
+                     f"{placement.tiles.fmt_tiles()}")
+            if slot.lr_sets and placement.tensor in slot.lr_sets:
+                label += f" set{placement.tensor}:{slot.lr_sets[placement.tensor]}"
+            return label
+        elif isinstance(placement, GRPlacement):
+            return (f"GR {placement.tensor} (MT {placement.mtIteration}, "
+                    f"subIterK {placement.tiles.fmt_k()}) "
+                    f"ids {placement.tiles.fmt_tiles()}")
+        return str(placement)
 
     def print_group(self, grouped: List[GroupedSubIterK] = None) -> str:
         """Print group output: serialized ops with dependencies."""
-        return self._print_grouped(grouped or self._grouped)
-
-    def _print_grouped(self, grouped: List[GroupedSubIterK]) -> str:
-        """Shared format for annotate_deps and group output."""
+        if grouped is None:
+            grouped = self._grouped
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
         buf.write("  Partition 0:\n")
+        self._print_grouped_slots(buf, grouped)
+        return buf.getvalue()
+
+    def _print_grouped_slots(self, buf, grouped: List[GroupedSubIterK]):
+        """Print a list of GroupedSubIterK slots with their deps."""
         for gslot in grouped:
             buf.write(f"    subIterK={gslot.subIterK}:\n")
             for op in gslot.ops:
@@ -1122,14 +1208,26 @@ class MFMATileScheduler:
                 if op.before:
                     buf.write("        before:\n")
                     for dep in op.before:
-                        dep_str = self._format_dep(dep, gslot)
+                        dep_str = self._format_dep(dep)
                         buf.write(f"            - {dep_str}\n")
-        return buf.getvalue()
 
-    def _format_dep(self, dep: DepOp, gslot) -> str:
-        """Format a DepOp for display. Refs are resolved to labels."""
-        if dep.kind == 'ref' and dep.ref:
-            return self._format_op_label(dep.ref, gslot)
+    def _format_dep(self, dep: DepOp) -> str:
+        """Format a DepOp for display."""
+        if dep.kind == 'ref' and dep.ref and isinstance(dep.ref, AnnotatedOp):
+            # group() refs: resolve to the AnnotatedOp's placement label
+            p = dep.ref.placement
+            slot = self._get_slot_data(p.subIterK_slot) if hasattr(p, 'subIterK_slot') else None
+            if slot:
+                return self._format_placement_label(p, slot)
+            return self._format_placement_label(p, SubIterKSlot(subIterK=0))
+        if dep.ref:
+            # annotate_deps() refs: point directly to placements
+            p = dep.ref
+            slot = p.subIterK_slot if hasattr(p, 'subIterK_slot') else '?'
+            part = p.partition if hasattr(p, 'partition') else 0
+            kind = 'LR' if isinstance(p, LRPlacement) else 'GR' if isinstance(p, GRPlacement) else 'MFMA'
+            loc = f"P{part}:subIterK={slot}" if self.config.numPartitions > 1 else f"subIterK={slot}"
+            return f"{dep.kind}({dep.tensor}) -> {kind} {dep.tensor} @{loc}"
         return str(dep)
 
     def print_emit(self, all_emitted: List[List[EmittedModule]] = None) -> str:
