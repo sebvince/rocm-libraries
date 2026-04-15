@@ -517,7 +517,8 @@ class MFMATileScheduler:
 
     # ── Step 3: Place GRs ─────────────────────────────────
 
-    def _step3_build_gr_list(self, part_ranges, offsetMT, offsetPartition):
+    def _step3_build_gr_list(self, part_ranges, offsetMT, offsetPartition,
+                             debug=False):
         """Phase 1: Build ordered GR list from step2 MFMAs.
 
         For each partition × subIterK, derive target partition/MT from
@@ -586,12 +587,12 @@ class MFMATileScheduler:
                    (entry[0], entry[2], entry[3], entry[4], entry[5])
                    not in n2_keys]
 
-        # Debug
-        print(f"Phase 1: {len(gr_list)} GR entries")
-        for i, (t, mt, ts, te, ks, ke, g) in enumerate(gr_list):
-            loads = ((te - ts) // g.size.mn) * ((ke - ks) // g.size.k)
-            print(f"  [{i}] {t:2s} {mt} tiles[{ts},{te - 1}] k[{ks},{ke - 1}] "
-                  f"gr_gran(mn={g.size.mn},k={g.size.k}) loads={loads}")
+        if debug:
+            print(f"Phase 1: {len(gr_list)} GR entries")
+            for i, (t, mt, ts, te, ks, ke, g) in enumerate(gr_list):
+                loads = ((te - ts) // g.size.mn) * ((ke - ks) // g.size.k)
+                print(f"  [{i}] {t:2s} {mt} tiles[{ts},{te - 1}] k[{ks},{ke - 1}] "
+                      f"gr_gran(mn={g.size.mn},k={g.size.k}) loads={loads}")
 
         return gr_list
 
@@ -628,7 +629,7 @@ class MFMATileScheduler:
                 return True
         return False
 
-    def _step3_distribute_grs(self, gr_list, lr_mt_n_info):
+    def _step3_distribute_grs(self, gr_list, lr_mt_n_info, debug=False):
         """Phase 2: Distribute GR atoms across partition × subIterK slots.
 
         Explodes GR entries into atomic loads, distributes them into flat
@@ -665,18 +666,19 @@ class MFMATileScheduler:
                 cur += 1
             buckets[cur].append(atom)
 
-        # Debug
-        print(f"Phase 2b: {len(atoms)} atoms, {numSlots} slots, "
-              f"{loads_per_slot} per slot")
-        for flat, bucket in enumerate(buckets):
-            pi = flat // numK
-            si = flat % numK
-            if bucket:
-                items = ", ".join(f"{t} {mt} tile[{ts},{te-1}] k[{ks},{ke-1}]"
-                                  for t, mt, ts, te, ks, ke in bucket)
-                print(f"  P{pi} s{si}: {len(bucket)} atoms — {items}")
-            else:
-                print(f"  P{pi} s{si}: empty")
+        if debug:
+            print(f"Phase 2b: {len(atoms)} atoms, {numSlots} slots, "
+                  f"{loads_per_slot} per slot")
+            for flat, bucket in enumerate(buckets):
+                pi = flat // numK
+                si = flat % numK
+                if bucket:
+                    items = ", ".join(
+                        f"{t} {mt} tile[{ts},{te-1}] k[{ks},{ke-1}]"
+                        for t, mt, ts, te, ks, ke in bucket)
+                    print(f"  P{pi} s{si}: {len(bucket)} atoms — {items}")
+                else:
+                    print(f"  P{pi} s{si}: empty")
 
         # 2c. Remerge consecutive atoms and place into partitions
         for flat, bucket in enumerate(buckets):
