@@ -739,6 +739,10 @@ class MFMATileScheduler:
          - GR are in the order we expect them from the LR pov
          - we respect the GR granularities (can change the above rule a bit)
          - Overall loads are spread accross all subIterKs of all partitions.
+
+         TODO:
+          - handle 1x4 and 4x1 GR granularities and test them
+          - support swapping A and B
         """
         if 'vgpr' not in self._completed:
             self.assign_vgpr_sets()
