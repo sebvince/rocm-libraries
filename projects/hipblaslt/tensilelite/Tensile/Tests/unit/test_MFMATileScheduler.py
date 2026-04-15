@@ -1778,10 +1778,10 @@ def test_annotate_deps_1x1_partition_DU256():
 
     # MFMA(k=0) at s0: all LR deps are at s0 or s1 (>= s0) → MT-1
     mfma0_deps = _dep_refs(s0.mfma)
-    assert ('LR', 'A',  0, 1, -1) in mfma0_deps   # mt="n", s1 >= s0 → MT-1
+    assert ('LR', 'A',  0, 1, -1) in mfma0_deps
     assert ('LR', 'B',  0, 1, -1) in mfma0_deps
-    assert ('LR', 'SA', 0, 0, -1) in mfma0_deps   # mt="n+1" → MT-1
-    assert ('LR', 'SB', 0, 1, -1) in mfma0_deps   # mt="n+1" → MT-1
+    assert ('LR', 'SA', 0, 0, -1) in mfma0_deps
+    assert ('LR', 'SB', 0, 1, -1) in mfma0_deps
     assert len(mfma0_deps) == 4
 
     # LR A @s0: depends on GR A @s0 (mt="n" vs GR mt="n+2" → MT-2)
@@ -1808,10 +1808,10 @@ def test_annotate_deps_1x1_partition_DU256():
 
     # MFMA(k=1) at s1: LR A/B (mt="n") at s0 → same MT; LR SA/SB (mt="n+1") → MT-1
     mfma1_deps = _dep_refs(s1.mfma)
-    assert ('LR', 'A',  0, 0, 0) in mfma1_deps    # mt="n", s0 < s1 → same MT
+    assert ('LR', 'A',  0, 0, 0) in mfma1_deps
     assert ('LR', 'B',  0, 0, 0) in mfma1_deps
-    assert ('LR', 'SA', 0, 0, -1) in mfma1_deps   # mt="n+1" → MT-1
-    assert ('LR', 'SB', 0, 1, -1) in mfma1_deps   # mt="n+1" → MT-1
+    assert ('LR', 'SA', 0, 0, -1) in mfma1_deps
+    assert ('LR', 'SB', 0, 1, -1) in mfma1_deps
     assert len(mfma1_deps) == 4
 
     # LR A @s1: depends on GR A @s0 (mt="n+1" vs GR mt="n+2" → MT-1)
@@ -1879,10 +1879,10 @@ def test_annotate_deps_2x2_partition_DU512():
 
     # MFMA(k=0) @P0 A[0-3],B[0-3]: deps on LRs with matching tiles — all from P3
     mfma_p0_s0 = _dep_refs(p0[0].mfma)
-    assert ('LR', 'A',  3, 3, -1) in mfma_p0_s0   # LR A @P3:s3 mt="n+1" → MT-1
-    assert ('LR', 'B',  3, 3, -1) in mfma_p0_s0   # LR B @P3:s3 mt="n+1" → MT-1
-    assert ('LR', 'SA', 3, 2, -1) in mfma_p0_s0   # LR SA @P3:s2 mt="n+1" → MT-1
-    assert ('LR', 'SB', 3, 3, -1) in mfma_p0_s0   # LR SB @P3:s3 mt="n+1" → MT-1
+    assert ('LR', 'A',  3, 3, -1) in mfma_p0_s0
+    assert ('LR', 'B',  3, 3, -1) in mfma_p0_s0
+    assert ('LR', 'SA', 3, 2, -1) in mfma_p0_s0
+    assert ('LR', 'SB', 3, 3, -1) in mfma_p0_s0
     assert len(mfma_p0_s0) == 4
 
     # LR A @P0:s0 subIterK[1] [0-3]: GR A @P2:s1 loads subIterK[0,1] ids[2-3] — overlaps both dims
@@ -1903,10 +1903,10 @@ def test_annotate_deps_2x2_partition_DU512():
 
     # MFMA(k=0) @P3 A[4-7],B[4-7]: deps on LRs with matching tiles — from P0 and P1
     mfma_p3_s0 = _dep_refs(p3[0].mfma)
-    assert ('LR', 'A',  0, 3, -1) in mfma_p3_s0   # LR A @P0:s3 mt="n" → MT-1 (slot)
-    assert ('LR', 'B',  1, 3, -1) in mfma_p3_s0   # LR B @P1:s3 mt="n" → MT-1 (slot)
-    assert ('LR', 'SA', 0, 2, -1) in mfma_p3_s0   # LR SA @P0:s2 mt="n" → MT-1 (slot)
-    assert ('LR', 'SB', 1, 2, -1) in mfma_p3_s0   # LR SB @P1:s2 mt="n" → MT-1 (slot)
+    assert ('LR', 'A',  0, 3, -1) in mfma_p3_s0
+    assert ('LR', 'B',  1, 3, -1) in mfma_p3_s0
+    assert ('LR', 'SA', 0, 2, -1) in mfma_p3_s0
+    assert ('LR', 'SB', 1, 2, -1) in mfma_p3_s0
     assert len(mfma_p3_s0) == 4
 
     # GR SA @P3:s0: no LR SA (mt="n"), falls back to LR SA (mt="n+1") → MT-1

@@ -917,29 +917,17 @@ class MFMATileScheduler:
                     gr.deps.append(DepRef(
                         ref=lr, mt_offset=_mt_offset(k, 'GR', lr, consumer=gr)))
 
-        # ── Dedup: keep only the last dep per (type, tensor) ──
-        # When multiple deps point to the same op type and tensor,
-        # only the last one in execution order matters (partition → subIterK).
+        # ── Dedup: keep only the single last dep ──
+        # Execution order is (MT offset, partition, subIterK). Waiting for the
+        # last one guarantees all earlier ones have completed.
         def _dedup_deps(deps):
             if len(deps) <= 1:
                 return deps
-            best = {}
-            for dep in deps:
-                ref = dep.ref
-                kind = 'LR' if isinstance(ref, LRPlacement) else 'GR'
-                key = (kind, ref.tensor)
-                prev = best.get(key)
-                if prev is None:
-                    best[key] = dep
-                else:
-                    p = prev.ref
-                    if (ref.partition, ref.subIterK_slot) > (p.partition, p.subIterK_slot):
-                        best[key] = dep
-            return list(best.values())
+            def _exec_order(dep):
+                return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
+            return [max(deps, key=_exec_order)]
 
         for slot in slots:
-            if slot.mfma:
-                slot.mfma.deps = _dedup_deps(slot.mfma.deps)
             for lr in slot.lrs:
                 lr.deps = _dedup_deps(lr.deps)
             for gr in slot.grs:
