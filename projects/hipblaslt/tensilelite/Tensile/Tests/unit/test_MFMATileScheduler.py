@@ -1745,12 +1745,12 @@ def test_place_GRs_LR_1x1_partition_10x1():
 # ── Step 4: Annotate deps ────────────────────────────────────
 
 def _dep_refs(placement):
-    """Return list of (type, tensor, subIterK_slot, cross_mt) for a placement's deps."""
+    """Return list of (type, tensor, partition, subIterK_slot, mt_offset) for a placement's deps."""
     result = []
     for dep in placement.deps:
         p = dep.ref
         kind = 'LR' if isinstance(p, LRPlacement) else 'GR'
-        result.append((kind, p.tensor, p.subIterK_slot, dep.cross_mt))
+        result.append((kind, p.tensor, p.partition, p.subIterK_slot, dep.mt_offset))
     return result
 
 #OK
@@ -1776,67 +1776,67 @@ def test_annotate_deps_1x1_partition_DU256():
 
     # ── subIterK=0 ──
 
-    # MFMA(k=0) at s0: all LR deps are at s0 or s1 (>= s0) → all cross_mt
+    # MFMA(k=0) at s0: all LR deps are at s0 or s1 (>= s0) → MT-1
     mfma0_deps = _dep_refs(s0.mfma)
-    assert ('LR', 'A',  1, True) in mfma0_deps   # s1 >= s0 → prev MT
-    assert ('LR', 'B',  1, True) in mfma0_deps
-    assert ('LR', 'SA', 0, True) in mfma0_deps   # s0, LR runs after MFMA → prev MT
-    assert ('LR', 'SB', 1, True) in mfma0_deps
+    assert ('LR', 'A',  0, 1, -1) in mfma0_deps   # mt="n", s1 >= s0 → MT-1
+    assert ('LR', 'B',  0, 1, -1) in mfma0_deps
+    assert ('LR', 'SA', 0, 0, -1) in mfma0_deps   # mt="n+1" → MT-1
+    assert ('LR', 'SB', 0, 1, -1) in mfma0_deps   # mt="n+1" → MT-1
     assert len(mfma0_deps) == 4
 
-    # LR A @s0: depends on GR A @s0 (GR runs after LR → prev MT)
+    # LR A @s0: depends on GR A @s0 (mt="n" vs GR mt="n+2" → MT-2)
     lr_a0 = _get_lr(s0, 'A')
-    assert _dep_refs(lr_a0) == [('GR', 'A', 0, True)]
+    assert _dep_refs(lr_a0) == [('GR', 'A', 0, 0, -2)]
 
-    # LR B @s0: depends on GR B @s0 (prev MT)
+    # LR B @s0: deduped to last GR B (s1 > s0, same tensor)
     lr_b0 = _get_lr(s0, 'B')
-    assert _dep_refs(lr_b0) == [('GR', 'B', 0, True)]
+    assert _dep_refs(lr_b0) == [('GR', 'B', 0, 1, -2)]
 
-    # LR SA @s0: depends on GR SA @s1 (s1 > s0 → prev MT)
+    # LR SA @s0: depends on GR SA @s1 (mt="n+1" vs GR mt="n+2" → MT-1)
     lr_sa0 = _get_lr(s0, 'SA')
-    assert _dep_refs(lr_sa0) == [('GR', 'SA', 1, True)]
+    assert _dep_refs(lr_sa0) == [('GR', 'SA', 0, 1, -1)]
 
-    # GR A @s0: collision on LR A @s0 (mt="n+2" vs LR mt="n" → prev MT)
+    # GR A @s0: collision on LR A @s0 (mt="n+2" vs LR mt="n" → MT-2)
     gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
-    assert _dep_refs(gr_a0) == [('LR', 'A', 0, True)]
+    assert _dep_refs(gr_a0) == [('LR', 'A', 0, 0, -2)]
 
-    # GR B @s0: collision on LR B @s0 (mt="n+2" vs LR mt="n" → prev MT)
+    # GR B @s0: collision on LR B @s0 (MT-2)
     gr_b0 = [gr for gr in s0.grs if gr.tensor == 'B'][0]
-    assert _dep_refs(gr_b0) == [('LR', 'B', 0, True)]
+    assert _dep_refs(gr_b0) == [('LR', 'B', 0, 0, -2)]
 
     # ── subIterK=1 ──
 
-    # MFMA(k=1) at s1: LRs at s0 ran first → same MT; LR SB at s1 → prev MT
+    # MFMA(k=1) at s1: LR A/B (mt="n") at s0 → same MT; LR SA/SB (mt="n+1") → MT-1
     mfma1_deps = _dep_refs(s1.mfma)
-    assert ('LR', 'A',  0, False) in mfma1_deps  # s0 < s1 → same MT
-    assert ('LR', 'B',  0, False) in mfma1_deps
-    assert ('LR', 'SA', 0, True)  in mfma1_deps   # mt="n+1" → prev MT
-    assert ('LR', 'SB', 1, True)  in mfma1_deps  # s1 >= s1 → prev MT
+    assert ('LR', 'A',  0, 0, 0) in mfma1_deps    # mt="n", s0 < s1 → same MT
+    assert ('LR', 'B',  0, 0, 0) in mfma1_deps
+    assert ('LR', 'SA', 0, 0, -1) in mfma1_deps   # mt="n+1" → MT-1
+    assert ('LR', 'SB', 0, 1, -1) in mfma1_deps   # mt="n+1" → MT-1
     assert len(mfma1_deps) == 4
 
-    # LR A @s1: depends on GR A @s0 (mt="n+1" vs GR mt="n+2" → prev MT)
+    # LR A @s1: depends on GR A @s0 (mt="n+1" vs GR mt="n+2" → MT-1)
     lr_a1 = _get_lr(s1, 'A')
-    assert _dep_refs(lr_a1) == [('GR', 'A', 0, True)]
+    assert _dep_refs(lr_a1) == [('GR', 'A', 0, 0, -1)]
 
-    # LR B @s1: depends on GR B @s1 (GR after LR → prev MT)
+    # LR B @s1: deduped to last GR B (s1 > s0, same tensor)
     lr_b1 = _get_lr(s1, 'B')
-    assert _dep_refs(lr_b1) == [('GR', 'B', 1, True)]
+    assert _dep_refs(lr_b1) == [('GR', 'B', 0, 1, -1)]
 
-    # LR SB @s1: depends on GR SB @s1 (prev MT)
+    # LR SB @s1: depends on GR SB @s1 (mt="n+1" vs GR mt="n+2" → MT-1)
     lr_sb1 = _get_lr(s1, 'SB')
-    assert _dep_refs(lr_sb1) == [('GR', 'SB', 1, True)]
+    assert _dep_refs(lr_sb1) == [('GR', 'SB', 0, 1, -1)]
 
-    # GR B @s1: collision on LR B (mt="n") at s0 (same buffer as mt="n+2")
+    # GR B @s1: collision on LR B (mt="n") at s0 (mt="n+2" vs mt="n" → MT-2)
     gr_b1 = [gr for gr in s1.grs if gr.tensor == 'B'][0]
-    assert _dep_refs(gr_b1) == [('LR', 'B', 0, True)]
+    assert _dep_refs(gr_b1) == [('LR', 'B', 0, 0, -2)]
 
-    # GR SA @s1: no LR SA (mt="n"), falls back to LR SA (mt="n+1") at s0 → prev MT
+    # GR SA @s1: no LR SA (mt="n"), falls back to LR SA (mt="n+1") → MT-1
     gr_sa1 = [gr for gr in s1.grs if gr.tensor == 'SA'][0]
-    assert _dep_refs(gr_sa1) == [('LR', 'SA', 0, True)]
+    assert _dep_refs(gr_sa1) == [('LR', 'SA', 0, 0, -1)]
 
-    # GR SB @s1: no LR SB (mt="n"), falls back to LR SB (mt="n+1") at s1 → prev MT
+    # GR SB @s1: no LR SB (mt="n"), falls back to LR SB (mt="n+1") → MT-1
     gr_sb1 = [gr for gr in s1.grs if gr.tensor == 'SB'][0]
-    assert _dep_refs(gr_sb1) == [('LR', 'SB', 1, True)]
+    assert _dep_refs(gr_sb1) == [('LR', 'SB', 0, 1, -1)]
 
 
 def test_annotate_deps_2x2_partition_DU512():
@@ -1877,50 +1877,53 @@ def test_annotate_deps_2x2_partition_DU512():
 
     p0 = parts[0]
 
-    # MFMA(k=0) @P0: LR A @s3 and LR SA @s2 are both >= s0 → prev MT
+    # MFMA(k=0) @P0 A[0-3],B[0-3]: deps on LRs with matching tiles — all from P3
     mfma_p0_s0 = _dep_refs(p0[0].mfma)
-    assert ('LR', 'A', 3, True) in mfma_p0_s0
-    assert ('LR', 'SA', 2, True) in mfma_p0_s0
+    assert ('LR', 'A',  3, 3, -1) in mfma_p0_s0   # LR A @P3:s3 mt="n+1" → MT-1
+    assert ('LR', 'B',  3, 3, -1) in mfma_p0_s0   # LR B @P3:s3 mt="n+1" → MT-1
+    assert ('LR', 'SA', 3, 2, -1) in mfma_p0_s0   # LR SA @P3:s2 mt="n+1" → MT-1
+    assert ('LR', 'SB', 3, 3, -1) in mfma_p0_s0   # LR SB @P3:s3 mt="n+1" → MT-1
+    assert len(mfma_p0_s0) == 4
 
-    # LR A @P0:s0 depends on GR A @P0:s0 (GR after LR → prev MT)
+    # LR A @P0:s0 subIterK[1] [0-3]: GR A @P2:s1 loads subIterK[0,1] ids[2-3] — overlaps both dims
     lr_a_p0_s0 = _get_lr(p0[0], 'A')
-    assert _dep_refs(lr_a_p0_s0) == [('GR', 'A', 0, True)]
+    assert _dep_refs(lr_a_p0_s0) == [('GR', 'A', 2, 1, -2)]
 
-    # LR B @P0:s0 has no GR B in P0 → no dep
+    # LR B @P0:s0 subIterK[1] [0-3]: GR B @P2:s3 loads subIterK[0,1] ids[2-3] — overlaps both dims
     lr_b_p0_s0 = _get_lr(p0[0], 'B')
-    assert _dep_refs(lr_b_p0_s0) == []
+    assert _dep_refs(lr_b_p0_s0) == [('GR', 'B', 2, 3, -2)]
 
-    # GR A @P0:s0: collision on LR A (mt="n") at s3 (same buffer as mt="n+2")
+    # GR A @P0:s0: collision on LR A (mt="n") at s3 (mt="n+1" vs mt="n" → MT-1)
     gr_a_p0_s0 = [gr for gr in p0[0].grs if gr.tensor == 'A'][0]
-    assert _dep_refs(gr_a_p0_s0) == [('LR', 'A', 3, True)]
+    assert _dep_refs(gr_a_p0_s0) == [('LR', 'A', 0, 3, -1)]
 
     # ── P3: has LR A, LR B, LR SA, LR SB and GR SA, GR SB, GR A, GR B ──
 
     p3 = parts[3]
 
-    # MFMA(k=0) @P3: all deps are at s2 or s3 (>= s0) → all prev MT
+    # MFMA(k=0) @P3 A[4-7],B[4-7]: deps on LRs with matching tiles — from P0 and P1
     mfma_p3_s0 = _dep_refs(p3[0].mfma)
-    assert ('LR', 'A', 3, True) in mfma_p3_s0
-    assert ('LR', 'B', 3, True) in mfma_p3_s0
-    assert ('LR', 'SA', 2, True) in mfma_p3_s0
-    assert ('LR', 'SB', 3, True) in mfma_p3_s0
+    assert ('LR', 'A',  0, 3, -1) in mfma_p3_s0   # LR A @P0:s3 mt="n" → MT-1 (slot)
+    assert ('LR', 'B',  1, 3, -1) in mfma_p3_s0   # LR B @P1:s3 mt="n" → MT-1 (slot)
+    assert ('LR', 'SA', 0, 2, -1) in mfma_p3_s0   # LR SA @P0:s2 mt="n" → MT-1 (slot)
+    assert ('LR', 'SB', 1, 2, -1) in mfma_p3_s0   # LR SB @P1:s2 mt="n" → MT-1 (slot)
     assert len(mfma_p3_s0) == 4
 
-    # GR SA @P3:s0: no LR SA (mt="n"), falls back to LR SA (mt="n+1") at s2 → prev MT
+    # GR SA @P3:s0: no LR SA (mt="n"), falls back to LR SA (mt="n+1") → MT-1
     gr_sa_p3 = [gr for gr in p3[0].grs if gr.tensor == 'SA'][0]
-    assert _dep_refs(gr_sa_p3) == [('LR', 'SA', 2, True)]
+    assert _dep_refs(gr_sa_p3) == [('LR', 'SA', 3, 2, -1)]
 
-    # LR SA @P3:s2 depends on GR SA @P3:s0 (mt="n+1" vs GR mt="n+2" → prev MT)
+    # LR SA @P3:s2: depends on GR SA @P3:s0 (mt="n+1" vs GR mt="n+2" → MT-1)
     lr_sa_p3_s2 = _get_lr(p3[2], 'SA')
-    assert _dep_refs(lr_sa_p3_s2) == [('GR', 'SA', 0, True)]
+    assert _dep_refs(lr_sa_p3_s2) == [('GR', 'SA', 3, 0, -1)]
 
-    # GR B @P3:s3: no LR B (mt="n"), falls back to LR B (mt="n+1") at s3 → prev MT
+    # GR B @P3:s3: no LR B (mt="n"), falls back to LR B (mt="n+1") → MT-1
     gr_b_p3_s3 = [gr for gr in p3[3].grs if gr.tensor == 'B'][0]
-    assert _dep_refs(gr_b_p3_s3) == [('LR', 'B', 3, True)]
+    assert _dep_refs(gr_b_p3_s3) == [('LR', 'B', 3, 3, -1)]
 
-    # LR B @P3:s3 depends on GR B @P3:s3 (GR after LR → prev MT)
+    # LR B @P3:s3 subIterK[0] [0-3]: GR B @P2:s3 loads subIterK[0,1] ids[2-3] — overlaps both dims
     lr_b_p3_s3 = _get_lr(p3[3], 'B')
-    assert _dep_refs(lr_b_p3_s3) == [('GR', 'B', 3, True)]
+    assert _dep_refs(lr_b_p3_s3) == [('GR', 'B', 2, 3, -1)]
 
 
 # ── Step 5/6: Group and emit (commented out — will be reworked) ──

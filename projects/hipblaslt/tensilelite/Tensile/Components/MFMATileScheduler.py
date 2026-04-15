@@ -238,7 +238,7 @@ class DepOp:
 class DepRef:
     """Dependency on another placement (annotate_deps output)."""
     ref: object     # LRPlacement or GRPlacement
-    cross_mt: bool = False  # True = depends on previous MT iteration's execution
+    mt_offset: int = 0  # 0 = same MT, -1 = prev MT, -2 = two MTs back, ...
 
 
 
@@ -768,20 +768,36 @@ class MFMATileScheduler:
 
         Rules:
         - MFMA(subIterK=k) depends on all LRs that loaded subIterK=k data
+          (cross-partition: LRs for a tensor may be in any partition)
         - LR depends on GR for same tensor (data must be in LDS)
         - GR depends on collision LR for same tensor (LDS double-buffer)
         """
         if 'gr' not in self._completed:
             self.place_GRs()
         cfg = self.config
+        numK = cfg.numSubIterK
+
+        # Build global lr_by_data across all partitions (MFMA deps are cross-partition)
+        # lr_by_data[data_k][tensor] → list of LRPlacements loading subIterK=data_k
+        lr_by_data = [{} for _ in range(numK)]
+        # gr_by_tensor[tensor] → list of all GRPlacements (LR→GR deps are cross-partition)
+        gr_by_tensor = {}
+        for slots in self._partitions:
+            for slot in slots:
+                for lr in slot.lrs:
+                    for data_k in lr.tiles.subIterK_list:
+                        lr_by_data[data_k].setdefault(lr.tensor, []).append(lr)
+                for gr in slot.grs:
+                    gr_by_tensor.setdefault(gr.tensor, []).append(gr)
 
         for pi, slots in enumerate(self._partitions):
-            self._annotate_deps_partition(pi, slots, cfg)
+            self._annotate_deps_partition(pi, slots, cfg, lr_by_data, gr_by_tensor)
 
         self._completed.add('deps')
 
     def _annotate_deps_partition(self, pi: int, slots: List[SubIterKSlot],
-                                 cfg: SchedulerConfig):
+                                 cfg: SchedulerConfig, lr_by_data: list,
+                                 gr_by_tensor: dict):
         """Annotate deps for a single partition (in-place on placements)."""
         numK = len(slots)
 
@@ -794,14 +810,13 @@ class MFMATileScheduler:
             for gr in slot.grs:
                 gr.deps.clear()
 
-        # ── Pass 1: build lookups from existing placements ──
+        # ── Pass 1: build per-partition lookups ──
         # lr_by_slot[k][tensor] → LRPlacement at subIterK=k
-        # lr_by_data[data_k][tensor] → list of LRPlacements loading subIterK=data_k
         # lr_by_mt[(mt, tensor)] → LRPlacement by mtIteration and tensor
         # lr_for_tensor[tensor] → any LRPlacement for that tensor (fallback)
         # gr_by_slot[k][tensor] → GRPlacement at subIterK=k
+        # (lr_by_data is built globally in annotate_deps and passed in)
         lr_by_slot = [{} for _ in range(numK)]
-        lr_by_data = [{} for _ in range(numK)]
         lr_by_mt = {}
         lr_for_tensor = {}
         gr_by_slot = [{} for _ in range(numK)]
@@ -811,67 +826,86 @@ class MFMATileScheduler:
                 lr_by_slot[k][lr.tensor] = lr
                 lr_by_mt[(lr.mtIteration, lr.tensor)] = lr
                 lr_for_tensor[lr.tensor] = lr
-                for data_k in lr.tiles.subIterK_list:
-                    lr_by_data[data_k].setdefault(lr.tensor, []).append(lr)
 
             for gr in slot.grs:
                 gr_by_slot[k][gr.tensor] = gr
 
         # ── Pass 2: populate deps on each placement ──
-        # cross_mt: True if dep is on previous MT iteration's execution.
+        # mt_offset: 0 = same MT, -1 = prev MT, -2 = two MTs back, etc.
         # Within one iteration, execution order per slot is MFMA → LR → GR,
         # and slots run in order 0, 1, 2, ...
-        # A dep is cross_mt when the producer hasn't run yet (same or later slot,
-        # and not earlier in the within-slot order).
         _order = {'MFMA': 0, 'LR': 1, 'GR': 2}
 
-        def _is_cross_mt(consumer_slot, consumer_type, producer, consumer=None):
-            # For MFMA→LR deps: if LR prefetches for a future iteration (mt != "n"),
-            # the data MFMA needs was loaded in a previous MT iteration.
-            if consumer_type == 'MFMA' and isinstance(producer, LRPlacement):
-                if producer.mtIteration != "n":
-                    return True
-            # For LR→GR deps: if GR writes for a different mtIteration than
-            # what the LR reads, the data came from a previous iteration's GR.
-            if consumer_type == 'LR' and isinstance(producer, GRPlacement) and consumer:
-                if producer.mtIteration != consumer.mtIteration:
-                    return True
-            # For GR→LR collision deps: if GR writes for a different mtIteration
-            # than what the LR reads, the buffer collision is with a previous iteration.
-            if consumer_type == 'GR' and isinstance(producer, LRPlacement) and consumer:
-                if producer.mtIteration != consumer.mtIteration:
-                    return True
+        def _parse_mt(mt_str):
+            """'n' → 0, 'n+1' → 1, 'n+2' → 2."""
+            return 0 if mt_str == "n" else int(mt_str.split('+')[1])
+
+        def _slot_offset(consumer_slot, consumer_type, producer):
+            """Offset from slot ordering alone: 0 if producer ran first, -1 otherwise."""
             prod_slot = producer.subIterK_slot
             if prod_slot < consumer_slot:
-                return False
+                return 0
             if prod_slot > consumer_slot:
-                return True
-            # Same slot: cross_mt unless producer runs before consumer
+                return -1
             prod_type = 'LR' if isinstance(producer, LRPlacement) else 'GR'
-            return _order[prod_type] >= _order[consumer_type]
+            return -1 if _order[prod_type] >= _order[consumer_type] else 0
+
+        def _mt_offset(consumer_slot, consumer_type, producer, consumer=None):
+            # MFMA→LR: MFMA always consumes mt="n" (offset 0).
+            if consumer_type == 'MFMA' and isinstance(producer, LRPlacement):
+                mt_off = _parse_mt(producer.mtIteration)
+                if mt_off > 0:
+                    return -mt_off
+            # LR→GR: mt difference determines how many iterations back.
+            if consumer_type == 'LR' and isinstance(producer, GRPlacement) and consumer:
+                diff = _parse_mt(producer.mtIteration) - _parse_mt(consumer.mtIteration)
+                if diff != 0:
+                    return -diff
+            # GR→LR collision: mt difference determines how many iterations back.
+            if consumer_type == 'GR' and isinstance(producer, LRPlacement) and consumer:
+                diff = _parse_mt(consumer.mtIteration) - _parse_mt(producer.mtIteration)
+                if diff != 0:
+                    return -diff
+            # Same effective mt: slot ordering decides.
+            return _slot_offset(consumer_slot, consumer_type, producer)
+
+        def _tiles_overlap(mfma, lr_tensor, lr_tiles):
+            """Check if LR tile range overlaps with MFMA's tile range for that tensor."""
+            # SA/SB follow A/B tile ranges respectively
+            if lr_tensor in ('A', 'SA'):
+                mfma_range = mfma.tileA
+            else:
+                mfma_range = mfma.tileB
+            return (lr_tiles.tileId_start < mfma_range.tileId_end and
+                    lr_tiles.tileId_end > mfma_range.tileId_start)
+
+        def _range_overlaps(a: MFMATileRange, b: MFMATileRange) -> bool:
+            """Check if two tile ranges overlap on both tile ids and subIterK."""
+            return (a.tileId_start < b.tileId_end and
+                    a.tileId_end > b.tileId_start and
+                    a.subIterK_start < b.subIterK_end and
+                    a.subIterK_end > b.subIterK_start)
 
         for k, slot in enumerate(slots):
-            # MFMA: depends on LRs that loaded subIterK=k data
+            # MFMA: depends on LRs that loaded subIterK=k data with matching tiles
             if slot.mfma:
                 tensor_names = ['A', 'B']
                 if cfg.hasScale:
                     tensor_names += ['SA', 'SB']
                 for t in tensor_names:
                     for lr in lr_by_data[slot.mfma.subIterK].get(t, []):
-                        slot.mfma.deps.append(DepRef(
-                            ref=lr, cross_mt=_is_cross_mt(k, 'MFMA', lr)))
+                        if _tiles_overlap(slot.mfma, t, lr.tiles):
+                            slot.mfma.deps.append(DepRef(
+                                ref=lr, mt_offset=_mt_offset(k, 'MFMA', lr)))
 
             # LR: depends on GR (data must be in LDS before reading)
+            # Cross-partition: the GR that loaded the matching tiles may be
+            # in a different partition. Filter by tile overlap.
             for lr in slot.lrs:
-                gr = gr_by_slot[k].get(lr.tensor)
-                if not gr:
-                    for other_k in range(numK):
-                        gr = gr_by_slot[other_k].get(lr.tensor)
-                        if gr:
-                            break
-                if gr:
-                    lr.deps.append(DepRef(
-                        ref=gr, cross_mt=_is_cross_mt(k, 'LR', gr, consumer=lr)))
+                for gr in gr_by_tensor.get(lr.tensor, []):
+                    if _range_overlaps(lr.tiles, gr.tiles):
+                        lr.deps.append(DepRef(
+                            ref=gr, mt_offset=_mt_offset(k, 'LR', gr, consumer=lr)))
 
             # GR: depends on collision LR (LDS double-buffer)
             # GR (mt="n+2") collides with same buffer as LR (mt="n").
@@ -881,7 +915,35 @@ class MFMATileScheduler:
                 lr = lr_by_mt.get(("n", gr.tensor)) or lr_for_tensor.get(gr.tensor)
                 if lr:
                     gr.deps.append(DepRef(
-                        ref=lr, cross_mt=_is_cross_mt(k, 'GR', lr, consumer=gr)))
+                        ref=lr, mt_offset=_mt_offset(k, 'GR', lr, consumer=gr)))
+
+        # ── Dedup: keep only the last dep per (type, tensor) ──
+        # When multiple deps point to the same op type and tensor,
+        # only the last one in execution order matters (partition → subIterK).
+        def _dedup_deps(deps):
+            if len(deps) <= 1:
+                return deps
+            best = {}
+            for dep in deps:
+                ref = dep.ref
+                kind = 'LR' if isinstance(ref, LRPlacement) else 'GR'
+                key = (kind, ref.tensor)
+                prev = best.get(key)
+                if prev is None:
+                    best[key] = dep
+                else:
+                    p = prev.ref
+                    if (ref.partition, ref.subIterK_slot) > (p.partition, p.subIterK_slot):
+                        best[key] = dep
+            return list(best.values())
+
+        for slot in slots:
+            if slot.mfma:
+                slot.mfma.deps = _dedup_deps(slot.mfma.deps)
+            for lr in slot.lrs:
+                lr.deps = _dedup_deps(lr.deps)
+            for gr in slot.grs:
+                gr.deps = _dedup_deps(gr.deps)
 
     # ── Group and serialize (commented out — will be reworked) ──
 
@@ -1237,7 +1299,7 @@ class MFMATileScheduler:
         slot = p.subIterK_slot if hasattr(p, 'subIterK_slot') else '?'
         part = p.partition if hasattr(p, 'partition') else 0
         kind = 'LR' if isinstance(p, LRPlacement) else 'GR'
-        mt = " (prev MT)" if dep.cross_mt else ""
+        mt = f" (MT{dep.mt_offset})" if dep.mt_offset != 0 else ""
         return f"{kind} {p.tensor} @P{part}:subIterK={slot}{mt}"
 
     # def _format_dep(self, dep: DepOp) -> str:
