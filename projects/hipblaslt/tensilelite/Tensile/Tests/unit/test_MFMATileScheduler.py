@@ -1445,16 +1445,29 @@ def test_step3_LR_1x1_partition_1x1():
 def test_step3_LR_1x1_partition_1x1_DU512():
     """Step 3: 256x256, DU512, FP4, k=1.
 
-    1 partition, numK=4, k_factor=numK//grK=4//2=2 (each tile = 2 loads).
-    GR order: A, B, SA, SB — then sorted by min_slot from LDS constraint.
-    min_slot: SA=0 (last LR SA MT n at s0), SB=1 (last LR SB MT n at s1),
-              A=2 (last LR A MT n at s2), B=2 (last LR B MT n at s2).
-    Sorted order: SA(0), SB(1), A(2), B(2).
-    Loads: SA(2), SB(2), A(16), B(16) = 36 total.
-    s0: SA[0-7](2)   — loads_per_slot=9, then jump to s1
-    s1: SB[0-7](2)   — jump to s2, recalc: 32 loads / 2 slots = 16/slot
-    s2: A[0-7](16)
-    s3: B[0-7](16)
+    1 partition, numK=4. grA/B.k=2, grSA/SB.k=4 (full MT).
+    6 GR entries: A/B × 2 k-chunks + SA/SB × 1 k-chunk.
+    Phase 1 order: A k[0,2), B k[0,2), SA k[0,4), SB k[0,4),
+                   A k[2,4), B k[2,4).
+    Loads: A(8+8), B(8+8), SA(1), SB(1) = 34 total, 8/slot.
+
+    LDS conflict (k-range aware):
+      LR(MT n): A k[1,2) at s0, A k[2,3) at s1, A k[3,4) at s2
+                B same, SA k[2,4) at s0, SB k[2,4) at s1
+      GR A/B k[0,2): no overlap with later LRs → no conflict
+      GR SA k[0,4): overlaps LR SA k[2,4) at s0, but s0 is not "later
+                    than s0" → no conflict at s0. Overlaps nothing later → ok
+      GR SB k[0,4): overlaps LR SB k[2,4) at s1 → blocked until s1+
+                    (but SB LR at s1 only, no later → ok at s2+? No,
+                    s1 is the only LR, "later than s1" = none → ok at s2)
+                    Actually check: any lr_slot > cur with overlap.
+                    At s0: LR SB k[2,4) at s1 > 0 and overlaps → blocked.
+                    At s1: no LR SB after s1 → ok.
+      GR A/B k[2,4): overlaps LR A/B k[3,4) at s2 → blocked until s2
+    s0: A k[0,2)(8) = 8
+    s1: B k[0,2)(8) = 8
+    s2: SA k[0,4)(1) + SB k[0,4)(1) + A k[2,4) tiles[0,6)(6) = 8
+    s3: A k[2,4) tiles[6,8)(2) + B k[2,4)(8) = 10
     """
     kernel = create_kernel(256, 256, fp4=True, depthU=512)
     tiA = TileInfo('A', kernel)
@@ -1471,91 +1484,114 @@ def test_step3_LR_1x1_partition_1x1_DU512():
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSA=ReadGranularity(MFMATileSize(k=4, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=4, mn=8)),
     )
     sched = MFMATileScheduler(cfg)
     slots = sched.step3_place_GRs()
     print(sched.print_step3())
 
-    # s0: SA[0-7]
-    assert [gr.tensor for gr in slots[0].grs] == ['SA']
-    _assert_gr(slots[0], 'SA', 0, 4, 0, 8)
+    # s0: A k[0,2)
+    assert [gr.tensor for gr in slots[0].grs] == ['A']
+    _assert_gr(slots[0], 'A', 0, 2, 0, 8)
 
-    # s1: SB[0-7]
-    assert [gr.tensor for gr in slots[1].grs] == ['SB']
-    _assert_gr(slots[1], 'SB', 0, 4, 0, 8)
+    # s1: B k[0,2)
+    assert [gr.tensor for gr in slots[1].grs] == ['B']
+    _assert_gr(slots[1], 'B', 0, 2, 0, 8)
 
-    # s2: A[0-7]
-    assert [gr.tensor for gr in slots[2].grs] == ['A']
-    _assert_gr(slots[2], 'A', 0, 4, 0, 8)
+    # s2: SA k[0,4) + SB k[0,4) + A k[2,4) tiles[0,6)
+    assert [gr.tensor for gr in slots[2].grs] == ['SA', 'SB', 'A']
+    _assert_gr(slots[2], 'SA', 0, 4, 0, 8)
+    _assert_gr(slots[2], 'SB', 0, 4, 0, 8)
+    _assert_gr(slots[2], 'A', 2, 4, 0, 6)
 
-    # s3: B[0-7]
-    assert [gr.tensor for gr in slots[3].grs] == ['B']
-    _assert_gr(slots[3], 'B', 0, 4, 0, 8)
+    # s3: A k[2,4) tiles[6,8) + B k[2,4)
+    assert [gr.tensor for gr in slots[3].grs] == ['A', 'B']
+    _assert_gr(slots[3], 'A', 2, 4, 6, 8)
+    _assert_gr(slots[3], 'B', 2, 4, 0, 8)
 
 
-# def test_step3_LR_1x1_partition_2x2():
-#     """Step 3: 256x256, DU256, FP4, k=1, 2x2 partition.
+def test_step3_LR_1x1_partition_2x2():
+    """Step 3: 256x256, DU256, FP4, k=1, 2x2 partition.
 
-#     Scale GR mn=8, partition tiles=4 → scale loads=0 (4//8=0).
-#     Only A/B count toward load balancing.
-#     Partition traversal (column-major):
-#       P0→P1 (n+1): SA[4-7](0), SB[0-3](0), A[4-7](4), B[0-3](4) = 8
-#       P1→P2 (n+1): SA[0-3](0), SB[4-7](0), A[0-3](4), B[4-7](4) = 8
-#       P2→P3 (n+1): all deduped
-#       P3→P0 (n+2): SA[0-3](0), SB[0-3](0), A[0-3](4), B[0-3](4) = 8
-#     Total=24, per_slot=12.
-#     s0: SA[4-7] SB[0-3] A[4-7] B[0-3] SA[0-3] SB[4-7] A[0-3] (n+1, 12 loads)
-#     s1: B[4-7] (n+1) + SA[0-3] SB[0-3] A[0-3] B[0-3] (n+2, 12 loads)
-#     """
-#     kernel = create_kernel(256, 256, fp4=True)
-#     tiA = TileInfo('A', kernel)
-#     tiB = TileInfo('B', kernel)
-#     scaleTiA = TileInfo('MXSA', kernel)
-#     scaleTiB = TileInfo('MXSB', kernel)
+    Scale GR mn=8 > partition tiles=4 → range snaps to [0,8), deduped.
+    Partition traversal (column-major):
+      P0→P1 (n+1): A[4-7](4), B[0-3](4), SA[0-7](1), SB[0-7](1)
+      P1→P2 (n+1): A[0-3](4), B[4-7](4), SA dedup, SB dedup
+      P2→P3 (n+1): A dedup, B dedup
+      P3→P0 (n+2): A[0-3](4), B[0-3](4), SA[0-7](1), SB[0-7](1)
+    Cross-MT dedup: n+1 entries matching an n+2 tile range are removed
+    (previous iteration's n+2 already loaded the same data into LDS).
+      A[0-3] n+1 removed (has n+2 match), B[0-3] n+1 removed (same)
+      SA/SB n+1 removed (n+2 covers full range)
+    GR list: A[4-7] n+1, B[4-7] n+1, A[0-3] n+2, B[0-3] n+2,
+             SA[0-7] n+2, SB[0-7] n+2.
+    Total=18, per_slot=9.
+    s0: A[4-7] B[4-7] SA[0-7] (n+1/n+2, 9 loads)
+    s1: A[0-3] B[0-3] SB[0-7] (n+2, 9 loads)
+    """
+    kernel = create_kernel(256, 256, fp4=True)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
 
-#     cfg = SchedulerConfig.from_tile_info(
-#         tiA, tiB,
-#         lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-#         lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-#         grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-#         grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-#         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-#         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-#         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-#         grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
-#         grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
-#         numPartitionsM=2,
-#         numPartitionsN=2,
-#     )
-#     sched = MFMATileScheduler(cfg)
-#     slots = sched.step3_place_GRs()
-#     print(sched.print_step3())
-#     parts = sched._step3_partitions
+    cfg = SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        numPartitionsM=2,
+        numPartitionsN=2,
+    )
+    sched = MFMATileScheduler(cfg)
+    slots = sched.step3_place_GRs()
+    print(sched.print_step3())
+    parts = sched._step3_partitions
 
-#     # All partitions get the same GR layout
-#     for pi in range(4):
-#         p = parts[pi]
-#         # s0: SA[4-7] SB[0-3] A[4-7] B[0-3] SA[0-3] SB[4-7] A[0-3], all n+1
-#         assert [gr.tensor for gr in p[0].grs] == \
-#             ['SA', 'SB', 'A', 'B', 'SA', 'SB', 'A'], f"P{pi} s0"
-#         _assert_gr(p[0], 'SA', 0, 2, 4, 8, mt='n+1', idx=0)
-#         _assert_gr(p[0], 'SB', 0, 2, 0, 4, mt='n+1', idx=0)
-#         _assert_gr(p[0], 'A', 0, 2, 4, 8, mt='n+1', idx=0)
-#         _assert_gr(p[0], 'B', 0, 2, 0, 4, mt='n+1', idx=0)
-#         _assert_gr(p[0], 'SA', 0, 2, 0, 4, mt='n+1', idx=1)
-#         _assert_gr(p[0], 'SB', 0, 2, 4, 8, mt='n+1', idx=1)
-#         _assert_gr(p[0], 'A', 0, 2, 0, 4, mt='n+1', idx=1)
+    # GRs are distributed across all 8 slots (4 partitions × 2 subIterKs).
+    # 18 atoms / 8 slots = 2 per slot (remainder goes to later slots).
+    # LDS conflict is per-partition: P2/P3 have no LR A/B (MT n) so
+    # n+2 A/B atoms can go to subIterK=0 there.
+    # P0 s0: A n+1 [4-5] (2 loads)
+    p = parts[0]
+    assert [gr.tensor for gr in p[0].grs] == ['A'], "P0 s0"
+    _assert_gr(p[0], 'A', 0, 2, 4, 6, mt='n+1')
+    # P0 s1: A n+1 [6-7] (2 loads)
+    assert [gr.tensor for gr in p[1].grs] == ['A'], "P0 s1"
+    _assert_gr(p[1], 'A', 0, 2, 6, 8, mt='n+1')
 
-#         # s1: B[4-7] (n+1) + SA[0-3] SB[0-3] A[0-3] B[0-3] (n+2)
-#         assert [gr.tensor for gr in p[1].grs] == \
-#             ['B', 'SA', 'SB', 'A', 'B'], f"P{pi} s1"
-#         _assert_gr(p[1], 'B', 0, 2, 4, 8, mt='n+1', idx=0)
-#         _assert_gr(p[1], 'SA', 0, 2, 0, 4, mt='n+2', idx=0)
-#         _assert_gr(p[1], 'SB', 0, 2, 0, 4, mt='n+2', idx=0)
-#         _assert_gr(p[1], 'A', 0, 2, 0, 4, mt='n+2', idx=0)
-#         _assert_gr(p[1], 'B', 0, 2, 0, 4, mt='n+2', idx=1)
+    # P1 s0: B n+1 [4-5] (2 loads)
+    p = parts[1]
+    assert [gr.tensor for gr in p[0].grs] == ['B'], "P1 s0"
+    _assert_gr(p[0], 'B', 0, 2, 4, 6, mt='n+1')
+    # P1 s1: B n+1 [6-7] (2 loads)
+    assert [gr.tensor for gr in p[1].grs] == ['B'], "P1 s1"
+    _assert_gr(p[1], 'B', 0, 2, 6, 8, mt='n+1')
+
+    # P2 s0: A n+2 [0-1] (2 loads) — no LR A (MT n) in P2, no conflict
+    p = parts[2]
+    assert [gr.tensor for gr in p[0].grs] == ['A'], "P2 s0"
+    _assert_gr(p[0], 'A', 0, 2, 0, 2, mt='n+2')
+    # P2 s1: A n+2 [2-3] (2 loads)
+    assert [gr.tensor for gr in p[1].grs] == ['A'], "P2 s1"
+    _assert_gr(p[1], 'A', 0, 2, 2, 4, mt='n+2')
+
+    # P3 s0: B n+2 [0-1] (2 loads) — no LR B (MT n) in P3, no conflict
+    p = parts[3]
+    assert [gr.tensor for gr in p[0].grs] == ['B'], "P3 s0"
+    _assert_gr(p[0], 'B', 0, 2, 0, 2, mt='n+2')
+    # P3 s1: B n+2 [2-3], SA n+2, SB n+2 (4 loads)
+    assert [gr.tensor for gr in p[1].grs] == ['B', 'SA', 'SB'], "P3 s1"
+    _assert_gr(p[1], 'B', 0, 2, 2, 4, mt='n+2')
+    _assert_gr(p[1], 'SA', 0, 2, 0, 8, mt='n+2')
+    _assert_gr(p[1], 'SB', 0, 2, 0, 8, mt='n+2')
 
 
 # def test_step3_LR_1x1_partition_2x2_DU512():

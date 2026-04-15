@@ -518,17 +518,15 @@ class MFMATileScheduler:
     # ── Step 3: Place GRs ─────────────────────────────────
 
     def step3_place_GRs(self) -> List[SubIterKSlot]:
-        """Place Global Reads by building an ordered list across partitions.
+        """Place Global Reads by iterating step2 MFMAs across partitions.
 
-        1. For each partition (column-major), determine target partition/MT:
-           target = (pi + offsetPartition) % numP
-           MT = n + offsetMT + (1 if wraps else 0)
-        2. Add GRs in local order: A, B, SA, SB. Dedup identical requests.
-        3. Flatten into a single ordered list.
-        4. Compute min_slot per tensor from LDS double-buffer constraint:
+        1. For each partition × subIterK, derive target partition/MT from
+           the MFMA and offsets. Add GRs (A, B, SA, SB) with tile and K
+           ranges snapped to GR granularity. Dedup identical requests.
+        2. Compute min_slot per tensor from LDS double-buffer constraint:
            GR (MT n+2) must not be in subIterK k if LR (MT n) for the
            same tensor exists at any subIterK > k. Sort by min_slot.
-        5. Split across subIterKs by load count, respecting min_slot
+        3. Split across subIterKs by load count, respecting min_slot
            and recalculating balance when jumping to a later slot.
         """
         if self._step2_result is None:
@@ -543,117 +541,156 @@ class MFMATileScheduler:
 
         part_ranges = [self._partition_tile_range(pi) for pi in range(numP)]
 
-        # ── Phase 1: Build ordered GR list ──
+        # ── Phase 1: Build ordered GR list from step2 MFMAs ──
         seen = set()
-        gr_list = []  # (tensor, mt_str, tile_start, tile_end, gr_gran)
+        gr_list = []  # (tensor, mt_str, tile_start, tile_end, k_start, k_end, gr_gran)
 
         for pi in range(numP):
+            partition_slots = self._step2_partitions[pi]
+
             target_pi = (pi + offsetPartition) % numP
             wraps = (pi + offsetPartition) >= numP
             mt_offset = offsetMT + (1 if wraps else 0)
             mt_str = f"n+{mt_offset}"
 
-            target = part_ranges[target_pi]
+            target_range = part_ranges[target_pi]
 
-            # Local order: A, B, SA, SB
-            items = [('A', target['A'], cfg.grA),
-                     ('B', target['B'], cfg.grB)]
-            if cfg.hasScale:
-                items.append(('SA', target['A'], cfg.grSA))
-                items.append(('SB', target['B'], cfg.grSB))
+            for slot in partition_slots:
+                k = slot.mfma.subIterK
 
-            for tensor, (t_start, t_end), gr_gran in items:
-                key = (tensor, t_start, t_end, mt_str)
-                if key in seen:
-                    continue
-                seen.add(key)
-                gr_list.append((tensor, mt_str, t_start, t_end, gr_gran))
+                # Local order: A, B, SA, SB
+                items = [('A', target_range['A'], cfg.grA),
+                         ('B', target_range['B'], cfg.grB)]
+                if cfg.hasScale:
+                    items.append(('SA', target_range['A'], cfg.grSA))
+                    items.append(('SB', target_range['B'], cfg.grSB))
 
-        # ── Phase 1b: Compute min_slot per tensor (LDS double-buffer) ──
-        # GR (MT n+2) writes to the same LDS buffer as MT n.
-        # If any LR for tensor T with mtIteration="n" exists at subIterK k',
-        # then GR T must not be placed at any subIterK k < k'.
-        # min_slot[T] = last subIterK with LR T (MT n), across all partitions.
-        last_lr_mt_n = {}
-        for partition_slots in self._step2_partitions:
+                for tensor, (t_start, t_end), gr_gran in items:
+                    mn = gr_gran.size.mn
+                    k_gran = gr_gran.size.k
+
+                    # Snap tile range to GR granularity boundaries
+                    gr_tile_start = (t_start // mn) * mn
+                    gr_tile_end = ((t_end + mn - 1) // mn) * mn
+
+                    # Snap subIterK to GR k-granularity
+                    gr_k_start = (k // k_gran) * k_gran
+                    gr_k_end = gr_k_start + k_gran
+
+                    # Dedup within same MT level
+                    key = (tensor, mt_str, gr_tile_start, gr_tile_end,
+                           gr_k_start, gr_k_end)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    gr_list.append((tensor, mt_str, gr_tile_start,
+                                    gr_tile_end, gr_k_start, gr_k_end,
+                                    gr_gran))
+
+        # Cross-MT dedup: if a tile/k range appears at both n+1 and n+2,
+        # the n+1 load is redundant — the previous iteration's n+2 already
+        # wrote the same data into LDS.  Remove the n+1 duplicate.
+        n2_keys = {(t, ts, te, ks, ke)
+                   for t, mt, ts, te, ks, ke, _ in gr_list
+                   if mt != f"n+{offsetMT}"}
+        gr_list = [entry for entry in gr_list
+                   if entry[1] != f"n+{offsetMT}" or
+                   (entry[0], entry[2], entry[3], entry[4], entry[5])
+                   not in n2_keys]
+
+        # Debug: display ordered GR list after Phase 1
+        print(f"Phase 1: {len(gr_list)} GR entries")
+        for i, (t, mt, ts, te, ks, ke, g) in enumerate(gr_list):
+            loads = ((te - ts) // g.size.mn) * ((ke - ks) // g.size.k)
+            print(f"  [{i}] {t:2s} {mt} tiles[{ts},{te - 1}] k[{ks},{ke - 1}] "
+                  f"gr_gran(mn={g.size.mn},k={g.size.k}) loads={loads}")
+
+        # ── Phase 2: Distribute GRs across partition × subIterK slots ──
+        # The GR list is common — each GR appears exactly once across the
+        # full pool of (partition, subIterK) slots.
+        numSlots = numP * numK
+
+        # Precompute LR(MT n) per (partition, tensor): list of (slot_idx, k_start, k_end).
+        # GR(MT n+2) writes the same LDS buffer as MT n, so it conflicts
+        # only if a later LR(MT n) in the SAME partition accesses the same
+        # subIterK range.
+        lr_mt_n_info = {}  # (pi, tensor) -> list of (slot_idx, k_start, k_end)
+        for pi, partition_slots in enumerate(self._step2_partitions):
             for slot in partition_slots:
                 for lr in slot.lrs:
                     if lr.mtIteration == "n":
-                        t = lr.tensor
-                        k = slot.subIterK
-                        if t not in last_lr_mt_n or k > last_lr_mt_n[t]:
-                            last_lr_mt_n[t] = k
+                        lr_mt_n_info.setdefault((pi, lr.tensor), []).append(
+                            (slot.subIterK,
+                             lr.tiles.subIterK_start,
+                             lr.tiles.subIterK_end))
 
-        min_slot = {t: last_lr_mt_n.get(t, 0) for t in
-                    (['A', 'B'] + (['SA', 'SB'] if cfg.hasScale else []))}
+        def _has_lr_conflict(tensor, mt_str, pi, subIterK, gr_k_start, gr_k_end):
+            """Return True if placing GR(mt_str) at (pi, subIterK) conflicts."""
+            if "n+2" not in mt_str:
+                return False
+            for lr_slot, lr_ks, lr_ke in lr_mt_n_info.get((pi, tensor), []):
+                if lr_slot > subIterK and gr_k_start < lr_ke and lr_ks < gr_k_end:
+                    return True
+            return False
 
-        # Sort by min_slot (ascending), preserving original order as tiebreaker
-        gr_list_sorted = sorted(
-            enumerate(gr_list),
-            key=lambda idx_gr: (min_slot.get(idx_gr[1][0], 0), idx_gr[0]))
-        gr_list = [gr for _, gr in gr_list_sorted]
-
-        # ── Phase 2: Split across subIterKs by load count ──
-        def _gr_loads(t_start, t_end, gr_gran):
-            return ((t_end - t_start) // gr_gran.size.mn) * \
-                   (numK // gr_gran.size.k)
-
-        total_loads = sum(_gr_loads(ts, te, g) for _, _, ts, te, g in gr_list)
-        placed_loads = 0
-        loads_per_slot = total_loads // numK
-
-        slot_grs = [[] for _ in range(numK)]
-        cur_slot = 0
-        cur_loads = 0
-
-        for tensor, mt_str, t_start, t_end, gr_gran in gr_list:
+        # 2a. Explode GR entries into atomic loads (1 load each)
+        atoms = []  # (tensor, mt_str, tile_pos, tile_pos+mn, k_start, k_end)
+        for tensor, mt_str, t_start, t_end, k_start, k_end, gr_gran in gr_list:
             mn = gr_gran.size.mn
-            k_factor = numK // gr_gran.size.k
-            pos = t_start
+            for pos in range(t_start, t_end, mn):
+                atoms.append((tensor, mt_str, pos, pos + mn, k_start, k_end))
 
-            # Enforce min_slot: jump forward if needed
-            tensor_min = min_slot.get(tensor, 0)
-            if cur_slot < tensor_min:
-                placed_loads += cur_loads
-                cur_slot = tensor_min
-                cur_loads = 0
-                slots_left = numK - cur_slot
-                remaining_total = total_loads - placed_loads
-                loads_per_slot = remaining_total // max(1, slots_left)
+        loads_per_slot = len(atoms) // numSlots
 
-            while pos < t_end:
-                space = loads_per_slot - cur_loads
-                mn_tiles = (t_end - pos) // mn
-                remaining = mn_tiles * k_factor
+        # 2b. Distribute atoms into flat buckets [0..numSlots),
+        #     each bucket maps to (partition=flat//numK, subIterK=flat%numK)
+        buckets = [[] for _ in range(numSlots)]
+        for atom in atoms:
+            tensor, mt_str, _, _, ks, ke = atom
+            cur = 0
+            while cur < numSlots - 1:
+                pi = cur // numK
+                subK = cur % numK
+                if (not _has_lr_conflict(tensor, mt_str, pi, subK, ks, ke) and
+                        len(buckets[cur]) < loads_per_slot):
+                    break
+                cur += 1
+            buckets[cur].append(atom)
 
-                if remaining <= space or cur_slot == numK - 1:
-                    slot_grs[cur_slot].append(GRPlacement(
-                        tensor=tensor, mtIteration=mt_str,
-                        tiles=MFMATileRange(0, numK, pos, t_end),
-                        subIterK_slot=cur_slot))
-                    cur_loads += remaining
-                    pos = t_end
-                else:
-                    # Split at mn boundary: ceiling division avoids tiny fragments
-                    mn_fit = max(1, (space + k_factor - 1) // k_factor)
-                    chunk_end = pos + mn_fit * mn
-                    slot_grs[cur_slot].append(GRPlacement(
-                        tensor=tensor, mtIteration=mt_str,
-                        tiles=MFMATileRange(0, numK, pos, chunk_end),
-                        subIterK_slot=cur_slot))
-                    cur_loads += mn_fit * k_factor
-                    pos = chunk_end
+        # Debug: display bucket distribution after 2b
+        print(f"Phase 2b: {len(atoms)} atoms, {numSlots} slots, "
+              f"{loads_per_slot} per slot")
+        for flat, bucket in enumerate(buckets):
+            pi = flat // numK
+            si = flat % numK
+            if bucket:
+                items = ", ".join(f"{t} {mt} tile[{ts},{te-1}] k[{ks},{ke-1}]"
+                                  for t, mt, ts, te, ks, ke in bucket)
+                print(f"  P{pi} s{si}: {len(bucket)} atoms — {items}")
+            else:
+                print(f"  P{pi} s{si}: empty")
 
-                if cur_loads >= loads_per_slot and cur_slot < numK - 1:
-                    placed_loads += cur_loads
-                    cur_slot += 1
-                    cur_loads = 0
-
-        # Place GRs in all partitions
-        for partition_slots in self._step2_partitions:
-            for slot_idx, grs in enumerate(slot_grs):
-                for gr in grs:
-                    partition_slots[slot_idx].grs.append(gr)
+        # 2c. Remerge consecutive atoms and place into partitions
+        for flat, bucket in enumerate(buckets):
+            pi = flat // numK
+            si = flat % numK
+            target_slot = self._step2_partitions[pi][si]
+            for atom in bucket:
+                tensor, mt_str, ts, te, ks, ke = atom
+                # Try to extend the last GR in this slot
+                if target_slot.grs:
+                    prev = target_slot.grs[-1]
+                    if (prev.tensor == tensor and
+                            prev.mtIteration == mt_str and
+                            prev.tiles.subIterK_start == ks and
+                            prev.tiles.subIterK_end == ke and
+                            prev.tiles.tileId_end == ts):
+                        prev.tiles = MFMATileRange(ks, ke, prev.tiles.tileId_start, te)
+                        continue
+                target_slot.grs.append(GRPlacement(
+                    tensor=tensor, mtIteration=mt_str,
+                    tiles=MFMATileRange(ks, ke, ts, te),
+                    subIterK_slot=si))
 
         self._step3_partitions = self._step2_partitions
         self._step3_result = self._step3_partitions[0]
