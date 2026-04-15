@@ -159,7 +159,8 @@ class MFMAPlacement:
     subIterK: int
     tileA: MFMATileRange       # A tiles consumed
     tileB: MFMATileRange       # B tiles consumed
-    before: List['DepOp'] = field(default_factory=list)  # populated by annotate_deps()
+    deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
+    pre_ops: List['PreOp'] = field(default_factory=list)    # populated by annotate_deps()
 
 
 @dataclass
@@ -170,7 +171,8 @@ class LRPlacement:
     tiles: MFMATileRange
     subIterK_slot: int         # which subIterK this LR is placed in
     partition: int = 0         # which partition this LR belongs to
-    before: List['DepOp'] = field(default_factory=list)  # populated by annotate_deps()
+    deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
+    pre_ops: List['PreOp'] = field(default_factory=list)    # populated by annotate_deps()
 
 
 @dataclass
@@ -181,7 +183,8 @@ class GRPlacement:
     tiles: MFMATileRange
     subIterK_slot: int         # which subIterK this GR is placed in
     partition: int = 0         # which partition this GR belongs to
-    before: List['DepOp'] = field(default_factory=list)  # populated by annotate_deps()
+    deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
+    pre_ops: List['PreOp'] = field(default_factory=list)    # populated by annotate_deps()
 
 
 # ── Per-subIterK container ──────────────────────────────────
@@ -232,6 +235,22 @@ class DepOp:
         if self.tensor:
             return f"{self.kind}({self.tensor})"
         return self.kind
+
+
+@dataclass
+class DepRef:
+    """Dependency on another placement (annotate_deps output)."""
+    ref: object     # LRPlacement or GRPlacement
+
+
+@dataclass
+class PreOp:
+    """Prerequisite operation to emit before a placement."""
+    kind: str       # 'lr_inc' or 'gr_inc'
+    tensor: str
+
+    def __str__(self):
+        return f"{self.kind}({self.tensor})"
 
 
 @dataclass
@@ -778,11 +797,14 @@ class MFMATileScheduler:
         # Clear any previous annotations (idempotent re-runs)
         for slot in slots:
             if slot.mfma:
-                slot.mfma.before.clear()
+                slot.mfma.deps.clear()
+                slot.mfma.pre_ops.clear()
             for lr in slot.lrs:
-                lr.before.clear()
+                lr.deps.clear()
+                lr.pre_ops.clear()
             for gr in slot.grs:
-                gr.before.clear()
+                gr.deps.clear()
+                gr.pre_ops.clear()
 
         # ── Pass 1: build lookups from existing placements ──
         # lr_by_slot[k][tensor] → LRPlacement at subIterK=k
@@ -810,12 +832,12 @@ class MFMATileScheduler:
                     tensor_names += ['SA', 'SB']
                 for t in tensor_names:
                     for lr in lr_by_data[slot.mfma.subIterK].get(t, []):
-                        slot.mfma.before.append(DepOp(kind='lr_ref', tensor=t, ref=lr))
+                        slot.mfma.deps.append(DepRef(ref=lr))
 
-            # LR deps: lr_inc + gr_ref
+            # LR deps: lr_inc (pre_op) + gr_ref (dep)
             for lr in slot.lrs:
                 if lr.mtIteration != "n":
-                    lr.before.append(DepOp(kind='lr_inc', tensor=lr.tensor))
+                    lr.pre_ops.append(PreOp(kind='lr_inc', tensor=lr.tensor))
                 gr = gr_by_slot[k].get(lr.tensor)
                 if not gr:
                     for other_k in range(numK):
@@ -823,14 +845,14 @@ class MFMATileScheduler:
                         if gr:
                             break
                 if gr:
-                    lr.before.append(DepOp(kind='gr_ref', tensor=lr.tensor, ref=gr))
+                    lr.deps.append(DepRef(ref=gr))
 
-            # GR deps: gr_inc + lr_ref (collision)
+            # GR deps: gr_inc (pre_op) + lr_ref (dep, collision)
             for gr in slot.grs:
-                gr.before.append(DepOp(kind='gr_inc', tensor=gr.tensor))
+                gr.pre_ops.append(PreOp(kind='gr_inc', tensor=gr.tensor))
                 lr = lr_by_slot[k].get(gr.tensor)
                 if lr:
-                    gr.before.append(DepOp(kind='lr_ref', tensor=gr.tensor, ref=lr))
+                    gr.deps.append(DepRef(ref=lr))
 
     # ── Group and serialize ───────────────────────────────
 
@@ -1154,14 +1176,16 @@ class MFMATileScheduler:
         return buf.getvalue()
 
     def _print_placement_with_deps(self, buf, placement, slot: SubIterKSlot):
-        """Print a placement label followed by its before-deps."""
+        """Print a placement label followed by its deps and pre_ops."""
         label = self._format_placement_label(placement, slot)
         buf.write(f"      {label}\n")
-        if placement.before:
+        if placement.deps or placement.pre_ops:
             buf.write("        before:\n")
-            for dep in placement.before:
-                dep_str = self._format_dep(dep)
+            for dep in placement.deps:
+                dep_str = self._format_dep_ref(dep)
                 buf.write(f"            - {dep_str}\n")
+            for op in placement.pre_ops:
+                buf.write(f"            - {op}\n")
 
     def _format_placement_label(self, placement, slot: SubIterKSlot) -> str:
         """Format a placement (MFMA/LR/GR) into a human-readable label."""
@@ -1211,8 +1235,16 @@ class MFMATileScheduler:
                         dep_str = self._format_dep(dep)
                         buf.write(f"            - {dep_str}\n")
 
+    def _format_dep_ref(self, dep: DepRef) -> str:
+        """Format a DepRef for display."""
+        p = dep.ref
+        slot = p.subIterK_slot if hasattr(p, 'subIterK_slot') else '?'
+        part = p.partition if hasattr(p, 'partition') else 0
+        kind = 'LR' if isinstance(p, LRPlacement) else 'GR'
+        return f"{kind} {p.tensor} @P{part}:subIterK={slot}"
+
     def _format_dep(self, dep: DepOp) -> str:
-        """Format a DepOp for display."""
+        """Format a DepOp for display (used by group/emit)."""
         if dep.kind == 'ref' and dep.ref and isinstance(dep.ref, AnnotatedOp):
             # group() refs: resolve to the AnnotatedOp's placement label
             p = dep.ref.placement
@@ -1220,14 +1252,6 @@ class MFMATileScheduler:
             if slot:
                 return self._format_placement_label(p, slot)
             return self._format_placement_label(p, SubIterKSlot(subIterK=0))
-        if dep.ref:
-            # annotate_deps() refs: point directly to placements
-            p = dep.ref
-            slot = p.subIterK_slot if hasattr(p, 'subIterK_slot') else '?'
-            part = p.partition if hasattr(p, 'partition') else 0
-            kind = 'LR' if isinstance(p, LRPlacement) else 'GR' if isinstance(p, GRPlacement) else 'MFMA'
-            loc = f"P{part}:subIterK={slot}" if self.config.numPartitions > 1 else f"subIterK={slot}"
-            return f"{dep.kind}({dep.tensor}) -> {kind} {dep.tensor} @{loc}"
         return str(dep)
 
     def print_emit(self, all_emitted: List[List[EmittedModule]] = None) -> str:
