@@ -16,6 +16,9 @@ from Tensile.Components.MFMATileScheduler import (
     ReadGranularity,
     SchedulerConfig,
     EmittedModule,
+    LRPlacement,
+    GRPlacement,
+    DepRef,
 )
 from unittest.mock import MagicMock
 
@@ -1739,114 +1742,270 @@ def test_place_GRs_LR_1x1_partition_10x1():
         _assert_gr(p[1], 'B', 0, 2, b_idx + 1, b_idx + 2, mt='n+2')
 
 
-# ── Step 5: Group and serialize ──────────────────────────
+# ── Step 4: Annotate deps ────────────────────────────────────
 
-def test_group():
-    """Validate Step 5: grouped output matches design doc."""
-    cfg = make_example_granularities_1()
+def _dep_refs(placement):
+    """Return list of (type, tensor, subIterK_slot, cross_mt) for a placement's deps."""
+    result = []
+    for dep in placement.deps:
+        p = dep.ref
+        kind = 'LR' if isinstance(p, LRPlacement) else 'GR'
+        result.append((kind, p.tensor, p.subIterK_slot, dep.cross_mt))
+    return result
+
+#OK
+def test_annotate_deps_1x1_partition_DU256():
+    """Step 4: 256x256, DU256, FP4, 1 partition, 2 subIterKs.
+
+    Deps follow three rules:
+    - MFMA(k) depends on all LRs that loaded subIterK=k data
+    - LR depends on GR for same tensor
+    - GR depends on collision LR at same subIterK slot
+
+    cross_mt: True when dep is on previous iteration's execution.
+    Within one iteration, slot order is 0→1, and within a slot: MFMA→LR→GR.
+    """
+    cfg = make_256x256_fp4()
     sched = MFMATileScheduler(cfg)
-    grouped = sched.group()
+    sched.annotate_deps()
+    parts = sched._partitions
+    print(sched.print_deps())
 
-    output = sched.print_group()
-    print(output)
-
-    # subIterK=0: MFMA, LR A, LR B, LR SA, GR A, GR B[0-0]
-    g0 = grouped[0]
-    op_kinds_0 = [op.kind for op in g0.ops]
-    assert op_kinds_0[0] == 'MFMA'
-    assert op_kinds_0[1] == 'LR'  # A
-    assert op_kinds_0[2] == 'LR'  # B
-    assert op_kinds_0[3] == 'LR'  # SA
-
-    # MFMA has WaitLROp before
-    assert any(dep.kind == 'wait_lr' for dep in g0.ops[0].before)
-
-    # First LR has WaitGROp before
-    assert any(dep.kind == 'wait_gr' for dep in g0.ops[1].before)
-
-    # subIterK=1: MFMA, LR A, LR B, LR SB, GR B[1-1], GR SA, GR SB
-    g1 = grouped[1]
-    lr_tensors = [op.placement.tensor for op in g1.ops if op.kind == 'LR']
-    assert lr_tensors == ['A', 'B', 'SB']
-
-
-# ── Step 6: EmittedModules ──────────────────────────────────
-
-def test_emit():
-    """Validate Step 6: EmittedModule list with correct before-links."""
-    cfg = make_example_granularities_1()
-    sched = MFMATileScheduler(cfg)
-    all_emitted = sched.emit()
-
-    output = sched.print_emit()
-    print(output)
-
-    assert len(all_emitted) == 2  # 2 subIterKs
+    s0 = parts[0][0]  # P0, subIterK=0
+    s1 = parts[0][1]  # P0, subIterK=1
 
     # ── subIterK=0 ──
-    e0 = all_emitted[0]
 
-    # Exactly one MFMA
-    mfmas = [e for e in e0 if e.opType == 'mfma']
-    assert len(mfmas) == 1
+    # MFMA(k=0) at s0: all LR deps are at s0 or s1 (>= s0) → all cross_mt
+    mfma0_deps = _dep_refs(s0.mfma)
+    assert ('LR', 'A',  1, True) in mfma0_deps   # s1 >= s0 → prev MT
+    assert ('LR', 'B',  1, True) in mfma0_deps
+    assert ('LR', 'SA', 0, True) in mfma0_deps   # s0, LR runs after MFMA → prev MT
+    assert ('LR', 'SB', 1, True) in mfma0_deps
+    assert len(mfma0_deps) == 4
 
-    # MFMA's before chain should include wait_lr
-    mfma = mfmas[0]
-    assert mfma.before is not None
-    assert e0[mfma.before].opType == 'wait_lr'
+    # LR A @s0: depends on GR A @s0 (GR runs after LR → prev MT)
+    lr_a0 = _get_lr(s0, 'A')
+    assert _dep_refs(lr_a0) == [('GR', 'A', 0, True)]
 
-    # LRs: 3 (A, B, SA)
-    lrs = [e for e in e0 if e.opType == 'lr']
-    assert len(lrs) == 3
+    # LR B @s0: depends on GR B @s0 (prev MT)
+    lr_b0 = _get_lr(s0, 'B')
+    assert _dep_refs(lr_b0) == [('GR', 'B', 0, True)]
 
-    # First LR's chain: wait_gr → lr_inc → lr
-    first_lr = lrs[0]
-    chain = _walk_before_chain(e0, first_lr.moduleId)
-    chain_types = [e0[mid].opType for mid in chain]
-    assert 'wait_gr' in chain_types
-    assert 'lr_inc' in chain_types
+    # LR SA @s0: depends on GR SA @s1 (s1 > s0 → prev MT)
+    lr_sa0 = _get_lr(s0, 'SA')
+    assert _dep_refs(lr_sa0) == [('GR', 'SA', 1, True)]
 
-    # Second LR links back to first LR
-    second_lr = lrs[1]
-    assert second_lr.before is not None
-    assert e0[second_lr.before].opType == 'lr'
+    # GR A @s0: collision on LR A @s0 (mt="n+2" vs LR mt="n" → prev MT)
+    gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
+    assert _dep_refs(gr_a0) == [('LR', 'A', 0, True)]
 
-    # GRs: 2 (A[0-1], B[0-0])
-    grs = [e for e in e0 if e.opType == 'gr']
-    assert len(grs) == 2
-
-    # First GR's chain: ref(LR A) → wait_lr → sync → GR
-    first_gr = grs[0]
-    chain = _walk_before_chain(e0, first_gr.moduleId)
-    chain_types = [e0[mid].opType for mid in chain]
-    assert 'sync' in chain_types
-    assert 'wait_lr' in chain_types
-
-    # Subsequent GRs link to previous GR
-    assert grs[1].before is not None
-    assert e0[grs[1].before].opType == 'gr'
+    # GR B @s0: collision on LR B @s0 (mt="n+2" vs LR mt="n" → prev MT)
+    gr_b0 = [gr for gr in s0.grs if gr.tensor == 'B'][0]
+    assert _dep_refs(gr_b0) == [('LR', 'B', 0, True)]
 
     # ── subIterK=1 ──
-    e1 = all_emitted[1]
 
-    mfmas1 = [e for e in e1 if e.opType == 'mfma']
-    assert len(mfmas1) == 1
+    # MFMA(k=1) at s1: LRs at s0 ran first → same MT; LR SB at s1 → prev MT
+    mfma1_deps = _dep_refs(s1.mfma)
+    assert ('LR', 'A',  0, False) in mfma1_deps  # s0 < s1 → same MT
+    assert ('LR', 'B',  0, False) in mfma1_deps
+    assert ('LR', 'SA', 0, True)  in mfma1_deps   # mt="n+1" → prev MT
+    assert ('LR', 'SB', 1, True)  in mfma1_deps  # s1 >= s1 → prev MT
+    assert len(mfma1_deps) == 4
 
-    lrs1 = [e for e in e1 if e.opType == 'lr']
-    assert len(lrs1) == 3  # A, B, SB
+    # LR A @s1: depends on GR A @s0 (mt="n+1" vs GR mt="n+2" → prev MT)
+    lr_a1 = _get_lr(s1, 'A')
+    assert _dep_refs(lr_a1) == [('GR', 'A', 0, True)]
 
-    grs1 = [e for e in e1 if e.opType == 'gr']
-    assert len(grs1) == 3  # B[1-1], SA[0-1], SB[0-1]
+    # LR B @s1: depends on GR B @s1 (GR after LR → prev MT)
+    lr_b1 = _get_lr(s1, 'B')
+    assert _dep_refs(lr_b1) == [('GR', 'B', 1, True)]
+
+    # LR SB @s1: depends on GR SB @s1 (prev MT)
+    lr_sb1 = _get_lr(s1, 'SB')
+    assert _dep_refs(lr_sb1) == [('GR', 'SB', 1, True)]
+
+    # GR B @s1: collision on LR B (mt="n") at s0 (same buffer as mt="n+2")
+    gr_b1 = [gr for gr in s1.grs if gr.tensor == 'B'][0]
+    assert _dep_refs(gr_b1) == [('LR', 'B', 0, True)]
+
+    # GR SA @s1: no LR SA (mt="n"), falls back to LR SA (mt="n+1") at s0 → prev MT
+    gr_sa1 = [gr for gr in s1.grs if gr.tensor == 'SA'][0]
+    assert _dep_refs(gr_sa1) == [('LR', 'SA', 0, True)]
+
+    # GR SB @s1: no LR SB (mt="n"), falls back to LR SB (mt="n+1") at s1 → prev MT
+    gr_sb1 = [gr for gr in s1.grs if gr.tensor == 'SB'][0]
+    assert _dep_refs(gr_sb1) == [('LR', 'SB', 1, True)]
 
 
-def _walk_before_chain(emitted, start_id):
-    """Walk the before-chain backwards, returning list of moduleIds."""
-    chain = []
-    cur = emitted[start_id].before
-    while cur is not None:
-        chain.append(cur)
-        cur = emitted[cur].before
-    return chain
+def test_annotate_deps_2x2_partition_DU512():
+    """Step 4: 256x256, DU512, FP4, 2x2 partition, 4 subIterKs.
+
+    With partitions, deps are per-partition. Each partition only sees
+    its own LRs and GRs. cross_mt tested on key deps.
+    """
+    kernel = create_kernel(256, 256, fp4=True, depthU=512)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+
+    cfg = SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=4, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=4, mn=8)),
+        numPartitionsM=2,
+        numPartitionsN=2,
+    )
+    sched = MFMATileScheduler(cfg)
+    sched.annotate_deps()
+    parts = sched._partitions
+    print(sched.print_deps())
+
+    assert len(parts) == 4
+    assert len(parts[0]) == 4  # 4 subIterKs per partition
+
+    # ── P0: has LR A, LR B, LR SA, LR SB and GR A only ──
+
+    p0 = parts[0]
+
+    # MFMA(k=0) @P0: LR A @s3 and LR SA @s2 are both >= s0 → prev MT
+    mfma_p0_s0 = _dep_refs(p0[0].mfma)
+    assert ('LR', 'A', 3, True) in mfma_p0_s0
+    assert ('LR', 'SA', 2, True) in mfma_p0_s0
+
+    # LR A @P0:s0 depends on GR A @P0:s0 (GR after LR → prev MT)
+    lr_a_p0_s0 = _get_lr(p0[0], 'A')
+    assert _dep_refs(lr_a_p0_s0) == [('GR', 'A', 0, True)]
+
+    # LR B @P0:s0 has no GR B in P0 → no dep
+    lr_b_p0_s0 = _get_lr(p0[0], 'B')
+    assert _dep_refs(lr_b_p0_s0) == []
+
+    # GR A @P0:s0: collision on LR A (mt="n") at s3 (same buffer as mt="n+2")
+    gr_a_p0_s0 = [gr for gr in p0[0].grs if gr.tensor == 'A'][0]
+    assert _dep_refs(gr_a_p0_s0) == [('LR', 'A', 3, True)]
+
+    # ── P3: has LR A, LR B, LR SA, LR SB and GR SA, GR SB, GR A, GR B ──
+
+    p3 = parts[3]
+
+    # MFMA(k=0) @P3: all deps are at s2 or s3 (>= s0) → all prev MT
+    mfma_p3_s0 = _dep_refs(p3[0].mfma)
+    assert ('LR', 'A', 3, True) in mfma_p3_s0
+    assert ('LR', 'B', 3, True) in mfma_p3_s0
+    assert ('LR', 'SA', 2, True) in mfma_p3_s0
+    assert ('LR', 'SB', 3, True) in mfma_p3_s0
+    assert len(mfma_p3_s0) == 4
+
+    # GR SA @P3:s0: no LR SA (mt="n"), falls back to LR SA (mt="n+1") at s2 → prev MT
+    gr_sa_p3 = [gr for gr in p3[0].grs if gr.tensor == 'SA'][0]
+    assert _dep_refs(gr_sa_p3) == [('LR', 'SA', 2, True)]
+
+    # LR SA @P3:s2 depends on GR SA @P3:s0 (mt="n+1" vs GR mt="n+2" → prev MT)
+    lr_sa_p3_s2 = _get_lr(p3[2], 'SA')
+    assert _dep_refs(lr_sa_p3_s2) == [('GR', 'SA', 0, True)]
+
+    # GR B @P3:s3: no LR B (mt="n"), falls back to LR B (mt="n+1") at s3 → prev MT
+    gr_b_p3_s3 = [gr for gr in p3[3].grs if gr.tensor == 'B'][0]
+    assert _dep_refs(gr_b_p3_s3) == [('LR', 'B', 3, True)]
+
+    # LR B @P3:s3 depends on GR B @P3:s3 (GR after LR → prev MT)
+    lr_b_p3_s3 = _get_lr(p3[3], 'B')
+    assert _dep_refs(lr_b_p3_s3) == [('GR', 'B', 3, True)]
+
+
+# ── Step 5/6: Group and emit (commented out — will be reworked) ──
+
+# def test_group():
+#     """Validate Step 5: grouped output matches design doc."""
+#     cfg = make_example_granularities_1()
+#     sched = MFMATileScheduler(cfg)
+#     grouped = sched.group()
+#
+#     output = sched.print_group()
+#     print(output)
+#
+#     g0 = grouped[0]
+#     op_kinds_0 = [op.kind for op in g0.ops]
+#     assert op_kinds_0[0] == 'MFMA'
+#     assert op_kinds_0[1] == 'LR'  # A
+#     assert op_kinds_0[2] == 'LR'  # B
+#     assert op_kinds_0[3] == 'LR'  # SA
+#
+#     assert any(dep.kind == 'wait_lr' for dep in g0.ops[0].before)
+#     assert any(dep.kind == 'wait_gr' for dep in g0.ops[1].before)
+#
+#     g1 = grouped[1]
+#     lr_tensors = [op.placement.tensor for op in g1.ops if op.kind == 'LR']
+#     assert lr_tensors == ['A', 'B', 'SB']
+#
+#
+# def test_emit():
+#     """Validate Step 6: EmittedModule list with correct before-links."""
+#     cfg = make_example_granularities_1()
+#     sched = MFMATileScheduler(cfg)
+#     all_emitted = sched.emit()
+#
+#     output = sched.print_emit()
+#     print(output)
+#
+#     assert len(all_emitted) == 2
+#
+#     e0 = all_emitted[0]
+#     mfmas = [e for e in e0 if e.opType == 'mfma']
+#     assert len(mfmas) == 1
+#     mfma = mfmas[0]
+#     assert mfma.before is not None
+#     assert e0[mfma.before].opType == 'wait_lr'
+#
+#     lrs = [e for e in e0 if e.opType == 'lr']
+#     assert len(lrs) == 3
+#     first_lr = lrs[0]
+#     chain = _walk_before_chain(e0, first_lr.moduleId)
+#     chain_types = [e0[mid].opType for mid in chain]
+#     assert 'wait_gr' in chain_types
+#     assert 'lr_inc' in chain_types
+#
+#     second_lr = lrs[1]
+#     assert second_lr.before is not None
+#     assert e0[second_lr.before].opType == 'lr'
+#
+#     grs = [e for e in e0 if e.opType == 'gr']
+#     assert len(grs) == 2
+#     first_gr = grs[0]
+#     chain = _walk_before_chain(e0, first_gr.moduleId)
+#     chain_types = [e0[mid].opType for mid in chain]
+#     assert 'sync' in chain_types
+#     assert 'wait_lr' in chain_types
+#     assert grs[1].before is not None
+#     assert e0[grs[1].before].opType == 'gr'
+#
+#     e1 = all_emitted[1]
+#     mfmas1 = [e for e in e1 if e.opType == 'mfma']
+#     assert len(mfmas1) == 1
+#     lrs1 = [e for e in e1 if e.opType == 'lr']
+#     assert len(lrs1) == 3
+#     grs1 = [e for e in e1 if e.opType == 'gr']
+#     assert len(grs1) == 3
+#
+#
+# def _walk_before_chain(emitted, start_id):
+#     """Walk the before-chain backwards, returning list of moduleIds."""
+#     chain = []
+#     cur = emitted[start_id].before
+#     while cur is not None:
+#         chain.append(cur)
+#         cur = emitted[cur].before
+#     return chain
 
 
 # ── from_tile_info ──────────────────────────────────────────
@@ -1947,8 +2106,8 @@ if __name__ == "__main__":
         ("Step 2: Assign VGPR sets",    lambda: (sched.assign_vgpr_sets(), sched.print_vgpr())),
         ("Step 3: Place GRs",           lambda: (sched.place_GRs(), sched.print_gr())),
         ("Step 4: Annotate deps",       lambda: (sched.annotate_deps(), sched.print_deps())),
-        ("Step 5: Group and serialize", lambda: (sched.group(), sched.print_group())),
-        ("Step 6: EmittedModules",      lambda: (sched.emit(), sched.print_emit())),
+        # ("Step 5: Group and serialize", lambda: (sched.group(), sched.print_group())),
+        # ("Step 6: EmittedModules",      lambda: (sched.emit(), sched.print_emit())),
     ]
 
     interactive = "--interactive" in sys.argv or "-i" in sys.argv
