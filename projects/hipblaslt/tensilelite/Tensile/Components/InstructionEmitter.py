@@ -20,16 +20,14 @@ from rocisa.container import vgpr, DSModifiers
 class InstructionEmitter:
     """Emits GPU instructions for each opType in the MFMATileScheduler output.
 
-    VGPR tile indexing uses flat 2x arrays with per-placement set selection:
-      vgprTilesA[tileId + set * numTilesA]
-      vgprTilesB[tileId + set * numTilesB]
-    where set is read from placement.vgpr_sets (MFMA) or placement.vgpr_set (LR).
+    VGPR tile indexing uses placement-level tile maps (tileId → vgprTileId)
+    set by assign_vgpr_tiles(). A single flat vgprTiles list is indexed by
+    vgprTileId. Scale VGPRs use two-set selection via placement.vgpr_set.
     """
 
     def __init__(self, writer, kernel, config,
                  tileInfoA, tileInfoB, dtileInfo,
-                 vgprTilesA, vgprTilesB,
-                 numTilesA, numTilesB,
+                 vgprTiles,
                  scaleTileInfoA=None, scaleTileInfoB=None,
                  scaleVgprTiles=None, scaleVgprTilesAlt=None,
                  numScaleGroupsA=0):
@@ -39,10 +37,7 @@ class InstructionEmitter:
         self.tileInfoA = tileInfoA
         self.tileInfoB = tileInfoB
         self.dtileInfo = dtileInfo
-        self.vgprTilesA = vgprTilesA
-        self.vgprTilesB = vgprTilesB
-        self.numTilesA = numTilesA
-        self.numTilesB = numTilesB
+        self.vgprTiles = vgprTiles
         self.scaleVgprTiles = scaleVgprTiles
         self.scaleVgprTilesAlt = scaleVgprTilesAlt
         self.numScaleGroupsA = numScaleGroupsA
@@ -68,13 +63,6 @@ class InstructionEmitter:
             'gr_scale': lambda em: self.emit_gr_scale(em.source),
         }
 
-    def _get_vgpr_tile(self, tensor, tileId, vgpr_set):
-        """Look up a data VGPR tile by tensor, tileId, and set."""
-        if tensor in ('A', 'SA'):
-            return self.vgprTilesA[tileId + vgpr_set * self.numTilesA]
-        else:
-            return self.vgprTilesB[tileId + vgpr_set * self.numTilesB]
-
     def _get_scale_tiles(self, vgpr_set):
         """Return the scale VGPR list for the given set."""
         return self.scaleVgprTiles if vgpr_set == 0 else self.scaleVgprTilesAlt
@@ -83,17 +71,17 @@ class InstructionEmitter:
         """Emit MFMA instructions from MFMAPlacement."""
         module = Module()
         vgpr_sets = placement.vgpr_sets or {}
-        setA = vgpr_sets.get('A', 0)
-        setB = vgpr_sets.get('B', 0)
         setSA = vgpr_sets.get('SA', 0)
         subIterK = placement.subIterK
+        tile_map_A = placement.vgpr_tile_map_A or {}
+        tile_map_B = placement.vgpr_tile_map_B or {}
 
         scaleTiles = self._get_scale_tiles(setSA) if self.hasScale else None
 
         for a in placement.tileA.tileId_list:
             for b in placement.tileB.tileId_list:
-                aTile = self.vgprTilesA[a + setA * self.numTilesA]
-                bTile = self.vgprTilesB[b + setB * self.numTilesB]
+                aTile = self.vgprTiles[tile_map_A[a]]
+                bTile = self.vgprTiles[tile_map_B[b]]
                 dTile = self.dtileInfo.vgprTiles[a + b * self.dtileInfo.localMMATileGrid[0]]
 
                 if self.hasScale:
@@ -119,6 +107,7 @@ class InstructionEmitter:
         module = Module()
         tensor = placement.tensor
         lr_set = placement.vgpr_set if placement.vgpr_set is not None else 0
+        tile_map = placement.vgpr_tile_map or {}
 
         if tensor in ('A', 'B'):
             ti = self.tileInfoMap[tensor]
@@ -126,7 +115,7 @@ class InstructionEmitter:
                 for k in placement.tiles.subIterK_list:
                     subtileK = k // self.subtileShapeK
                     subIterK_within = k % self.subtileShapeK
-                    dstTile = self._get_vgpr_tile(tensor, tileId, lr_set)
+                    dstTile = self.vgprTiles[tile_map[tileId]]
                     module.add(emitSingleDsRead(
                         ti, tileId, subtileK, subIterK_within, dstTile))
         elif tensor in ('SA', 'SB'):

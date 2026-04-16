@@ -165,6 +165,8 @@ class MFMAPlacement:
     deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['DepOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     vgpr_sets: Optional[dict] = None   # {'A': int, 'B': int, 'SA': int, 'SB': int} — populated by assign_vgpr_sets()
+    vgpr_tile_map_A: Optional[dict] = None   # {tileId: vgprTileId} — populated by assign_vgpr_tiles()
+    vgpr_tile_map_B: Optional[dict] = None   # {tileId: vgprTileId} — populated by assign_vgpr_tiles()
 
 
 @dataclass
@@ -178,6 +180,7 @@ class LRPlacement:
     deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['DepOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     vgpr_set: Optional[int] = None     # set id (0 or 1) — populated by assign_vgpr_sets()
+    vgpr_tile_map: Optional[dict] = None  # {tileId: vgprTileId} — populated by assign_vgpr_tiles()
 
 
 @dataclass
@@ -568,6 +571,112 @@ class MFMATileScheduler:
 
         self._completed.add('vgpr')
         return self._partitions[0]
+
+    # ── Assign VGPR tile IDs (free-list allocation) ──────
+
+    def assign_vgpr_tiles(self):
+        """Assign physical vgprTileIds to MFMA and LR placements.
+
+        Uses a free-list allocator to minimize VGPR usage. Tiles are
+        allocated when an LR writes data and released after the last
+        MFMA that reads them.
+
+        Two phases:
+          1. Scan all MFMAs to find last read position for each
+             (tensor, tileId, set) key.
+          2. Walk execution order: seed preloop tiles, allocate at
+             LR writes, release after last MFMA reads.
+
+        Only handles A/B data tiles. Scale VGPRs use the simpler
+        two-set model via vgpr_set/vgpr_sets.
+
+        Sets self.totalVGPRTiles to the peak allocation.
+        """
+        if 'vgpr' not in self._completed:
+            self.assign_vgpr_sets()
+
+        # ── Phase 1: find last MFMA read for each (tensor, tileId, set) ──
+        # Position = (partition_idx, subIterK) flattened to a single int.
+        numK = self.config.numSubIterK
+        last_read = {}  # (tensor, tileId, set) -> flat position
+
+        for pi, slots in enumerate(self._partitions):
+            for slot in slots:
+                if not slot.mfma or not slot.mfma.vgpr_sets:
+                    continue
+                pos = pi * numK + slot.subIterK
+                for tensor, tileRange in [('A', slot.mfma.tileA),
+                                           ('B', slot.mfma.tileB)]:
+                    s = slot.mfma.vgpr_sets[tensor]
+                    for t in tileRange.tileId_list:
+                        last_read[(tensor, t, s)] = pos
+
+        # ── Phase 2: walk execution order, allocate with free-list ──
+        free_list = []
+        next_id = 0
+        active = {}  # (tensor, tileId, set) -> vgprTileId
+        peak = 0
+
+        def _alloc():
+            nonlocal next_id, peak
+            if free_list:
+                vid = free_list.pop()
+            else:
+                vid = next_id
+                next_id += 1
+            peak = max(peak, next_id - len(free_list))
+            return vid
+
+        def _release(vid):
+            free_list.append(vid)
+
+        # Walk execution order: partition 0 all subIterKs, then partition 1, ...
+        # Within each slot: MFMA first (reads), then LRs (writes).
+        # Tiles read by MFMA before any LR writes are preloop-seeded on demand.
+        for pi, slots in enumerate(self._partitions):
+            for slot in slots:
+                pos = pi * numK + slot.subIterK
+
+                # MFMA reads: look up or seed (preloop) tiles
+                if slot.mfma and slot.mfma.vgpr_sets:
+                    map_A, map_B = {}, {}
+                    for tensor, tileRange, tile_map in [
+                            ('A', slot.mfma.tileA, map_A),
+                            ('B', slot.mfma.tileB, map_B)]:
+                        s = slot.mfma.vgpr_sets[tensor]
+                        for t in tileRange.tileId_list:
+                            key = (tensor, t, s)
+                            if key not in active:
+                                # Preloop seed: first read with no prior LR write
+                                active[key] = _alloc()
+                            tile_map[t] = active[key]
+                    slot.mfma.vgpr_tile_map_A = map_A
+                    slot.mfma.vgpr_tile_map_B = map_B
+
+                # Release tiles whose last read was at this position
+                to_release = [key for key, lr_pos in last_read.items()
+                              if lr_pos == pos and key in active]
+                for key in to_release:
+                    _release(active[key])
+                    del active[key]
+
+                # LR writes: allocate new tiles
+                for lr in slot.lrs:
+                    if lr.tensor not in ('A', 'B') or lr.vgpr_set is None:
+                        continue
+                    tile_map = {}
+                    for t in lr.tiles.tileId_list:
+                        key = (lr.tensor, t, lr.vgpr_set)
+                        if key in active:
+                            # Overwriting same (tensor, tileId, set) — release old
+                            _release(active[key])
+                        vid = _alloc()
+                        active[key] = vid
+                        tile_map[t] = vid
+                    lr.vgpr_tile_map = tile_map
+
+        self.totalVGPRTiles = peak
+        self._completed.add('vgpr_tiles')
 
     # ── Place GRs ─────────────────────────────────────────
 
@@ -1500,35 +1609,29 @@ class MFMATileScheduler:
 
     def allocVgprTiles(self, writer, tileInfoA, tileInfoB,
                        scaleTileInfoA=None, scaleTileInfoB=None):
-        """Allocate VGPR tiles for A and B data, with two sets for ping-pong.
+        """Allocate physical VGPR tiles based on assign_vgpr_tiles() peak.
 
-        Layout (flat 2x arrays):
-          vgprTilesA: [set0_tile0, set0_tile1, ..., set1_tile0, set1_tile1, ...]
-          vgprTilesB: same layout, sized for numMFMATilesN
+        Produces a single self.vgprTiles list indexed by vgprTileId.
+        Placements carry tileId→vgprTileId mappings set by assign_vgpr_tiles().
 
         Scale VGPRs: two sets (ping/pong), 1 VGPR per scale group.
         """
+        if 'vgpr_tiles' not in self._completed:
+            self.assign_vgpr_tiles()
+
         from Tensile.Components.SubtileBasedKernel import TileInfo
 
         cfg = self.config
         mmaTileRegCount = int(math.ceil(tileInfoA.mmaTileRegCount))
 
-        def alloc_tile_array(count):
-            tiles = []
-            for _ in range(count):
-                tile = TileInfo.RegisterTileInfo(writer.vgprPool)
-                for j in range(0, mmaTileRegCount, 4):
-                    vstart = writer.vgprPool.checkOutAligned(4, 4)
-                    for k in range(4):
-                        tile.append(vstart + k)
-                tiles.append(tile)
-            return tiles
-
-        # 2 sets per tensor dimension
-        self.vgprTilesA = alloc_tile_array(2 * cfg.numMFMATilesM)
-        self.vgprTilesB = alloc_tile_array(2 * cfg.numMFMATilesN)
-        self.numTilesA = cfg.numMFMATilesM
-        self.numTilesB = cfg.numMFMATilesN
+        self.vgprTiles = []
+        for _ in range(self.totalVGPRTiles):
+            tile = TileInfo.RegisterTileInfo(writer.vgprPool)
+            for j in range(0, mmaTileRegCount, 4):
+                vstart = writer.vgprPool.checkOutAligned(4, 4)
+                for k in range(4):
+                    tile.append(vstart + k)
+            self.vgprTiles.append(tile)
 
         # Scale VGPRs: 1 VGPR per scale group, double-buffered
         numScaleGroupsA = math.ceil(cfg.numMFMATilesM / 2) if cfg.hasScale else 0
@@ -1544,12 +1647,12 @@ class MFMATileScheduler:
 
     def deallocVgprTiles(self, writer):
         """Deallocate VGPR tiles allocated by allocVgprTiles."""
-        for tiles in (self.vgprTilesA, self.vgprTilesB):
-            for tile in tiles:
-                pool = tile.regList.regPool
-                for val in tile:
-                    if tile.index(val) % 4 == 0:
-                        pool.checkIn(val)
+        for tile in self.vgprTiles:
+            pool = tile.regList.regPool
+            for val in tile:
+                if tile.index(val) % 4 == 0:
+                    pool.checkIn(val)
+        self.vgprTiles = []
 
         for v in self.scaleVgprTiles:
             writer.vgprPool.checkIn(v)
@@ -1558,9 +1661,6 @@ class MFMATileScheduler:
             writer.vgprPool.checkIn(v)
         self.scaleVgprTilesAlt = []
 
-        self.vgprTilesA = []
-        self.vgprTilesB = []
-
     # ── Populate instructions ──────────────────────────────
 
     def populate_instructions(self, writer, kernel,
@@ -1568,9 +1668,8 @@ class MFMATileScheduler:
                               scaleTileInfoA=None, scaleTileInfoB=None) -> None:
         """Populate EmittedModule.instructions from placements and preOps.
 
-        Uses self.vgprTilesA, vgprTilesB, scaleVgprTiles, scaleVgprTilesAlt
-        allocated by allocVgprTiles(). Per-subIterK set selection is read from
-        placement.vgpr_sets (MFMA) and placement.vgpr_set (LR).
+        Uses self.vgprTiles (indexed by vgprTileId from placement tile maps),
+        and self.scaleVgprTiles/scaleVgprTilesAlt (selected by placement.vgpr_set).
         """
         if 'emit' not in self._completed:
             self.emit()
@@ -1580,8 +1679,7 @@ class MFMATileScheduler:
         emitter = InstructionEmitter(
             writer, kernel, self.config,
             tileInfoA, tileInfoB, dtileInfo,
-            self.vgprTilesA, self.vgprTilesB,
-            self.numTilesA, self.numTilesB,
+            self.vgprTiles,
             scaleTileInfoA, scaleTileInfoB,
             self.scaleVgprTiles, self.scaleVgprTilesAlt,
             self.numScaleGroupsA,
