@@ -550,6 +550,7 @@ class MFMATileScheduler:
 
         active = {}      # (tensor, tileIdx, k_data) -> vgprTileId (current iteration)
         next_iter = {}   # same keys but for wrapping LR writes (next iteration data)
+        seeded = {}      # keys auto-seeded by first MFMA encounter -> vgprTileId
 
         for pi, slots in enumerate(self._partitions):
             for slot in slots:
@@ -566,6 +567,7 @@ class MFMATileScheduler:
                             key = (tensor, t, k)
                             if key not in active:
                                 active[key] = pools[tensor].alloc()
+                                seeded[key] = active[key]
                             tile_map[t] = active[key]
                     slot.mfma.vgpr_tile_map_A = map_A
                     slot.mfma.vgpr_tile_map_B = map_B
@@ -583,6 +585,7 @@ class MFMATileScheduler:
                                 key = (stensor, sg, k_chunk)
                                 if key not in active:
                                     active[key] = pools[stensor].alloc()
+                                    seeded[key] = active[key]
                                 tile_map[sg] = active[key]
                         slot.mfma.vgpr_tile_map_SA = map_SA
                         slot.mfma.vgpr_tile_map_SB = map_SB
@@ -630,9 +633,15 @@ class MFMATileScheduler:
                     pools[key[0]].release(active[key])
                     del active[key]
 
-        # ── Phase 3: unrolling detection (deferred — not yet implemented) ──
-        self.needs_unrolling = False
-        self.unroll_factor = 1
+        # ── Phase 3: unrolling detection ──
+        # Compare what wrapping LRs wrote (next_iter) to what the first
+        # iteration's MFMAs were seeded with (seeded).  If any seeded key
+        # has a different vgprTileId in next_iter, the loop body isn't
+        # self-consistent and must be unrolled.
+        self.needs_unrolling = any(
+            next_iter.get(key) != vid for key, vid in seeded.items()
+        )
+        self.unroll_factor = 2 if self.needs_unrolling else 1
 
         # Per-tensor peaks
         self.tile_peaks = {t: pools[t].peak for t in pools}
@@ -1682,6 +1691,7 @@ class MFMATileScheduler:
         """Print assign_vgpr_tiles output: LRs + MFMAs with vgprTileId annotations."""
         partitions = self._partitions
         buf = io.StringIO()
+        buf.write(f"needsUnrolling: {self.needs_unrolling}\n")
         buf.write("MAINLOOP:\n")
         for pi, slots in enumerate(partitions):
             buf.write(f"  Partition {pi}:\n")

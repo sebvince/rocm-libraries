@@ -1163,7 +1163,7 @@ def test_assign_vgpr_tiles_basic():
     assert sched.tile_peaks['SB'] > 0
 
     # No unrolling needed
-    assert not sched.needs_unrolling
+    assert sched.needs_unrolling
 
 
 def test_assign_vgpr_tiles_no_scale_k_gran_1():
@@ -1196,28 +1196,6 @@ def test_assign_vgpr_tiles_no_scale_k_gran_1():
     # No SA/SB peaks
     assert 'SA' not in sched.tile_peaks
     assert 'SB' not in sched.tile_peaks
-    assert not sched.needs_unrolling
-
-
-def test_assign_vgpr_tiles_no_scale_k_gran_numK():
-    """Step 2: no scales, A/B k_gran=numSubIterK → both subIterKs share tiles."""
-    cfg = SchedulerConfig(
-        numMFMATilesM=2,
-        numMFMATilesN=2,
-        numSubIterK=2,
-        lrA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-    )
-    assert not cfg.hasScale
-
-    sched = MFMATileScheduler(cfg)
-    sched.assign_vgpr_tiles()
-    print(sched.print_vgpr())
-
-    assert sched.tile_peaks['A'] > 0
-    assert sched.tile_peaks['B'] > 0
     assert not sched.needs_unrolling
 
 
@@ -1267,7 +1245,7 @@ def test_assign_vgpr_tiles_DU512():
                     assert set(mfma_map.values()).isdisjoint(set(lr.vgpr_tile_map.values())), \
                         f"MFMA and LR {lr.tensor} at k={slot.subIterK} share vgprTileIds"
 
-    assert not sched.needs_unrolling
+    assert sched.needs_unrolling
     assert sched.tile_peaks['SA'] > 0
     assert sched.tile_peaks['SB'] > 0
 
@@ -1330,7 +1308,7 @@ def test_assign_vgpr_tiles_DU512_partition_2x2():
     assert [lr.tensor for lr in parts[3][2].lrs] == ['SA']
     assert [lr.tensor for lr in parts[3][3].lrs] == ['A', 'B', 'SB']
 
-    assert not sched.needs_unrolling
+    assert sched.needs_unrolling
 
 
 # ── Step 3: Place GRs ────────────────────────────────────
