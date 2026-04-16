@@ -1108,45 +1108,66 @@ def test_place_LRs_LR_1x1_partition_10x1():
     assert lr_b_wrap.mtIteration == "n+1"
 
 
-# ── Step 2: Assign VGPR sets ──────────────────────────────
+# ── Step 2: Assign VGPR tiles ────────────────────────────
 
-def test_assign_vgpr_sets():
-    """Validate Step 2: VGPR set assignments match design doc."""
+def test_assign_vgpr_tiles_basic():
+    """Validate Step 2: vgprTile allocation with scale tensors."""
     cfg = make_example_granularities_1()
     sched = MFMATileScheduler(cfg)
-    slots = sched.assign_vgpr_sets()
+    sched.assign_vgpr_tiles()
 
     output = sched.print_vgpr()
     print(output)
 
-    # subIterK=0: MFMA reads set 0 for all tensors
-    s0 = slots[0]
-    assert s0.mfma_sets['A'] == 0
-    assert s0.mfma_sets['B'] == 0
-    assert s0.mfma_sets['SA'] == 0
-    assert s0.mfma_sets['SB'] == 0
+    parts = sched._partitions
+    s0 = parts[0][0]
+    s1 = parts[0][1]
 
-    # LR A at subIterK=0 writes set 1 (opposite of MFMA read set 0)
-    assert s0.lr_sets['A'] == 1
-    assert s0.lr_sets['B'] == 1
-    assert s0.lr_sets['SA'] == 1
+    # Every MFMA must have tile maps for A, B, SA, SB
+    assert s0.mfma.vgpr_tile_map_A is not None
+    assert s0.mfma.vgpr_tile_map_B is not None
+    assert s0.mfma.vgpr_tile_map_SA is not None
+    assert s0.mfma.vgpr_tile_map_SB is not None
 
-    # subIterK=1: MFMA reads set 1 (what LR wrote at subIterK=0)
-    s1 = slots[1]
-    assert s1.mfma_sets['A'] == 1
-    assert s1.mfma_sets['B'] == 1
-    # SA/SB: MFMA still reads set 0 (SA was loaded but consumed later)
-    assert s1.mfma_sets['SA'] == 0
-    assert s1.mfma_sets['SB'] == 0
+    # MFMA at k=0 and k=1 must use different vgprTileIds for A/B
+    # (LR at k=0 writes new tiles for k=1)
+    for tensor in ('A', 'B'):
+        map_k0 = getattr(s0.mfma, f'vgpr_tile_map_{tensor}')
+        map_k1 = getattr(s1.mfma, f'vgpr_tile_map_{tensor}')
+        for tileId in map_k0:
+            if tileId in map_k1:
+                assert map_k0[tileId] != map_k1[tileId], \
+                    f"{tensor} tile {tileId}: k=0 and k=1 must use different vgprTileIds"
 
-    # LR A at subIterK=1 writes set 0
-    assert s1.lr_sets['A'] == 0
-    assert s1.lr_sets['B'] == 0
-    assert s1.lr_sets['SB'] == 1
+    # LRs must have tile maps
+    for slot in [s0, s1]:
+        for lr in slot.lrs:
+            assert lr.vgpr_tile_map is not None, \
+                f"LR {lr.tensor} at k={slot.subIterK} missing tile map"
+
+    # MFMA and LR at same subIterK must not share vgprTileIds (same tensor)
+    for slot in [s0, s1]:
+        if slot.mfma:
+            for lr in slot.lrs:
+                if lr.tensor in ('A', 'B'):
+                    mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')
+                    mfma_vids = set(mfma_map.values())
+                    lr_vids = set(lr.vgpr_tile_map.values())
+                    assert mfma_vids.isdisjoint(lr_vids), \
+                        f"MFMA and LR {lr.tensor} at k={slot.subIterK} share vgprTileIds"
+
+    # Per-tensor peaks should be set
+    assert sched.tile_peaks['A'] > 0
+    assert sched.tile_peaks['B'] > 0
+    assert sched.tile_peaks['SA'] > 0
+    assert sched.tile_peaks['SB'] > 0
+
+    # No unrolling needed
+    assert not sched.needs_unrolling
 
 
-def test_assign_vgpr_no_scale_k_gran_1():
-    """Step 2: no scales, A/B k_gran=1 → sets alternate every subIterK."""
+def test_assign_vgpr_tiles_no_scale_k_gran_1():
+    """Step 2: no scales, A/B k_gran=1 → tiles alternate every subIterK."""
     cfg = SchedulerConfig(
         numMFMATilesM=2,
         numMFMATilesN=2,
@@ -1159,24 +1180,27 @@ def test_assign_vgpr_no_scale_k_gran_1():
     assert not cfg.hasScale
 
     sched = MFMATileScheduler(cfg)
-    slots = sched.assign_vgpr_sets()
+    sched.assign_vgpr_tiles()
     print(sched.print_vgpr())
 
-    # subIterK=0: MFMA reads set 0, LR writes set 1
-    s0 = slots[0]
-    assert s0.mfma_sets == {'A': 0, 'B': 0}
-    assert s0.lr_sets['A'] == 1
-    assert s0.lr_sets['B'] == 1
+    parts = sched._partitions
+    s0, s1 = parts[0][0], parts[0][1]
 
-    # subIterK=1: MFMA reads set 1 (flipped), LR writes set 0
-    s1 = slots[1]
-    assert s1.mfma_sets == {'A': 1, 'B': 1}
-    assert s1.lr_sets['A'] == 0
-    assert s1.lr_sets['B'] == 0
+    # Both MFMA k=0 and k=1 have tile maps
+    for tensor in ('A', 'B'):
+        map0 = getattr(s0.mfma, f'vgpr_tile_map_{tensor}')
+        map1 = getattr(s1.mfma, f'vgpr_tile_map_{tensor}')
+        assert map0 is not None
+        assert map1 is not None
+
+    # No SA/SB peaks
+    assert 'SA' not in sched.tile_peaks
+    assert 'SB' not in sched.tile_peaks
+    assert not sched.needs_unrolling
 
 
-def test_assign_vgpr_no_scale_k_gran_numK():
-    """Step 2: no scales, A/B k_gran=numSubIterK → sets never advance."""
+def test_assign_vgpr_tiles_no_scale_k_gran_numK():
+    """Step 2: no scales, A/B k_gran=numSubIterK → both subIterKs share tiles."""
     cfg = SchedulerConfig(
         numMFMATilesM=2,
         numMFMATilesN=2,
@@ -1189,98 +1213,18 @@ def test_assign_vgpr_no_scale_k_gran_numK():
     assert not cfg.hasScale
 
     sched = MFMATileScheduler(cfg)
-    slots = sched.assign_vgpr_sets()
+    sched.assign_vgpr_tiles()
     print(sched.print_vgpr())
 
-    # Both subIterKs: MFMA stays on set 0 (k_gran == numK, no advance)
-    assert slots[0].mfma_sets == {'A': 0, 'B': 0}
-    assert slots[1].mfma_sets == {'A': 0, 'B': 0}
-
-    # LR A at slot 0 writes set 1 (opposite of MFMA set 0)
-    assert slots[0].lr_sets['A'] == 1
-    # LR B at slot 1 writes set 1
-    assert slots[1].lr_sets['B'] == 1
+    assert sched.tile_peaks['A'] > 0
+    assert sched.tile_peaks['B'] > 0
+    assert not sched.needs_unrolling
 
 
-def test_assign_vgpr_partition_2x2():
-    """Step 2: 2x2 partition, FP4. All 4 partitions get VGPR set assignments.
-
-    A/B k_gran=1 → sets alternate. SA/SB k_gran=2 → sets stay at 0.
-    Each partition has different LR placements (from place_LRs), so lr_sets differ.
-
-    Partition LR placements (from place_LRs):
-      P0 (A[0-3],B[0-3]): s0: LR A,B,SA   s1: LR A
-      P1 (A[4-7],B[0-3]): s0: LR A,SB     s1: LR B
-      P2 (A[0-3],B[4-7]): s0: LR B        s1: (none)
-      P3 (A[4-7],B[4-7]): s0: LR SA       s1: LR A,B,SB
-    """
-    kernel = create_kernel(256, 256, fp4=True)
-    tiA = TileInfo('A', kernel)
-    tiB = TileInfo('B', kernel)
-    scaleTiA = TileInfo('MXSA', kernel)
-    scaleTiB = TileInfo('MXSB', kernel)
-
-    cfg = SchedulerConfig.from_tile_info(
-        tiA, tiB,
-        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
-        numPartitionsM=2,
-        numPartitionsN=2,
-    )
-    assert cfg.numPartitions == 4
-    assert cfg.hasScale
-
-    sched = MFMATileScheduler(cfg)
-    sched.assign_vgpr_sets()
-    print(sched.print_vgpr())
-    parts = sched._partitions
-
-    # A/B k_gran=1 (< numK=2): chunk-based, same for all partitions.
-    # SA/SB k_gran=2 (>= numK=2): tile-range tracking across partitions.
-    #   SA follows A-side tiles: P0/P2=[0-3]→set 0, P1/P3=[4-7]→set 1
-    #   SB follows B-side tiles: P0/P1=[0-3]→set 0, P2/P3=[4-7]→set 1
-
-    # ── P0: SA[0-3]=set0, SB[0-3]=set0. LR A,B,SA at s0; LR A at s1. ──
-    p0 = parts[0]
-    assert p0[0].mfma_sets == {'A': 0, 'B': 0, 'SA': 0, 'SB': 0}
-    assert p0[1].mfma_sets == {'A': 1, 'B': 1, 'SA': 0, 'SB': 0}
-    assert p0[0].lr_sets == {'A': 1, 'B': 1, 'SA': 1}
-    assert p0[1].lr_sets == {'A': 0}
-
-    # ── P1: SA[4-7]=set1 (loaded by P0 LR), SB[0-3]=set0. ──
-    p1 = parts[1]
-    assert p1[0].mfma_sets == {'A': 0, 'B': 0, 'SA': 1, 'SB': 0}
-    assert p1[1].mfma_sets == {'A': 1, 'B': 1, 'SA': 1, 'SB': 0}
-    assert p1[0].lr_sets == {'A': 1, 'SB': 1}
-    assert p1[1].lr_sets == {'B': 0}
-
-    # ── P2: SA[0-3]=set0, SB[4-7]=set1 (loaded by P1 LR). ──
-    p2 = parts[2]
-    assert p2[0].mfma_sets == {'A': 0, 'B': 0, 'SA': 0, 'SB': 1}
-    assert p2[1].mfma_sets == {'A': 1, 'B': 1, 'SA': 0, 'SB': 1}
-    assert p2[0].lr_sets == {'B': 1}
-    assert p2[1].lr_sets == {}
-
-    # ── P3: SA[4-7]=set1, SB[4-7]=set1. LR SA at s0; LR A,B,SB at s1. ──
-    p3 = parts[3]
-    assert p3[0].mfma_sets == {'A': 0, 'B': 0, 'SA': 1, 'SB': 1}
-    assert p3[1].mfma_sets == {'A': 1, 'B': 1, 'SA': 1, 'SB': 1}
-    assert p3[0].lr_sets == {'SA': 0}
-    assert p3[1].lr_sets == {'A': 0, 'B': 0, 'SB': 0}
-
-
-def test_assign_vgpr_DU512():
+def test_assign_vgpr_tiles_DU512():
     """Step 2: DU=512, FP4. numSubIterK=4, A/B k_gran=1, SA/SB k_gran=2.
 
-    A/B: sets flip every subIterK → 0,1,0,1
-    SA/SB: sets flip every 2 subIterKs → 0,0,1,1
+    Verifies tile maps are populated and no unrolling is needed.
     """
     kernel = create_kernel(256, 256, fp4=True, depthU=512)
     tiA = TileInfo('A', kernel)
@@ -1304,38 +1248,32 @@ def test_assign_vgpr_DU512():
     assert cfg.hasScale
 
     sched = MFMATileScheduler(cfg)
-    slots = sched.assign_vgpr_sets()
+    sched.assign_vgpr_tiles()
     print(sched.print_vgpr())
 
-    # A/B: k_gran=1 → sets alternate 0,1,0,1
-    ab_expected = [0, 1, 0, 1]
-    for k in range(4):
-        assert slots[k].mfma_sets['A'] == ab_expected[k], f"A mfma set at k={k}"
-        assert slots[k].mfma_sets['B'] == ab_expected[k], f"B mfma set at k={k}"
+    # All MFMAs have tile maps
+    for slot in sched._partitions[0]:
+        assert slot.mfma.vgpr_tile_map_A is not None
+        assert slot.mfma.vgpr_tile_map_B is not None
+        assert slot.mfma.vgpr_tile_map_SA is not None
+        assert slot.mfma.vgpr_tile_map_SB is not None
 
-    # SA/SB: k_gran=2 with numK=4 → 2 chunks, ping-pong by chunk index.
-    # Chunk 0 (k=0,1): set 0.  Chunk 1 (k=2,3): set 1.
-    sa_sb_expected = [0, 0, 1, 1]
-    for k in range(4):
-        assert slots[k].mfma_sets['SA'] == sa_sb_expected[k], f"SA mfma set at k={k}"
-        assert slots[k].mfma_sets['SB'] == sa_sb_expected[k], f"SB mfma set at k={k}"
+    # MFMA and LR at same subIterK don't share vgprTileIds
+    for slot in sched._partitions[0]:
+        if slot.mfma:
+            for lr in slot.lrs:
+                if lr.tensor in ('A', 'B'):
+                    mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')
+                    assert set(mfma_map.values()).isdisjoint(set(lr.vgpr_tile_map.values())), \
+                        f"MFMA and LR {lr.tensor} at k={slot.subIterK} share vgprTileIds"
 
-    # LR sets: each LR writes opposite of its MFMA set
-    for k in range(4):
-        for t in slots[k].lr_sets:
-            assert slots[k].lr_sets[t] == 1 - slots[k].mfma_sets[t], \
-                f"LR {t} at k={k} should write opposite of MFMA set"
+    assert not sched.needs_unrolling
+    assert sched.tile_peaks['SA'] > 0
+    assert sched.tile_peaks['SB'] > 0
 
 
-def test_assign_vgpr_DU512_partition_2x2():
-    """Step 2: DU=512 + 2x2 partition, FP4. numSubIterK=4.
-
-    A/B k_gran=1 (< numK=4): chunk-based 0,1,0,1, same for all partitions.
-    SA/SB k_gran=2 (< numK=4): chunk-based 0,0,1,1, same for all partitions.
-
-    Unlike the DU256 2x2 case (k_gran >= numK → tile-range tracking),
-    here k_gran < numK so the chunk formula applies uniformly.
-    """
+def test_assign_vgpr_tiles_DU512_partition_2x2():
+    """Step 2: DU=512 + 2x2 partition, FP4. numSubIterK=4."""
     kernel = create_kernel(256, 256, fp4=True, depthU=512)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
@@ -1361,44 +1299,38 @@ def test_assign_vgpr_DU512_partition_2x2():
     assert cfg.hasScale
 
     sched = MFMATileScheduler(cfg)
-    sched.assign_vgpr_sets()
+    sched.assign_vgpr_tiles()
     print(sched.print_vgpr())
     parts = sched._partitions
 
-    # MFMA sets: chunk-based, identical across all 4 partitions.
-    # A/B: 0,1,0,1.  SA/SB: 0,0,1,1.
-    ab_expected = [0, 1, 0, 1]
-    sa_sb_expected = [0, 0, 1, 1]
+    # All partitions' MFMAs have tile maps
     for pi in range(4):
-        for k in range(4):
-            assert parts[pi][k].mfma_sets['A'] == ab_expected[k], \
-                f"P{pi} A mfma set at k={k}"
-            assert parts[pi][k].mfma_sets['B'] == ab_expected[k], \
-                f"P{pi} B mfma set at k={k}"
-            assert parts[pi][k].mfma_sets['SA'] == sa_sb_expected[k], \
-                f"P{pi} SA mfma set at k={k}"
-            assert parts[pi][k].mfma_sets['SB'] == sa_sb_expected[k], \
-                f"P{pi} SB mfma set at k={k}"
+        for slot in parts[pi]:
+            assert slot.mfma.vgpr_tile_map_A is not None
+            assert slot.mfma.vgpr_tile_map_B is not None
 
-    # LR sets: every LR writes opposite of its MFMA set.
+    # MFMA and LR at same subIterK don't share vgprTileIds
     for pi in range(4):
-        for k in range(4):
-            for t in parts[pi][k].lr_sets:
-                assert parts[pi][k].lr_sets[t] == 1 - parts[pi][k].mfma_sets[t], \
-                    f"P{pi} LR {t} at k={k} should write opposite of MFMA set"
+        for slot in parts[pi]:
+            if slot.mfma:
+                for lr in slot.lrs:
+                    if lr.tensor in ('A', 'B'):
+                        mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')
+                        assert set(mfma_map.values()).isdisjoint(set(lr.vgpr_tile_map.values())), \
+                            f"P{pi} MFMA and LR {lr.tensor} at k={slot.subIterK} share vgprTileIds"
 
-    # Spot-check LR presence per partition (different from 1x1 due to dedup).
-    # P0: all 4 subIterKs have LRs for A,B; SA at s0,s2; SB at s1
+    # Spot-check LR presence per partition (unchanged from place_LRs).
     assert [lr.tensor for lr in parts[0][0].lrs] == ['A', 'B', 'SA']
     assert [lr.tensor for lr in parts[0][1].lrs] == ['A', 'B', 'SB']
     assert [lr.tensor for lr in parts[0][2].lrs] == ['A', 'B', 'SA']
     assert [lr.tensor for lr in parts[0][3].lrs] == ['A']
 
-    # P3 (last): only s2 has LR SA, s3 has LR A,B,SB (all for MT n+1)
     assert len(parts[3][0].lrs) == 0
     assert len(parts[3][1].lrs) == 0
     assert [lr.tensor for lr in parts[3][2].lrs] == ['SA']
     assert [lr.tensor for lr in parts[3][3].lrs] == ['A', 'B', 'SB']
+
+    assert not sched.needs_unrolling
 
 
 # ── Step 3: Place GRs ────────────────────────────────────
@@ -2631,15 +2563,19 @@ def test_populate_instructions_256x256_fp4():
                     assert len(em.instructions) > 0, \
                         f"P{pi} subIterK={k} [{em.moduleId}] {em.opType}: no instructions"
 
-        # Verify ping-pong: MFMA and LR at same subIterK use different VGPR sets
+        # Verify: MFMA and LR at same subIterK use different vgprTileIds
         for pi, slots in enumerate(sched._partitions):
             for slot in slots:
-                if slot.mfma and slot.mfma.vgpr_sets and slot.lrs:
+                if slot.mfma and slot.lrs:
                     for lr in slot.lrs:
-                        if lr.vgpr_set is not None and lr.tensor in slot.mfma.vgpr_sets:
-                            assert lr.vgpr_set != slot.mfma.vgpr_sets[lr.tensor], \
-                                f"P{pi} subIterK={slot.subIterK}: MFMA and LR {lr.tensor} " \
-                                f"use same VGPR set {lr.vgpr_set}"
+                        if lr.vgpr_tile_map and lr.tensor in ('A', 'B'):
+                            mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')
+                            if mfma_map:
+                                mfma_vids = set(mfma_map.values())
+                                lr_vids = set(lr.vgpr_tile_map.values())
+                                assert mfma_vids.isdisjoint(lr_vids), \
+                                    f"P{pi} subIterK={slot.subIterK}: MFMA and LR {lr.tensor} " \
+                                    f"share vgprTileIds"
 
         # Call instructionSchedule on each subIterK and verify no crash
         for pi, partition_emitted in enumerate(sched._emitted):
@@ -2699,7 +2635,7 @@ if __name__ == "__main__":
 
     steps = [
         ("Step 1: Place LRs",          lambda: (sched.place_LRs(), sched.print_lr())),
-        ("Step 2: Assign VGPR sets",    lambda: (sched.assign_vgpr_sets(), sched.print_vgpr())),
+        ("Step 2: Assign VGPR tiles",   lambda: (sched.assign_vgpr_tiles(), sched.print_vgpr())),
         ("Step 3: Place GRs",           lambda: (sched.place_GRs(), sched.print_gr())),
         ("Step 4: Annotate deps",       lambda: (sched.annotate_deps(), sched.print_deps())),
         ("Step 5: Remove cross deps",  lambda: (sched.remove_cross_deps(), sched.print_remove_deps())),

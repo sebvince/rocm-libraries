@@ -21,26 +21,25 @@ class InstructionEmitter:
     """Emits GPU instructions for each opType in the MFMATileScheduler output.
 
     VGPR tile indexing uses placement-level tile maps (tileId → vgprTileId)
-    set by assign_vgpr_tiles(). A single flat vgprTiles list is indexed by
-    vgprTileId. Scale VGPRs use two-set selection via placement.vgpr_set.
+    set by assign_vgpr_tiles(). Per-tensor VGPR tile lists are indexed by
+    vgprTileId. All tensors (A, B, SA, SB) use the same tile-map approach.
     """
 
     def __init__(self, writer, kernel, config,
                  tileInfoA, tileInfoB, dtileInfo,
-                 vgprTiles,
+                 vgprTilesA, vgprTilesB,
                  scaleTileInfoA=None, scaleTileInfoB=None,
-                 scaleVgprTiles=None, scaleVgprTilesAlt=None,
-                 numScaleGroupsA=0):
+                 vgprTilesSA=None, vgprTilesSB=None):
         self.writer = writer
         self.kernel = kernel
         self.config = config
         self.tileInfoA = tileInfoA
         self.tileInfoB = tileInfoB
         self.dtileInfo = dtileInfo
-        self.vgprTiles = vgprTiles
-        self.scaleVgprTiles = scaleVgprTiles
-        self.scaleVgprTilesAlt = scaleVgprTilesAlt
-        self.numScaleGroupsA = numScaleGroupsA
+        self.vgprTilesA = vgprTilesA
+        self.vgprTilesB = vgprTilesB
+        self.vgprTilesSA = vgprTilesSA or []
+        self.vgprTilesSB = vgprTilesSB or []
 
         # Derived state
         self.hasScale = scaleTileInfoA is not None and scaleTileInfoB is not None
@@ -63,32 +62,26 @@ class InstructionEmitter:
             'gr_scale': lambda em: self.emit_gr_scale(em.source),
         }
 
-    def _get_scale_tiles(self, vgpr_set):
-        """Return the scale VGPR list for the given set."""
-        return self.scaleVgprTiles if vgpr_set == 0 else self.scaleVgprTilesAlt
-
     def emit_mfma(self, placement):
         """Emit MFMA instructions from MFMAPlacement."""
         module = Module()
-        vgpr_sets = placement.vgpr_sets or {}
-        setSA = vgpr_sets.get('SA', 0)
         subIterK = placement.subIterK
         tile_map_A = placement.vgpr_tile_map_A or {}
         tile_map_B = placement.vgpr_tile_map_B or {}
-
-        scaleTiles = self._get_scale_tiles(setSA) if self.hasScale else None
+        tile_map_SA = placement.vgpr_tile_map_SA or {}
+        tile_map_SB = placement.vgpr_tile_map_SB or {}
 
         for a in placement.tileA.tileId_list:
             for b in placement.tileB.tileId_list:
-                aTile = self.vgprTiles[tile_map_A[a]]
-                bTile = self.vgprTiles[tile_map_B[b]]
+                aTile = self.vgprTilesA[tile_map_A[a]]
+                bTile = self.vgprTilesB[tile_map_B[b]]
                 dTile = self.dtileInfo.vgprTiles[a + b * self.dtileInfo.localMMATileGrid[0]]
 
                 if self.hasScale:
                     scaleGroupA = a // 2
                     scaleGroupB = b // 2
-                    scaleAVgpr = scaleTiles[scaleGroupA]
-                    scaleBVgpr = scaleTiles[self.numScaleGroupsA + scaleGroupB]
+                    scaleAVgpr = self.vgprTilesSA[tile_map_SA[scaleGroupA]]
+                    scaleBVgpr = self.vgprTilesSB[tile_map_SB[scaleGroupB]]
                     sAsel = (a % 2) + 2 * subIterK
                     sBsel = (b % 2) + 2 * subIterK
                 else:
@@ -106,31 +99,30 @@ class InstructionEmitter:
         """Emit LR (ds_read) instructions from LRPlacement."""
         module = Module()
         tensor = placement.tensor
-        lr_set = placement.vgpr_set if placement.vgpr_set is not None else 0
         tile_map = placement.vgpr_tile_map or {}
 
         if tensor in ('A', 'B'):
             ti = self.tileInfoMap[tensor]
+            vgprTiles = self.vgprTilesA if tensor == 'A' else self.vgprTilesB
             for tileId in placement.tiles.tileId_list:
                 for k in placement.tiles.subIterK_list:
                     subtileK = k // self.subtileShapeK
                     subIterK_within = k % self.subtileShapeK
-                    dstTile = self.vgprTiles[tile_map[tileId]]
+                    dstTile = vgprTiles[tile_map[tileId]]
                     module.add(emitSingleDsRead(
                         ti, tileId, subtileK, subIterK_within, dstTile))
         elif tensor in ('SA', 'SB'):
             # Scale LR: DSLoadB32
             tc = 'MXSA' if tensor == 'SA' else 'MXSB'
             ti = self.tileInfoMap[tensor]
-            scaleTiles = self._get_scale_tiles(lr_set)
+            vgprTilesScale = self.vgprTilesSA if tensor == 'SA' else self.vgprTilesSB
             groupStride = 2 * ti.subtileSize
             for tileId in placement.tiles.tileId_list:
                 scaleGroupIdx = tileId // 2
-                vid = scaleGroupIdx if tensor == 'SA' else self.numScaleGroupsA + scaleGroupIdx
                 for k in placement.tiles.subIterK_list:
                     subtileK = k // self.subtileShapeK
                     dsOffset = groupStride * (scaleGroupIdx * (self.config.numSubIterK // self.subtileShapeK) + subtileK)
-                    vdst = scaleTiles[vid]
+                    vdst = vgprTilesScale[tile_map[scaleGroupIdx]]
                     module.add(DSLoadB32(
                         dst=vgpr(vdst),
                         src=vgpr(ti.sharedVgprLROffset[0]),
