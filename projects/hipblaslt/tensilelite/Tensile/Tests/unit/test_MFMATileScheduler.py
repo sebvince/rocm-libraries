@@ -2501,6 +2501,61 @@ def test_group_lr_gr_1x1_partition_DU256():
     assert gr_sb1.deps[0].ref is gr_sa1
 
 
+def test_emit_1x1_partition_DU256():
+    """Step 7: emit pass — 256x256, DU256, FP4, 1 partition, 2 subIterKs.
+
+    Visualize EmittedModule chains produced from group_lr_gr output.
+    """
+    cfg = make_256x256_fp4()
+    sched = MFMATileScheduler(cfg)
+    result = sched.emit()
+    print(sched.print_emit())
+
+    assert len(result) == 1       # 1 partition
+    assert len(result[0]) == 2    # 2 subIterKs
+
+    # ── subIterK=0 ──
+    em0 = result[0][0]
+    types0 = [(e.moduleId, e.opType, e.before) for e in em0]
+    print("subIterK=0 modules:", types0)
+
+    # Primary modules: mfma + 3 LRs (A, B, SA) + 2 GRs (A, B)
+    primary0 = [e for e in em0 if e.opType in ('mfma', 'lr', 'gr')]
+    assert len(primary0) == 6
+    assert primary0[0].opType == 'mfma'
+
+    # MFMA has a before-link (wait_lr)
+    assert em0[0].before is not None
+    wait_lr_0 = em0[em0[0].before]
+    assert wait_lr_0.opType == 'wait_lr'
+
+    # wait_gr is standalone (no incoming before)
+    wait_grs_0 = [e for e in em0 if e.opType == 'wait_gr']
+    assert len(wait_grs_0) == 1
+    assert wait_grs_0[0].before is None
+
+    # ── subIterK=1 ──
+    em1 = result[0][1]
+    types1 = [(e.moduleId, e.opType, e.before) for e in em1]
+    print("subIterK=1 modules:", types1)
+
+    primary1 = [e for e in em1 if e.opType in ('mfma', 'lr', 'gr')]
+    assert len(primary1) == 7   # mfma + 3 LRs (A, B, SB) + 3 GRs (B, SA, SB)
+    assert primary1[0].opType == 'mfma'
+
+    # wait_gr standalone
+    wait_grs_1 = [e for e in em1 if e.opType == 'wait_gr']
+    assert len(wait_grs_1) == 1
+    assert wait_grs_1[0].before is None
+
+    # No self-loops
+    for em_list in [em0, em1]:
+        for e in em_list:
+            if e.before is not None:
+                assert e.before != e.moduleId, \
+                    f"module {e.moduleId} has self-loop"
+
+
 # ── Standalone mode ─────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -2539,8 +2594,10 @@ if __name__ == "__main__":
         ("Step 2: Assign VGPR sets",    lambda: (sched.assign_vgpr_sets(), sched.print_vgpr())),
         ("Step 3: Place GRs",           lambda: (sched.place_GRs(), sched.print_gr())),
         ("Step 4: Annotate deps",       lambda: (sched.annotate_deps(), sched.print_deps())),
-        # ("Step 5: Group and serialize", lambda: (sched.group(), sched.print_group())),
-        # ("Step 6: EmittedModules",      lambda: (sched.emit(), sched.print_emit())),
+        ("Step 5: Remove cross deps",  lambda: (sched.remove_cross_deps(), sched.print_remove_deps())),
+        ("Step 6: Insert gr/lr inc",   lambda: (sched.insert_gr_lr_inc(), sched.print_group_lr_gr())),
+        ("Step 7: Group LR/GR",        lambda: (sched.group_lr_gr(), sched.print_group_lr_gr())),
+        ("Step 8: Emit",               lambda: (sched.emit(), sched.print_emit())),
     ]
 
     interactive = "--interactive" in sys.argv or "-i" in sys.argv

@@ -1374,6 +1374,113 @@ class MFMATileScheduler:
     #     self._completed.add('emit')
     #     return all_emitted
 
+    # ── Emit ───────────────────────────────────────────────
+
+    def emit(self) -> List[List[List[EmittedModule]]]:
+        """Convert placements into EmittedModule chains per partition per subIterK.
+
+        Returns [partition][subIterK][EmittedModule].
+
+        Each subIterK list contains:
+          - Primary modules (MFMA, LRs, GRs) with opType and label
+          - Dependency modules (wait_gr, wait_lr, sync, lr_inc, gr_inc, gr_scale)
+            emitted from preOps, chained via before-links
+
+        The before-link topology matches SubtileBasedScheduler._buildEmittedModules:
+          - wait_gr is standalone (no incoming before-link), but later deps chain from it
+          - wait_lr_sync expands to two modules: wait_lr then sync
+          - Same-subIterK DepRef deps become ordering constraints (no new module)
+        """
+        if 'group_lr_gr' not in self._completed:
+            self.group_lr_gr()
+
+        all_partitions = []
+        for pi, slots in enumerate(self._partitions):
+            partition_emitted = []
+            for slot in slots:
+                emitted: List[EmittedModule] = []
+                placement_to_id = {}
+
+                def add(opType: str, label: str) -> int:
+                    mid = len(emitted)
+                    emitted.append(EmittedModule(
+                        moduleId=mid, opType=opType, label=label))
+                    return mid
+
+                def setBefore(moduleId: int, beforeId: int) -> None:
+                    if beforeId is None or beforeId == moduleId:
+                        return
+                    cur = emitted[moduleId].before
+                    if cur is None:
+                        emitted[moduleId].before = beforeId
+                        return
+                    assert cur == beforeId, \
+                        f"EmittedModule {moduleId} has multiple before deps: {cur} and {beforeId}"
+
+                # Step 1: emit primary modules
+                placements = []
+                if slot.mfma:
+                    placements.append(('mfma', slot.mfma))
+                for lr in slot.lrs:
+                    placements.append(('lr', lr))
+                for gr in slot.grs:
+                    placements.append(('gr', gr))
+
+                for opType, placement in placements:
+                    label = self._format_placement_label(placement, slot)
+                    mid = add(opType, label)
+                    placement_to_id[id(placement)] = mid
+
+                # Step 2: wire before-chains from preOps + deps
+                for opType, placement in placements:
+                    curId = placement_to_id[id(placement)]
+                    prevId = None
+                    lastDepId = None
+
+                    # preOps
+                    for preOp in placement.preOps:
+                        if preOp.kind == 'wait_gr':
+                            # Standalone: no incoming before-link, but later
+                            # deps chain from it
+                            depId = add('wait_gr', str(preOp))
+                            prevId = depId
+                            continue
+                        elif preOp.kind == 'wait_lr_sync':
+                            # Expand to wait_lr + sync
+                            depId = add('wait_lr', 'wait_lr')
+                            setBefore(depId, prevId)
+                            prevId = depId
+                            lastDepId = depId
+                            depId = add('sync', 'sync')
+                            setBefore(depId, prevId)
+                            prevId = depId
+                            lastDepId = depId
+                            continue
+                        else:
+                            depId = add(preOp.kind, str(preOp))
+                            setBefore(depId, prevId)
+                            prevId = depId
+                            lastDepId = depId
+
+                    # deps (same-subIterK DepRefs — ordering constraints)
+                    for dep in placement.deps:
+                        ref_id = placement_to_id.get(id(dep.ref))
+                        if ref_id is not None:
+                            prevId = ref_id
+
+                    # Final link: primary module points to last dep
+                    if lastDepId is not None:
+                        setBefore(curId, lastDepId)
+                    elif prevId is not None:
+                        setBefore(curId, prevId)
+
+                partition_emitted.append(emitted)
+            all_partitions.append(partition_emitted)
+
+        self._emitted = all_partitions
+        self._completed.add('emit')
+        return all_partitions
+
     # ── Print helpers ───────────────────────────────────────
 
     @staticmethod
@@ -1643,15 +1750,17 @@ class MFMATileScheduler:
     #         return self._format_placement_label(p, SubIterKSlot(subIterK=0))
     #     return str(dep)
     #
-    # def print_emit(self, all_emitted: List[List[EmittedModule]] = None) -> str:
-    #     """Print emit output: EmittedModule list with before-links."""
-    #     if all_emitted is None:
-    #         all_emitted = self._emitted
-    #     buf = io.StringIO()
-    #     for k, emitted in enumerate(all_emitted):
-    #         buf.write(f"subIterK={k}:\n")
-    #         for em in emitted:
-    #             before_str = f" ← [{em.before}]" if em.before is not None else ""
-    #             buf.write(f"  [{em.moduleId:2d}] {em.opType:8s} {em.label}{before_str}\n")
-    #         buf.write("\n")
-    #     return buf.getvalue()
+    def print_emit(self, all_partitions: List[List[List[EmittedModule]]] = None) -> str:
+        """Print emit output: EmittedModule list with before-links."""
+        if all_partitions is None:
+            all_partitions = self._emitted
+        buf = io.StringIO()
+        buf.write("MAINLOOP:\n")
+        for pi, partition_emitted in enumerate(all_partitions):
+            buf.write(f"  Partition {pi}:\n")
+            for k, emitted in enumerate(partition_emitted):
+                buf.write(f"    subIterK={k}:\n")
+                for em in emitted:
+                    before_str = f" <- [{em.before}]" if em.before is not None else ""
+                    buf.write(f"      [{em.moduleId:2d}] {em.opType:10s} {em.label}{before_str}\n")
+        return buf.getvalue()
