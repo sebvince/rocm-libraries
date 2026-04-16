@@ -2384,6 +2384,123 @@ def test_from_tile_info_256x256():
     assert not cfg.hasScale
 
 
+# ── Step 6: group_lr_gr ────────────────────────────────────
+
+def test_group_lr_gr_1x1_partition_DU256():
+    """Step 6: 256x256, DU256, FP4, 1 partition, 2 subIterKs.
+
+    After group_lr_gr:
+      subIterK=0:
+        LRs: A, B, SA → chain A←B←SA, merged preOps on A
+        GRs: A, B → chain A←B, first GR dep→last LR (SA), merged preOps on A
+
+      subIterK=1:
+        LRs: A, B, SB → chain A←B←SB, merged preOps on A
+        GRs: B, SA, SB → chain B←SA←SB, no deps (none originally), merged preOps on B
+    """
+    cfg = make_256x256_fp4()
+    sched = MFMATileScheduler(cfg)
+    sched.group_lr_gr()
+    parts = sched._partitions
+    print(sched.print_group_lr_gr())
+
+    s0 = parts[0][0]
+    s1 = parts[0][1]
+
+    # ── subIterK=0: LR chain ──
+
+    lr_a0 = _get_lr(s0, 'A')
+    lr_b0 = _get_lr(s0, 'B')
+    lr_sa0 = _get_lr(s0, 'SA')
+
+    # First LR (A) has merged wait_gr
+    assert len(lr_a0.preOps) == 1
+    assert lr_a0.preOps[0].kind == 'wait_gr'
+    assert lr_a0.preOps[0].wait_gr_counts.A == 16
+    assert lr_a0.preOps[0].wait_gr_counts.B == 16
+    assert lr_a0.preOps[0].wait_gr_counts.SA == 1
+    assert lr_a0.deps == []
+
+    # LR B chains to LR A
+    assert lr_b0.preOps == []
+    assert len(lr_b0.deps) == 1
+    assert lr_b0.deps[0].ref is lr_a0
+    assert lr_b0.deps[0].mt_offset == 0
+
+    # LR SA chains to LR B
+    assert lr_sa0.preOps == []
+    assert len(lr_sa0.deps) == 1
+    assert lr_sa0.deps[0].ref is lr_b0
+    assert lr_sa0.deps[0].mt_offset == 0
+
+    # ── subIterK=0: GR chain ──
+
+    gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
+    gr_b0 = [gr for gr in s0.grs if gr.tensor == 'B'][0]
+
+    # First GR (A) has merged preOps: gr_inc(A), gr_inc(B)
+    assert len(gr_a0.preOps) == 2
+    assert gr_a0.preOps[0].kind == 'gr_inc' and gr_a0.preOps[0].tensor == 'A'
+    assert gr_a0.preOps[1].kind == 'gr_inc' and gr_a0.preOps[1].tensor == 'B'
+    # First GR dep points to last LR (SA)
+    assert len(gr_a0.deps) == 1
+    assert gr_a0.deps[0].ref is lr_sa0
+
+    # GR B chains to GR A
+    assert gr_b0.preOps == []
+    assert len(gr_b0.deps) == 1
+    assert gr_b0.deps[0].ref is gr_a0
+
+    # ── subIterK=1: LR chain ──
+
+    lr_a1 = _get_lr(s1, 'A')
+    lr_b1 = _get_lr(s1, 'B')
+    lr_sb1 = _get_lr(s1, 'SB')
+
+    # First LR (A) has merged wait_gr + lr_inc ops
+    assert lr_a1.preOps[0].kind == 'wait_gr'
+    assert lr_a1.preOps[0].wait_gr_counts.A == 8
+    assert lr_a1.preOps[0].wait_gr_counts.B == 1
+    assert lr_a1.preOps[1].kind == 'lr_inc' and lr_a1.preOps[1].tensor == 'A'
+    assert lr_a1.preOps[2].kind == 'lr_inc' and lr_a1.preOps[2].tensor == 'B'
+    assert len(lr_a1.preOps) == 3
+
+    # LR B chains to LR A
+    assert lr_b1.preOps == []
+    assert len(lr_b1.deps) == 1
+    assert lr_b1.deps[0].ref is lr_a1
+
+    # LR SB chains to LR B
+    assert lr_sb1.preOps == []
+    assert len(lr_sb1.deps) == 1
+    assert lr_sb1.deps[0].ref is lr_b1
+
+    # ── subIterK=1: GR chain ──
+
+    gr_b1 = [gr for gr in s1.grs if gr.tensor == 'B'][0]
+    gr_sa1 = [gr for gr in s1.grs if gr.tensor == 'SA'][0]
+    gr_sb1 = [gr for gr in s1.grs if gr.tensor == 'SB'][0]
+
+    # First GR (B) has merged preOps: wait_lr_sync (deduped) + gr_inc(B,SA,SB)
+    assert gr_b1.preOps[0].kind == 'wait_lr_sync'
+    assert gr_b1.preOps[1].kind == 'gr_inc' and gr_b1.preOps[1].tensor == 'B'
+    assert gr_b1.preOps[2].kind == 'gr_inc' and gr_b1.preOps[2].tensor == 'SA'
+    assert gr_b1.preOps[3].kind == 'gr_inc' and gr_b1.preOps[3].tensor == 'SB'
+    assert len(gr_b1.preOps) == 4
+    # No deps (none originally)
+    assert gr_b1.deps == []
+
+    # GR SA chains to GR B
+    assert gr_sa1.preOps == []
+    assert len(gr_sa1.deps) == 1
+    assert gr_sa1.deps[0].ref is gr_b1
+
+    # GR SB chains to GR SA
+    assert gr_sb1.preOps == []
+    assert len(gr_sb1.deps) == 1
+    assert gr_sb1.deps[0].ref is gr_sa1
+
+
 # ── Standalone mode ─────────────────────────────────────────
 
 if __name__ == "__main__":

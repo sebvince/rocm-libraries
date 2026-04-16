@@ -1102,6 +1102,117 @@ class MFMATileScheduler:
 
         self._completed.add('gr_inc')
 
+    # ── Group LR/GR chains ─────────────────────────────────────
+
+    _LR_GR_ORDER = ['A', 'B', 'SA', 'SB']
+
+    @staticmethod
+    def _merge_preops(all_preops: List[List['DepOp']]) -> List['DepOp']:
+        """Merge preOps from multiple placements.
+
+        Combines wait_gr counts into a single DepOp, deduplicates barrier ops
+        (wait_lr_sync, wait_lr), and collects the rest.
+        """
+        merged_counts = None
+        seen_kinds = set()
+        others = []
+        for preops in all_preops:
+            for op in preops:
+                if op.kind == 'wait_gr' and op.wait_gr_counts:
+                    if merged_counts is None:
+                        merged_counts = WaitGRCounts()
+                    for t in ('A', 'B', 'SA', 'SB'):
+                        v = getattr(op.wait_gr_counts, t)
+                        if v:
+                            setattr(merged_counts, t, v)
+                elif op.kind in ('wait_lr_sync', 'wait_lr'):
+                    if op.kind not in seen_kinds:
+                        seen_kinds.add(op.kind)
+                        others.append(op)
+                else:
+                    others.append(op)
+        result = []
+        if merged_counts is not None:
+            result.append(DepOp(kind='wait_gr', wait_gr_counts=merged_counts))
+        result.extend(others)
+        return result
+
+    def group_lr_gr(self):
+        """Group LR and GR placements into chains within each subIterK.
+
+        Phase 1 — LR chain:
+          Sort LRs by tensor order (A, B, SA, SB).  Build a dep chain so each
+          LR depends on the previous one.  Merge all preOps onto the first LR
+          (wait_gr counts are combined, other preOps are collected).
+
+        Phase 2 — GR chain:
+          Sort GRs by tensor order (A, B, SA, SB).  Build a dep chain.  If any
+          GR originally had same-subIterK deps, replace the first GR's deps with
+          a single dep on the last LR of the phase-1 chain.  Merge all preOps
+          onto the first GR.
+        """
+        if 'gr_inc' not in self._completed:
+            self.insert_gr_lr_inc()
+
+        order = self._LR_GR_ORDER
+
+        for pi, slots in enumerate(self._partitions):
+            for slot in slots:
+                # ── Phase 1: LR chain ──
+                ordered_lrs = sorted(
+                    slot.lrs,
+                    key=lambda lr: order.index(lr.tensor))
+
+                if len(ordered_lrs) > 1:
+                    # Merge preOps onto first LR
+                    merged = self._merge_preops(
+                        [lr.preOps for lr in ordered_lrs])
+                    ordered_lrs[0].preOps = merged
+                    for lr in ordered_lrs[1:]:
+                        lr.preOps = []
+
+                    # Build chain: each LR depends on the previous
+                    for i in range(1, len(ordered_lrs)):
+                        ordered_lrs[i].deps = [
+                            DepRef(ref=ordered_lrs[i - 1], mt_offset=0)]
+
+                last_lr = ordered_lrs[-1] if ordered_lrs else None
+
+                # ── Phase 2: GR chain ──
+                ordered_grs = sorted(
+                    slot.grs,
+                    key=lambda gr: order.index(gr.tensor))
+
+                if len(ordered_grs) > 1:
+                    # Check if any GR has same-subIterK deps
+                    any_deps = any(gr.deps for gr in ordered_grs)
+
+                    # Merge preOps onto first GR
+                    merged = self._merge_preops(
+                        [gr.preOps for gr in ordered_grs])
+                    ordered_grs[0].preOps = merged
+                    for gr in ordered_grs[1:]:
+                        gr.preOps = []
+
+                    # First GR: if any GR had deps, point to last LR
+                    if any_deps and last_lr is not None:
+                        ordered_grs[0].deps = [
+                            DepRef(ref=last_lr, mt_offset=0)]
+                    else:
+                        ordered_grs[0].deps = []
+
+                    # Build chain: each GR depends on the previous
+                    for i in range(1, len(ordered_grs)):
+                        ordered_grs[i].deps = [
+                            DepRef(ref=ordered_grs[i - 1], mt_offset=0)]
+                elif len(ordered_grs) == 1:
+                    # Single GR: still consolidate dep to last LR if it had deps
+                    if ordered_grs[0].deps and last_lr is not None:
+                        ordered_grs[0].deps = [
+                            DepRef(ref=last_lr, mt_offset=0)]
+
+        self._completed.add('group_lr_gr')
+
     def _split_deps(self, deps: List[DepRef], consumer_pi: int,
                     consumer_slot: int) -> Tuple[List[DepRef], List[DepRef]]:
         """Split deps into same-subIterK and cross-subIterK lists.
@@ -1446,6 +1557,22 @@ class MFMATileScheduler:
 
     def print_remove_deps(self) -> str:
         """Print remove_cross_deps output: placements with preOps and remaining deps."""
+        buf = io.StringIO()
+        buf.write("MAINLOOP:\n")
+        for pi, slots in enumerate(self._partitions):
+            buf.write(f"  Partition {pi}:\n")
+            for slot in slots:
+                buf.write(f"    subIterK={slot.subIterK}:\n")
+                if slot.mfma:
+                    self._print_placement_with_preops(buf, slot.mfma, slot)
+                for lr in slot.lrs:
+                    self._print_placement_with_preops(buf, lr, slot)
+                for gr in slot.grs:
+                    self._print_placement_with_preops(buf, gr, slot)
+        return buf.getvalue()
+
+    def print_group_lr_gr(self) -> str:
+        """Print group_lr_gr output: placements with chained deps and merged preOps."""
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
         for pi, slots in enumerate(self._partitions):
