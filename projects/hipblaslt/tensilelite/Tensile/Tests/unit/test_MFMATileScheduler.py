@@ -1797,13 +1797,13 @@ def test_annotate_deps_1x1_partition_DU256():
     lr_sa0 = _get_lr(s0, 'SA')
     assert _dep_refs(lr_sa0) == [('GR', 'SA', 0, 1, -1)]
 
-    # GR A @s0: collision on LR A @s0 (mt="n+2" vs LR mt="n" → MT-2)
+    # GR A @s0: collision on LR A (mt="n") @s0 — same iteration (MT 0)
     gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
-    assert _dep_refs(gr_a0) == [('LR', 'A', 0, 0, -2)]
+    assert _dep_refs(gr_a0) == [('LR', 'A', 0, 0, 0)]
 
-    # GR B @s0: collision on LR B @s0 (MT-2)
+    # GR B @s0: collision on LR B (mt="n") @s0 — same iteration (MT 0)
     gr_b0 = [gr for gr in s0.grs if gr.tensor == 'B'][0]
-    assert _dep_refs(gr_b0) == [('LR', 'B', 0, 0, -2)]
+    assert _dep_refs(gr_b0) == [('LR', 'B', 0, 0, 0)]
 
     # ── subIterK=1 ──
 
@@ -1827,15 +1827,15 @@ def test_annotate_deps_1x1_partition_DU256():
     lr_sb1 = _get_lr(s1, 'SB')
     assert _dep_refs(lr_sb1) == [('GR', 'SB', 0, 1, -1)]
 
-    # GR B @s1: collision on LR B (mt="n") at s0 (mt="n+2" vs mt="n" → MT-2)
+    # GR B @s1: collision on LR B (mt="n") at s0 — same iteration (MT 0)
     gr_b1 = [gr for gr in s1.grs if gr.tensor == 'B'][0]
-    assert _dep_refs(gr_b1) == [('LR', 'B', 0, 0, -2)]
+    assert _dep_refs(gr_b1) == [('LR', 'B', 0, 0, 0)]
 
-    # GR SA @s1: no LR SA (mt="n"), falls back to LR SA (mt="n+1") → MT-1
+    # GR SA @s1: LR SA (mt="n+1") @s0, prev iter handled data "n" → MT-1
     gr_sa1 = [gr for gr in s1.grs if gr.tensor == 'SA'][0]
     assert _dep_refs(gr_sa1) == [('LR', 'SA', 0, 0, -1)]
 
-    # GR SB @s1: no LR SB (mt="n"), falls back to LR SB (mt="n+1") → MT-1
+    # GR SB @s1: LR SB (mt="n+1") @s1, prev iter handled data "n" → MT-1
     gr_sb1 = [gr for gr in s1.grs if gr.tensor == 'SB'][0]
     assert _dep_refs(gr_sb1) == [('LR', 'SB', 0, 1, -1)]
 
@@ -1894,9 +1894,9 @@ def test_annotate_deps_2x2_partition_DU512():
     lr_b_p0_s0 = _get_lr(p0[0], 'B')
     assert _dep_refs(lr_b_p0_s0) == [('GR', 'B', 2, 3, -2)]
 
-    # GR A @P0:s0: collision on LR A (mt="n") at s3 (mt="n+1" vs mt="n" → MT-1)
+    # GR A(n+1) @P0:s0 k[0,1) ids[4,6): collision on LR A(n) @P1:s0 k[1,2) ids[4,8) — MT-1
     gr_a_p0_s0 = [gr for gr in p0[0].grs if gr.tensor == 'A'][0]
-    assert _dep_refs(gr_a_p0_s0) == [('LR', 'A', 0, 3, -1)]
+    assert _dep_refs(gr_a_p0_s0) == [('LR', 'A', 1, 0, -1)]
 
     # ── P3: has LR A, LR B, LR SA, LR SB and GR SA, GR SB, GR A, GR B ──
 
@@ -1910,17 +1910,17 @@ def test_annotate_deps_2x2_partition_DU512():
     assert ('LR', 'SB', 1, 2, -1) in mfma_p3_s0
     assert len(mfma_p3_s0) == 4
 
-    # GR SA @P3:s0: no LR SA (mt="n"), falls back to LR SA (mt="n+1") → MT-1
+    # GR SA(n+2) @P3:s0 k[0,4) ids[0,8): collision on LR SA(n) @P1:s0 k[2,4) ids[4,8) — MT 0
     gr_sa_p3 = [gr for gr in p3[0].grs if gr.tensor == 'SA'][0]
-    assert _dep_refs(gr_sa_p3) == [('LR', 'SA', 3, 2, -1)]
+    assert _dep_refs(gr_sa_p3) == [('LR', 'SA', 1, 0, 0)]
 
     # LR SA @P3:s2: depends on GR SA @P3:s0 (mt="n+1" vs GR mt="n+2" → MT-1)
     lr_sa_p3_s2 = _get_lr(p3[2], 'SA')
     assert _dep_refs(lr_sa_p3_s2) == [('GR', 'SA', 3, 0, -1)]
 
-    # GR B @P3:s3: no LR B (mt="n"), falls back to LR B (mt="n+1") → MT-1
+    # GR B(n+2) @P3:s3 k[2,4) ids[0,4): collision on LR B(n) @P0:s2 k[3,4) ids[0,4) — MT 0
     gr_b_p3_s3 = [gr for gr in p3[3].grs if gr.tensor == 'B'][0]
-    assert _dep_refs(gr_b_p3_s3) == [('LR', 'B', 3, 3, -1)]
+    assert _dep_refs(gr_b_p3_s3) == [('LR', 'B', 0, 2, 0)]
 
     # LR B @P3:s3 subIterK[0] [0-3]: GR B @P2:s3 loads subIterK[0,1] ids[2-3] — overlaps both dims
     lr_b_p3_s3 = _get_lr(p3[3], 'B')
@@ -1982,15 +1982,15 @@ def test_remove_cross_deps_1x1_partition_DU256():
     assert _preop_kinds(lr_sa0) == [('wait_gr', {'A': 0, 'B': 0, 'SA': 1, 'SB': 0})]
     assert len(lr_sa0.deps) == 0
 
-    # GR A @s0: dep on LR A @s0 (MT-2) → cross, wait_lr_sync
+    # GR A @s0: dep on LR A @s0 (MT 0, same slot) → same-subIterK, stays in deps
     gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
-    assert _preop_kinds(gr_a0) == [('wait_lr_sync', None)]
-    assert len(gr_a0.deps) == 0
+    assert _preop_kinds(gr_a0) == []
+    assert len(gr_a0.deps) == 1
 
-    # GR B @s0: dep on LR B @s0 (MT-2) → cross, wait_lr_sync
+    # GR B @s0: dep on LR B @s0 (MT 0, same slot) → same-subIterK, stays in deps
     gr_b0 = [gr for gr in s0.grs if gr.tensor == 'B'][0]
-    assert _preop_kinds(gr_b0) == [('wait_lr_sync', None)]
-    assert len(gr_b0.deps) == 0
+    assert _preop_kinds(gr_b0) == []
+    assert len(gr_b0.deps) == 1
 
     # ── subIterK=1 ──
 
@@ -2077,9 +2077,9 @@ def test_remove_cross_deps_2x2_partition_DU512():
 
     p2 = parts[2]
 
-    # GR A @P2:s0: no deps at all (no LR A in P2) → no preOps
+    # GR A(n+2) @P2:s0: dep on LR A(n) @P0:s0 (MT 0, cross-partition) → wait_lr_sync
     gr_a_p2_s0 = [gr for gr in p2[0].grs if gr.tensor == 'A'][0]
-    assert len(gr_a_p2_s0.preOps) == 0
+    assert _preop_kinds(gr_a_p2_s0) == [('wait_lr_sync', None)]
     assert len(gr_a_p2_s0.deps) == 0
 
     # GR B @P2:s2: dep on LR B @P2:s2 (MT-2) → cross, wait_lr_sync

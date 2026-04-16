@@ -805,22 +805,26 @@ class MFMATileScheduler:
         lr_by_data = [{} for _ in range(numK)]
         # gr_by_tensor[tensor] → list of all GRPlacements (LR→GR deps are cross-partition)
         gr_by_tensor = {}
+        # lr_by_tensor[tensor] → list of all LRPlacements (GR→LR collision is cross-partition)
+        lr_by_tensor = {}
         for slots in self._partitions:
             for slot in slots:
                 for lr in slot.lrs:
                     for data_k in lr.tiles.subIterK_list:
                         lr_by_data[data_k].setdefault(lr.tensor, []).append(lr)
+                    lr_by_tensor.setdefault(lr.tensor, []).append(lr)
                 for gr in slot.grs:
                     gr_by_tensor.setdefault(gr.tensor, []).append(gr)
 
         for pi, slots in enumerate(self._partitions):
-            self._annotate_deps_partition(pi, slots, cfg, lr_by_data, gr_by_tensor)
+            self._annotate_deps_partition(pi, slots, cfg, lr_by_data,
+                                          gr_by_tensor, lr_by_tensor)
 
         self._completed.add('deps')
 
     def _annotate_deps_partition(self, pi: int, slots: List[SubIterKSlot],
                                  cfg: SchedulerConfig, lr_by_data: list,
-                                 gr_by_tensor: dict):
+                                 gr_by_tensor: dict, lr_by_tensor: dict):
         """Annotate deps for a single partition (in-place on placements)."""
         numK = len(slots)
 
@@ -835,20 +839,14 @@ class MFMATileScheduler:
 
         # ── Pass 1: build per-partition lookups ──
         # lr_by_slot[k][tensor] → LRPlacement at subIterK=k
-        # lr_by_mt[(mt, tensor)] → LRPlacement by mtIteration and tensor
-        # lr_for_tensor[tensor] → any LRPlacement for that tensor (fallback)
         # gr_by_slot[k][tensor] → GRPlacement at subIterK=k
-        # (lr_by_data is built globally in annotate_deps and passed in)
+        # (lr_by_data, gr_by_tensor, lr_by_tensor are built globally in annotate_deps)
         lr_by_slot = [{} for _ in range(numK)]
-        lr_by_mt = {}
-        lr_for_tensor = {}
         gr_by_slot = [{} for _ in range(numK)]
 
         for k, slot in enumerate(slots):
             for lr in slot.lrs:
                 lr_by_slot[k][lr.tensor] = lr
-                lr_by_mt[(lr.mtIteration, lr.tensor)] = lr
-                lr_for_tensor[lr.tensor] = lr
 
             for gr in slot.grs:
                 gr_by_slot[k][gr.tensor] = gr
@@ -882,11 +880,6 @@ class MFMATileScheduler:
             # LR→GR: mt difference determines how many iterations back.
             if consumer_type == 'LR' and isinstance(producer, GRPlacement) and consumer:
                 diff = _parse_mt(producer.mtIteration) - _parse_mt(consumer.mtIteration)
-                if diff != 0:
-                    return -diff
-            # GR→LR collision: mt difference determines how many iterations back.
-            if consumer_type == 'GR' and isinstance(producer, LRPlacement) and consumer:
-                diff = _parse_mt(consumer.mtIteration) - _parse_mt(producer.mtIteration)
                 if diff != 0:
                     return -diff
             # Same effective mt: slot ordering decides.
@@ -931,14 +924,22 @@ class MFMATileScheduler:
                             ref=gr, mt_offset=_mt_offset(k, 'LR', gr, consumer=lr)))
 
             # GR: depends on collision LR (LDS double-buffer)
-            # GR (mt="n+2") collides with same buffer as LR (mt="n").
-            # If no LR (mt="n") exists, the same LR instruction loaded
-            # mt="n" data in a previous iteration → fall back to any LR.
+            # GR(n+x) collides with LR(n+x-2) — same buffer, period 2.
+            # target_data = parse_mt(gr.mt) - 2. For each LR of same tensor,
+            # mt_offset = target_data - parse_mt(lr.mt). Dedup keeps latest.
+            #   GR(n+2)→LR(n):   mt_offset = 0   (same iteration)
+            #   GR(n+2)→LR(n+1): mt_offset = -1  (prev iter LR(n+1) handled n)
+            #   GR(n+1)→LR(n):   mt_offset = -1  (prev iter LR(n) handled n-1)
             for gr in slot.grs:
-                lr = lr_by_mt.get(("n", gr.tensor)) or lr_for_tensor.get(gr.tensor)
-                if lr:
-                    gr.deps.append(DepRef(
-                        ref=lr, mt_offset=_mt_offset(k, 'GR', lr, consumer=gr)))
+                target_data = _parse_mt(gr.mtIteration) - 2
+                for lr in lr_by_tensor.get(gr.tensor, []):
+                    if _range_overlaps(lr.tiles, gr.tiles):
+                        mt_off = target_data - _parse_mt(lr.mtIteration)
+                        gr.deps.append(DepRef(ref=lr, mt_offset=mt_off))
+                if not gr.deps:
+                    raise ValueError(
+                        f"GR {gr.tensor} mt={gr.mtIteration} at slot {k} "
+                        f"has no overlapping LR(n) dependency")
 
         # ── Dedup: keep only the single last dep ──
         # Execution order is (MT offset, partition, subIterK). Waiting for the
