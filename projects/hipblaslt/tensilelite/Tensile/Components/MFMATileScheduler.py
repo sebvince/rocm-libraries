@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Optional, Tuple
 import io
+import math
 
 
 # ── Core primitives ─────────────────────────────────────────
@@ -163,6 +164,7 @@ class MFMAPlacement:
     tileB: MFMATileRange       # B tiles consumed
     deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['DepOp'] = field(default_factory=list)     # populated by remove_cross_deps()
+    vgpr_sets: Optional[dict] = None   # {'A': int, 'B': int, 'SA': int, 'SB': int} — populated by assign_vgpr_sets()
 
 
 @dataclass
@@ -175,6 +177,7 @@ class LRPlacement:
     partition: int = 0         # which partition this LR belongs to
     deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['DepOp'] = field(default_factory=list)     # populated by remove_cross_deps()
+    vgpr_set: Optional[int] = None     # set id (0 or 1) — populated by assign_vgpr_sets()
 
 
 @dataclass
@@ -553,6 +556,15 @@ class MFMATileScheduler:
             # Apply deferred wrapping writes for next partition / iteration
             for key, val in deferred:
                 set_map[key] = val
+
+        # Copy set info onto placements
+        for partition_slots in self._partitions:
+            for slot in partition_slots:
+                if slot.mfma and slot.mfma_sets:
+                    slot.mfma.vgpr_sets = dict(slot.mfma_sets)
+                for lr in slot.lrs:
+                    if slot.lr_sets and lr.tensor in slot.lr_sets:
+                        lr.vgpr_set = slot.lr_sets[lr.tensor]
 
         self._completed.add('vgpr')
         return self._partitions[0]
@@ -1484,30 +1496,81 @@ class MFMATileScheduler:
         self._completed.add('emit')
         return all_partitions
 
+    # ── VGPR tile allocation ──────────────────────────────
+
+    def allocVgprTiles(self, writer, tileInfoA, tileInfoB,
+                       scaleTileInfoA=None, scaleTileInfoB=None):
+        """Allocate VGPR tiles for A and B data, with two sets for ping-pong.
+
+        Layout (flat 2x arrays):
+          vgprTilesA: [set0_tile0, set0_tile1, ..., set1_tile0, set1_tile1, ...]
+          vgprTilesB: same layout, sized for numMFMATilesN
+
+        Scale VGPRs: two sets (ping/pong), 1 VGPR per scale group.
+        """
+        from Tensile.Components.SubtileBasedKernel import TileInfo
+
+        cfg = self.config
+        mmaTileRegCount = int(math.ceil(tileInfoA.mmaTileRegCount))
+
+        def alloc_tile_array(count):
+            tiles = []
+            for _ in range(count):
+                tile = TileInfo.RegisterTileInfo(writer.vgprPool)
+                for j in range(0, mmaTileRegCount, 4):
+                    vstart = writer.vgprPool.checkOutAligned(4, 4)
+                    for k in range(4):
+                        tile.append(vstart + k)
+                tiles.append(tile)
+            return tiles
+
+        # 2 sets per tensor dimension
+        self.vgprTilesA = alloc_tile_array(2 * cfg.numMFMATilesM)
+        self.vgprTilesB = alloc_tile_array(2 * cfg.numMFMATilesN)
+        self.numTilesA = cfg.numMFMATilesM
+        self.numTilesB = cfg.numMFMATilesN
+
+        # Scale VGPRs: 1 VGPR per scale group, double-buffered
+        numScaleGroupsA = math.ceil(cfg.numMFMATilesM / 2) if cfg.hasScale else 0
+        numScaleGroupsB = math.ceil(cfg.numMFMATilesN / 2) if cfg.hasScale else 0
+        self.numScaleGroupsA = numScaleGroupsA
+        totalScaleVGPRTiles = numScaleGroupsA + numScaleGroupsB
+
+        self.scaleVgprTiles = []
+        self.scaleVgprTilesAlt = []
+        for _ in range(totalScaleVGPRTiles):
+            self.scaleVgprTiles.append(writer.vgprPool.checkOut(1))
+            self.scaleVgprTilesAlt.append(writer.vgprPool.checkOut(1))
+
+    def deallocVgprTiles(self, writer):
+        """Deallocate VGPR tiles allocated by allocVgprTiles."""
+        for tiles in (self.vgprTilesA, self.vgprTilesB):
+            for tile in tiles:
+                pool = tile.regList.regPool
+                for val in tile:
+                    if tile.index(val) % 4 == 0:
+                        pool.checkIn(val)
+
+        for v in self.scaleVgprTiles:
+            writer.vgprPool.checkIn(v)
+        self.scaleVgprTiles = []
+        for v in self.scaleVgprTilesAlt:
+            writer.vgprPool.checkIn(v)
+        self.scaleVgprTilesAlt = []
+
+        self.vgprTilesA = []
+        self.vgprTilesB = []
+
     # ── Populate instructions ──────────────────────────────
 
     def populate_instructions(self, writer, kernel,
                               tileInfoA, tileInfoB, dtileInfo,
-                              vgprTiles,
-                              scaleTileInfoA=None, scaleTileInfoB=None,
-                              scaleVgprTiles=None, scaleVgprTilesAlt=None,
-                              scaleSet=0, scaleLRSet=0) -> None:
+                              scaleTileInfoA=None, scaleTileInfoB=None) -> None:
         """Populate EmittedModule.instructions from placements and preOps.
 
-        Walks self._emitted (produced by emit()) and fills each EmittedModule's
-        instructions list based on its opType and the original source placement/DepOp.
-
-        Args:
-            writer: Kernel writer (for register pools, emitters).
-            kernel: Kernel config dict.
-            tileInfoA/B: TileInfo for A and B matrices.
-            dtileInfo: TileInfo for D (destination) matrix.
-            vgprTiles: List of RegisterTileInfo for A/B data VGPRs.
-            scaleTileInfoA/B: TileInfo for scale tensors (optional).
-            scaleVgprTiles: Set 0 of scale VGPRs (optional).
-            scaleVgprTilesAlt: Set 1 of scale VGPRs (optional).
-            scaleSet: Which scale VGPR set MFMA reads from (0 or 1).
-            scaleLRSet: Which scale VGPR set LR writes to (0 or 1).
+        Uses self.vgprTilesA, vgprTilesB, scaleVgprTiles, scaleVgprTilesAlt
+        allocated by allocVgprTiles(). Per-subIterK set selection is read from
+        placement.vgpr_sets (MFMA) and placement.vgpr_set (LR).
         """
         if 'emit' not in self._completed:
             self.emit()
@@ -1516,10 +1579,12 @@ class MFMATileScheduler:
 
         emitter = InstructionEmitter(
             writer, kernel, self.config,
-            tileInfoA, tileInfoB, dtileInfo, vgprTiles,
+            tileInfoA, tileInfoB, dtileInfo,
+            self.vgprTilesA, self.vgprTilesB,
+            self.numTilesA, self.numTilesB,
             scaleTileInfoA, scaleTileInfoB,
-            scaleVgprTiles, scaleVgprTilesAlt,
-            scaleSet, scaleLRSet,
+            self.scaleVgprTiles, self.scaleVgprTilesAlt,
+            self.numScaleGroupsA,
         )
         emitter.populate(self._emitted)
 

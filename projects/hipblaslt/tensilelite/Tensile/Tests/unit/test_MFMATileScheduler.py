@@ -2563,16 +2563,13 @@ def test_populate_instructions_256x256_fp4():
 
     Sets up the full kernel infrastructure (TileInfo, VGPR allocation, writer)
     and runs MFMATileScheduler through emit → populate_instructions → instructionSchedule.
+    Uses the scheduler's own allocVgprTiles for self-contained VGPR management.
     """
     from types import SimpleNamespace
     from rocisa import rocIsa
     from rocisa.register import RegisterPool
     from rocisa.enum import RegisterType
-    from Tensile.Components.SubtileBasedScheduler import (
-        SubtileBasedScheduler,
-        SchedulerConfig as SubtileSchedulerConfig,
-        PrefetchMode,
-    )
+    from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler
 
     # Initialize rocIsa
     ri = rocIsa.getInstance()
@@ -2609,30 +2606,22 @@ def test_populate_instructions_256x256_fp4():
     scaleTiA.allocOffsetRegisters(writer, kernel)
     scaleTiB.allocOffsetRegisters(writer, kernel)
 
-    # Use SubtileBasedScheduler for VGPR tile allocation
-    lsgA = tiA.localSubtileGrid[0]
-    lsgB = tiB.localSubtileGrid[0]
-    subtileCfg = SubtileSchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH)
-    subtileSched = SubtileBasedScheduler(tiA, tiB, subtileCfg,
-                                         scaleTileInfoA=scaleTiA,
-                                         scaleTileInfoB=scaleTiB)
-    subtileSched.allocVgprTiles(writer)
+    # Build MFMATileScheduler logical schedule
+    cfg = make_256x256_fp4()
+    sched = MFMATileScheduler(cfg)
+    sched.emit()
+
+    # Allocate VGPR tiles using scheduler's own method
+    sched.allocVgprTiles(writer, tiA, tiB,
+                         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
 
     try:
-        # Build MFMATileScheduler logical schedule
-        cfg = make_256x256_fp4()
-        sched = MFMATileScheduler(cfg)
-        sched.emit()
-
         # Populate instructions
         sched.populate_instructions(
             writer, kernel,
             tileInfoA=tiA, tileInfoB=tiB,
             dtileInfo=dTileInfo,
-            vgprTiles=subtileSched.vgprTiles,
             scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-            scaleVgprTiles=subtileSched.scaleVgprTiles,
-            scaleVgprTilesAlt=subtileSched.scaleVgprTilesAlt,
         )
 
         # Verify instructions were populated
@@ -2641,6 +2630,16 @@ def test_populate_instructions_256x256_fp4():
                 for em in emitted:
                     assert len(em.instructions) > 0, \
                         f"P{pi} subIterK={k} [{em.moduleId}] {em.opType}: no instructions"
+
+        # Verify ping-pong: MFMA and LR at same subIterK use different VGPR sets
+        for pi, slots in enumerate(sched._partitions):
+            for slot in slots:
+                if slot.mfma and slot.mfma.vgpr_sets and slot.lrs:
+                    for lr in slot.lrs:
+                        if lr.vgpr_set is not None and lr.tensor in slot.mfma.vgpr_sets:
+                            assert lr.vgpr_set != slot.mfma.vgpr_sets[lr.tensor], \
+                                f"P{pi} subIterK={slot.subIterK}: MFMA and LR {lr.tensor} " \
+                                f"use same VGPR set {lr.vgpr_set}"
 
         # Call instructionSchedule on each subIterK and verify no crash
         for pi, partition_emitted in enumerate(sched._emitted):
@@ -2661,7 +2660,7 @@ def test_populate_instructions_256x256_fp4():
                     print(f"    {str(inst)}")
 
     finally:
-        subtileSched.deallocVgprTiles(writer)
+        sched.deallocVgprTiles(writer)
 
 
 # ── Standalone mode ─────────────────────────────────────────
