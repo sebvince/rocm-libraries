@@ -2103,6 +2103,86 @@ def test_remove_cross_deps_2x2_partition_DU512():
     assert lr_sa_p3_s2.preOps[0].wait_gr_counts.SA == 1
 
 
+def _preop_inc_tensors(placement, kind):
+    """Return list of tensor names for preOps of given kind on a placement."""
+    return [op.tensor for op in placement.preOps if op.kind == kind]
+
+
+def test_insert_gr_lr_inc_1x1_partition_DU256():
+    """Step 5: 256x256, DU256, FP4, 1 partition, 2 subIterKs.
+
+    After insert_gr_lr_inc, lr_inc/gr_inc preOps are inserted at MT transitions.
+    Per-tensor tracking in global execution order (LRs then GRs per slot):
+
+      s0: LR A(n), LR B(n), LR SA(n+1), GR A(n+2), GR B(n+2)
+      s1: LR A(n+1), LR B(n+1), LR SB(n+1), GR B(n+2), GR SA(n+2), GR SB(n+2)
+
+    MT transitions per tensor:
+      A:  LR A s0 (n) → GR A s0 (n+2)  → LR A s1 (n+1)
+      B:  LR B s0 (n) → GR B s0 (n+2)  → LR B s1 (n+1) → GR B s1 (n+2)
+      SA: LR SA s0 (n+1) → GR SA s1 (n+2)
+      SB: LR SB s1 (n+1) → GR SB s1 (n+2)
+    """
+    cfg = make_256x256_fp4()
+    sched = MFMATileScheduler(cfg)
+    sched.insert_gr_lr_inc()
+    parts = sched._partitions
+    print(sched.print_remove_deps())
+
+    s0 = parts[0][0]
+    s1 = parts[0][1]
+
+    # ── subIterK=0 ──
+
+    # MFMA: no inc preOps (MFMAs not checked)
+    assert _preop_inc_tensors(s0.mfma, 'lr_inc') == []
+    assert _preop_inc_tensors(s0.mfma, 'gr_inc') == []
+
+    # LR A @s0: mt=n, first seen → no inc
+    assert _preop_inc_tensors(_get_lr(s0, 'A'), 'lr_inc') == []
+
+    # LR B @s0: mt=n, first seen → no inc
+    assert _preop_inc_tensors(_get_lr(s0, 'B'), 'lr_inc') == []
+
+    # LR SA @s0: mt=n+1, first seen → no inc
+    assert _preop_inc_tensors(_get_lr(s0, 'SA'), 'lr_inc') == []
+
+    # GR A @s0: mt=n+2, A was n → switch → gr_inc(A)
+    gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
+    assert _preop_inc_tensors(gr_a0, 'gr_inc') == ['A']
+
+    # GR B @s0: mt=n+2, B was n → switch → gr_inc(B)
+    gr_b0 = [gr for gr in s0.grs if gr.tensor == 'B'][0]
+    assert _preop_inc_tensors(gr_b0, 'gr_inc') == ['B']
+
+    # ── subIterK=1 ──
+
+    # LR A @s1: mt=n+1, A was n+2 → switch → lr_inc(A)
+    assert _preop_inc_tensors(_get_lr(s1, 'A'), 'lr_inc') == ['A']
+    # Also has wait_gr from remove_cross_deps — lr_inc is appended after
+    lr_a1 = _get_lr(s1, 'A')
+    assert lr_a1.preOps[0].kind == 'wait_gr'
+    assert lr_a1.preOps[1].kind == 'lr_inc'
+
+    # LR B @s1: mt=n+1, B was n+2 → switch → lr_inc(B)
+    assert _preop_inc_tensors(_get_lr(s1, 'B'), 'lr_inc') == ['B']
+
+    # LR SB @s1: mt=n+1, first seen → no inc
+    assert _preop_inc_tensors(_get_lr(s1, 'SB'), 'lr_inc') == []
+
+    # GR B @s1: mt=n+2, B was n+1 → switch → gr_inc(B)
+    gr_b1 = [gr for gr in s1.grs if gr.tensor == 'B'][0]
+    assert _preop_inc_tensors(gr_b1, 'gr_inc') == ['B']
+
+    # GR SA @s1: mt=n+2, SA was n+1 → switch → gr_inc(SA)
+    gr_sa1 = [gr for gr in s1.grs if gr.tensor == 'SA'][0]
+    assert _preop_inc_tensors(gr_sa1, 'gr_inc') == ['SA']
+
+    # GR SB @s1: mt=n+2, SB was n+1 → switch → gr_inc(SB)
+    gr_sb1 = [gr for gr in s1.grs if gr.tensor == 'SB'][0]
+    assert _preop_inc_tensors(gr_sb1, 'gr_inc') == ['SB']
+
+
 def test_compute_inflight_loads():
     """Unit test for _compute_inflight_loads.
 

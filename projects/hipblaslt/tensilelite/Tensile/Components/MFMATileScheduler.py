@@ -3,11 +3,13 @@
 Builds a logical schedule using MFMA tile indices as the core primitive,
 with explicit per-operation load granularity for GR/LR on A, B, SA, SB.
 
-The schedule is built in 6 passes:
+The schedule is built in 7 passes:
   place_LRs        — place LRs based on their granularities
   assign_vgpr_sets — assign VGPR tile sets (ping-pong) based on subIterK dependencies
   place_GRs        — place GRs
   annotate_deps    — annotate raw per-op dependencies
+  remove_cross_deps— replace cross-subIterK deps with wait preOps
+  insert_gr_lr_inc    — insert lr_inc/gr_inc preOps at MT transitions
   group            — serialize and group (produce paths for instructionSchedule)
   emit             — produce List[EmittedModule] with before-link chains
 """
@@ -1067,6 +1069,38 @@ class MFMATileScheduler:
                         gr.preOps.append(DepOp(kind='wait_lr_sync'))
 
         self._completed.add('remove_deps')
+
+    def insert_gr_lr_inc(self):
+        """Insert gr_inc/lr_inc preOps at MacroTile iteration transitions.
+
+        Walks all LR and GR placements in global execution order
+        (partition 0 slots → partition 1 slots → ..., within each slot: LR then GR).
+        Tracks per-tensor the last-seen mtIteration. When a tensor's mtIteration
+        changes, inserts a DepOp into that placement's preOps:
+          - lr_inc for LR placements
+          - gr_inc for GR placements
+        """
+        if 'remove_deps' not in self._completed:
+            self.remove_cross_deps()
+
+        last_mt = {}  # tensor -> mtIteration string
+
+        for pi, slots in enumerate(self._partitions):
+            for slot in slots:
+                for lr in slot.lrs:
+                    tensor = lr.tensor
+                    mt = lr.mtIteration
+                    if tensor in last_mt and last_mt[tensor] != mt:
+                        lr.preOps.append(DepOp(kind='lr_inc', tensor=tensor))
+                    last_mt[tensor] = mt
+                for gr in slot.grs:
+                    tensor = gr.tensor
+                    mt = gr.mtIteration
+                    if tensor in last_mt and last_mt[tensor] != mt:
+                        gr.preOps.append(DepOp(kind='gr_inc', tensor=tensor))
+                    last_mt[tensor] = mt
+
+        self._completed.add('gr_inc')
 
     def _split_deps(self, deps: List[DepRef], consumer_pi: int,
                     consumer_slot: int) -> Tuple[List[DepRef], List[DepRef]]:
