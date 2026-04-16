@@ -2556,10 +2556,119 @@ def test_emit_1x1_partition_DU256():
                     f"module {e.moduleId} has self-loop"
 
 
+# ── Integration test: populate_instructions ───────────────
+
+def test_populate_instructions_256x256_fp4():
+    """Integration test: populate_instructions with real writer/kernel/VGPR state.
+
+    Sets up the full kernel infrastructure (TileInfo, VGPR allocation, writer)
+    and runs MFMATileScheduler through emit → populate_instructions → instructionSchedule.
+    """
+    from types import SimpleNamespace
+    from rocisa import rocIsa
+    from rocisa.register import RegisterPool
+    from rocisa.enum import RegisterType
+    from Tensile.Components.SubtileBasedScheduler import (
+        SubtileBasedScheduler,
+        SchedulerConfig as SubtileSchedulerConfig,
+        PrefetchMode,
+    )
+
+    # Initialize rocIsa
+    ri = rocIsa.getInstance()
+    if not ri.isInit():
+        import shutil
+        asmpath = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asmpath)
+    ri.setKernel((9, 5, 0), 64)
+
+    # Create kernel + TileInfo
+    kernel = create_kernel(256, 256, fp4=True)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+
+    # Create writer with register pools
+    writer = SimpleNamespace()
+    writer.vgprPool = RegisterPool(0, RegisterType.Vgpr, False)
+    writer.agprPool = RegisterPool(0, RegisterType.Accvgpr, False)
+    writer.sgprPool = RegisterPool(0, RegisterType.Sgpr, False)
+    writer.states = SimpleNamespace(
+        regCaps={"MaxSgpr": 106, "MaxVgpr": 256, "PhysicalMaxVgpr": 512},
+    )
+    dTileInfo = TileInfo('D', kernel)
+    dTileInfo.allocVgprTileRegisters(writer, kernel)
+    writer.states.d = SimpleNamespace(tileInfo=dTileInfo)
+    writer.states.a = SimpleNamespace(tileInfo=tiA)
+    writer.states.b = SimpleNamespace(tileInfo=tiB)
+    writer.states.mxsa = SimpleNamespace(tileInfo=scaleTiA)
+    writer.states.mxsb = SimpleNamespace(tileInfo=scaleTiB)
+    tiA.allocOffsetRegisters(writer, kernel)
+    tiB.allocOffsetRegisters(writer, kernel)
+    scaleTiA.allocOffsetRegisters(writer, kernel)
+    scaleTiB.allocOffsetRegisters(writer, kernel)
+
+    # Use SubtileBasedScheduler for VGPR tile allocation
+    lsgA = tiA.localSubtileGrid[0]
+    lsgB = tiB.localSubtileGrid[0]
+    subtileCfg = SubtileSchedulerConfig(lsgA, lsgB, PrefetchMode.HALF_PREFETCH)
+    subtileSched = SubtileBasedScheduler(tiA, tiB, subtileCfg,
+                                         scaleTileInfoA=scaleTiA,
+                                         scaleTileInfoB=scaleTiB)
+    subtileSched.allocVgprTiles(writer)
+
+    try:
+        # Build MFMATileScheduler logical schedule
+        cfg = make_256x256_fp4()
+        sched = MFMATileScheduler(cfg)
+        sched.emit()
+
+        # Populate instructions
+        sched.populate_instructions(
+            writer, kernel,
+            tileInfoA=tiA, tileInfoB=tiB,
+            dtileInfo=dTileInfo,
+            vgprTiles=subtileSched.vgprTiles,
+            scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+            scaleVgprTiles=subtileSched.scaleVgprTiles,
+            scaleVgprTilesAlt=subtileSched.scaleVgprTilesAlt,
+        )
+
+        # Verify instructions were populated
+        for pi, partition_emitted in enumerate(sched._emitted):
+            for k, emitted in enumerate(partition_emitted):
+                for em in emitted:
+                    assert len(em.instructions) > 0, \
+                        f"P{pi} subIterK={k} [{em.moduleId}] {em.opType}: no instructions"
+
+        # Call instructionSchedule on each subIterK and verify no crash
+        for pi, partition_emitted in enumerate(sched._emitted):
+            for k, emitted in enumerate(partition_emitted):
+                scheduled = SubtileBasedScheduler.instructionSchedule(emitted)
+                insts = list(scheduled.flatitems())
+                assert len(insts) > 0, \
+                    f"P{pi} subIterK={k}: instructionSchedule returned empty"
+
+        # Print for visualization
+        for pi, partition_emitted in enumerate(sched._emitted):
+            print(f"Partition {pi}:")
+            for k, emitted in enumerate(partition_emitted):
+                scheduled = SubtileBasedScheduler.instructionSchedule(emitted)
+                insts = list(scheduled.flatitems())
+                print(f"  subIterK={k}: {len(insts)} instructions")
+                for inst in insts:
+                    print(f"    {str(inst)}")
+
+    finally:
+        subtileSched.deallocVgprTiles(writer)
+
+
 # ── Standalone mode ─────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
+    import io
 
     # Build config from TileInfo (MT=64, fp4 = Example Granularities 1)
     kernel = create_kernel(256, 256, fp4=True)
@@ -2610,3 +2719,38 @@ if __name__ == "__main__":
         print(output)
         if interactive and i < len(steps) - 1:
             input("Press Enter for next step...")
+
+    # ── instructionSchedule: extract paths and validate topology ──
+    from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler
+
+    all_emitted = sched._emitted
+    buf = io.StringIO()
+    buf.write("MAINLOOP (instructionSchedule):\n")
+    for pi, partition_emitted in enumerate(all_emitted):
+        buf.write(f"  Partition {pi}:\n")
+        for k, emitted in enumerate(partition_emitted):
+            buf.write(f"    subIterK={k}:\n")
+
+            scheduled = SubtileBasedScheduler.instructionSchedule(emitted)
+
+            # Display paths that instructionSchedule extracts
+            mfmaIdx, paths = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted)
+            mfma_em = emitted[mfmaIdx]
+            buf.write(f"      MFMA [{mfma_em.moduleId}]: {mfma_em.label}\n")
+            for pi2, path in enumerate(paths):
+                labels = [f"[{emitted[mid].moduleId}] {emitted[mid].opType}" for mid in path]
+                buf.write(f"      Path {pi2}: {' -> '.join(labels)}\n")
+
+            # Display flattened instructions from instructionSchedule
+            insts = list(scheduled.flatitems())
+            if insts:
+                buf.write(f"      Instructions:\n")
+                for inst in insts:
+                    buf.write(f"        {str(inst)}\n")
+            else:
+                buf.write(f"      Instructions: (empty — logical level, no GPU instructions)\n")
+
+    print(f"{'=' * 60}")
+    print(f"  Step 9: instructionSchedule")
+    print(f"{'=' * 60}")
+    print(buf.getvalue())

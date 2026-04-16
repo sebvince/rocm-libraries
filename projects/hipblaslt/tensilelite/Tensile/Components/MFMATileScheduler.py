@@ -300,6 +300,7 @@ class EmittedModule:
     before: Optional[int] = None   # moduleId that must complete before this module
     opType: str = ""
     label: str = ""                # human-readable label for debugging
+    source: object = None          # original placement or DepOp, for populate_instructions
 
 
 # ── Main scheduler class ───────────────────────────────────
@@ -1401,10 +1402,10 @@ class MFMATileScheduler:
                 emitted: List[EmittedModule] = []
                 placement_to_id = {}
 
-                def add(opType: str, label: str) -> int:
+                def add(opType: str, label: str, source: object = None) -> int:
                     mid = len(emitted)
                     emitted.append(EmittedModule(
-                        moduleId=mid, opType=opType, label=label))
+                        moduleId=mid, opType=opType, label=label, source=source))
                     return mid
 
                 def setBefore(moduleId: int, beforeId: int) -> None:
@@ -1428,7 +1429,7 @@ class MFMATileScheduler:
 
                 for opType, placement in placements:
                     label = self._format_placement_label(placement, slot)
-                    mid = add(opType, label)
+                    mid = add(opType, label, source=placement)
                     placement_to_id[id(placement)] = mid
 
                 # Step 2: wire before-chains from preOps + deps
@@ -1442,22 +1443,24 @@ class MFMATileScheduler:
                         if preOp.kind == 'wait_gr':
                             # Standalone: no incoming before-link, but later
                             # deps chain from it
-                            depId = add('wait_gr', str(preOp))
+                            depId = add('wait_gr', str(preOp), source=preOp)
                             prevId = depId
                             continue
                         elif preOp.kind == 'wait_lr_sync':
                             # Expand to wait_lr + sync
-                            depId = add('wait_lr', 'wait_lr')
+                            depId = add('wait_lr', 'wait_lr',
+                                        source=DepOp(kind='wait_lr'))
                             setBefore(depId, prevId)
                             prevId = depId
                             lastDepId = depId
-                            depId = add('sync', 'sync')
+                            depId = add('sync', 'sync',
+                                        source=DepOp(kind='sync'))
                             setBefore(depId, prevId)
                             prevId = depId
                             lastDepId = depId
                             continue
                         else:
-                            depId = add(preOp.kind, str(preOp))
+                            depId = add(preOp.kind, str(preOp), source=preOp)
                             setBefore(depId, prevId)
                             prevId = depId
                             lastDepId = depId
@@ -1480,6 +1483,202 @@ class MFMATileScheduler:
         self._emitted = all_partitions
         self._completed.add('emit')
         return all_partitions
+
+    # ── Populate instructions ──────────────────────────────
+
+    def populate_instructions(self, writer, kernel,
+                              tileInfoA, tileInfoB, dtileInfo,
+                              vgprTiles,
+                              scaleTileInfoA=None, scaleTileInfoB=None,
+                              scaleVgprTiles=None, scaleVgprTilesAlt=None,
+                              scaleSet=0, scaleLRSet=0) -> None:
+        """Populate EmittedModule.instructions from placements and preOps.
+
+        Walks self._emitted (produced by emit()) and fills each EmittedModule's
+        instructions list based on its opType and the original source placement/DepOp.
+
+        Args:
+            writer: Kernel writer (for register pools, emitters).
+            kernel: Kernel config dict.
+            tileInfoA/B: TileInfo for A and B matrices.
+            dtileInfo: TileInfo for D (destination) matrix.
+            vgprTiles: List of RegisterTileInfo for A/B data VGPRs.
+            scaleTileInfoA/B: TileInfo for scale tensors (optional).
+            scaleVgprTiles: Set 0 of scale VGPRs (optional).
+            scaleVgprTilesAlt: Set 1 of scale VGPRs (optional).
+            scaleSet: Which scale VGPR set MFMA reads from (0 or 1).
+            scaleLRSet: Which scale VGPR set LR writes to (0 or 1).
+        """
+        if 'emit' not in self._completed:
+            self.emit()
+
+        from Tensile.Components.SubtileBasedKernel import (
+            emitMfmaInstruction, emitSingleDsRead, emitSingleBufferLoad,
+            globalReadPtrUpdates, globalReadLDSBufferSwap,
+            localReadLDSBufferSwap,
+            globalReadDoScaleSubtile, globalReadScalePtrUpdates,
+        )
+        from rocisa.code import Module
+        from rocisa.instruction import SWaitCnt, SBarrier, DSLoadB32
+        from rocisa.container import vgpr, DSModifiers
+
+        hasScale = scaleTileInfoA is not None and scaleTileInfoB is not None
+        subtileShapeK = tileInfoA.subtileShape[1]
+
+        # Map tensor name to tileInfo
+        tileInfoMap = {'A': tileInfoA, 'B': tileInfoB}
+        if hasScale:
+            tileInfoMap['SA'] = scaleTileInfoA
+            tileInfoMap['SB'] = scaleTileInfoB
+
+        def _emit_mfma(placement):
+            """Emit MFMA instructions from MFMAPlacement."""
+            module = Module()
+            scaleTiles = scaleVgprTiles if scaleSet == 0 else scaleVgprTilesAlt
+            subIterK = placement.subIterK
+
+            for a in placement.tileA.tileId_list:
+                for b in placement.tileB.tileId_list:
+                    # VGPR lookup: use VGPRSetAssignment from assign_vgpr_sets
+                    # For now, use tileId directly as VGPR index
+                    # (matches SubtileBasedScheduler when subtileShape[0]=1)
+                    aTile = vgprTiles[a]
+                    bTile = vgprTiles[b]
+                    dTile = dtileInfo.vgprTiles[a + b * dtileInfo.localMMATileGrid[0]]
+
+                    if hasScale:
+                        scaleGroupA = a // 2
+                        scaleGroupB = b // 2
+                        numScaleGroupsA = (self.config.numMFMATilesM + 1) // 2
+                        scaleAVgpr = scaleTiles[scaleGroupA]
+                        scaleBVgpr = scaleTiles[numScaleGroupsA + scaleGroupB]
+                        sAsel = (a % 2) + 2 * subIterK
+                        sBsel = (b % 2) + 2 * subIterK
+                    else:
+                        scaleAVgpr = scaleBVgpr = -1
+                        sAsel = sBsel = 0
+
+                    module.add(emitMfmaInstruction(
+                        writer, kernel, aTile, bTile, dTile, dTile,
+                        scaleAVgpr=scaleAVgpr, scaleBVgpr=scaleBVgpr,
+                        scaleAsel=sAsel, scaleBsel=sBsel,
+                        comment=f"MFMA C[{a},{b}] += A[{a},K={subIterK}] * B[{b},K={subIterK}]"))
+            return list(module.flatitems())
+
+        def _emit_lr(placement):
+            """Emit LR (ds_read) instructions from LRPlacement."""
+            module = Module()
+            tensor = placement.tensor
+            if tensor in ('A', 'B'):
+                ti = tileInfoMap[tensor]
+                for tileId in placement.tiles.tileId_list:
+                    for k in placement.tiles.subIterK_list:
+                        subtileK = k // subtileShapeK
+                        subIterK_within = k % subtileShapeK
+                        dstTile = vgprTiles[tileId]
+                        module.add(emitSingleDsRead(
+                            ti, tileId, subtileK, subIterK_within, dstTile))
+            elif tensor in ('SA', 'SB'):
+                # Scale LR: DSLoadB32
+                tc = 'MXSA' if tensor == 'SA' else 'MXSB'
+                ti = tileInfoMap[tensor]
+                scaleTiles = scaleVgprTiles if scaleLRSet == 0 else scaleVgprTilesAlt
+                groupStride = 2 * ti.subtileSize
+                for tileId in placement.tiles.tileId_list:
+                    scaleGroupIdx = tileId // 2
+                    numScaleGroupsA = (self.config.numMFMATilesM + 1) // 2
+                    vid = scaleGroupIdx if tensor == 'SA' else numScaleGroupsA + scaleGroupIdx
+                    for k in placement.tiles.subIterK_list:
+                        subtileK = k // subtileShapeK
+                        dsOffset = groupStride * (scaleGroupIdx * (self.config.numSubIterK // subtileShapeK) + subtileK)
+                        vdst = scaleTiles[vid]
+                        module.add(DSLoadB32(
+                            dst=vgpr(vdst),
+                            src=vgpr(ti.sharedVgprLROffset[0]),
+                            ds=DSModifiers(offset=dsOffset),
+                            comment=f"scale{tc}[group{scaleGroupIdx},K={k}]: load 4B from LDS"))
+            return list(module.flatitems())
+
+        def _emit_gr(placement):
+            """Emit GR (buffer_load) instructions from GRPlacement."""
+            module = Module()
+            tensor = placement.tensor
+            if tensor in ('A', 'B'):
+                ti = tileInfoMap[tensor]
+                for tileId in placement.tiles.tileId_list:
+                    for k in placement.tiles.subIterK_list:
+                        subtileK = k // subtileShapeK
+                        module.add(emitSingleBufferLoad(ti, kernel, tileId, subtileK))
+            elif tensor in ('SA', 'SB'):
+                tc = 'MXSA' if tensor == 'SA' else 'MXSB'
+                module.add(globalReadDoScaleSubtile(tc, writer, kernel))
+            return list(module.flatitems())
+
+        def _emit_wait_gr(source):
+            """Emit SWaitCnt for wait_gr from DepOp with wait_gr_counts."""
+            counts = source.wait_gr_counts
+            if counts is None:
+                return []
+            grCnt = (int(counts.A / tileInfoA.loadRatioGR) +
+                     int(counts.B / tileInfoB.loadRatioGR) +
+                     counts.SA + counts.SB)
+            return [SWaitCnt(vlcnt=grCnt, vscnt=-1,
+                             comment=f"Wait GR: A={counts.A} B={counts.B} SA={counts.SA} SB={counts.SB} => vlcnt={grCnt}")]
+
+        def _emit_wait_lr():
+            return [SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1,
+                             comment="Wait for LR to complete")]
+
+        def _emit_sync():
+            return [SBarrier(comment="Barrier")]
+
+        def _emit_lr_inc(source):
+            """Emit localReadLDSBufferSwap for a single tensor."""
+            tensor = source.tensor
+            tc = {'A': 'A', 'B': 'B', 'SA': 'MXSA', 'SB': 'MXSB'}.get(tensor, tensor)
+            module = Module()
+            module.add(localReadLDSBufferSwap(tc, writer, kernel))
+            return list(module.flatitems())
+
+        def _emit_gr_inc(source):
+            """Emit globalReadPtrUpdates + globalReadLDSBufferSwap for a single tensor."""
+            tensor = source.tensor
+            tc = {'A': 'A', 'B': 'B', 'SA': 'MXSA', 'SB': 'MXSB'}.get(tensor, tensor)
+            module = Module()
+            module.add(globalReadPtrUpdates(tc, writer, kernel))
+            module.add(globalReadLDSBufferSwap(tc, writer, kernel))
+            if tensor in ('SA', 'SB'):
+                module.add(globalReadScalePtrUpdates(tc, writer, kernel))
+            return list(module.flatitems())
+
+        def _emit_gr_scale(source):
+            """Emit scale global reads."""
+            module = Module()
+            module.add(globalReadDoScaleSubtile('MXSA', writer, kernel))
+            module.add(globalReadDoScaleSubtile('MXSB', writer, kernel))
+            return list(module.flatitems())
+
+        # Dispatch table
+        dispatch = {
+            'mfma': lambda em: _emit_mfma(em.source),
+            'lr': lambda em: _emit_lr(em.source),
+            'gr': lambda em: _emit_gr(em.source),
+            'wait_gr': lambda em: _emit_wait_gr(em.source),
+            'wait_lr': lambda em: _emit_wait_lr(),
+            'sync': lambda em: _emit_sync(),
+            'lr_inc': lambda em: _emit_lr_inc(em.source),
+            'gr_inc': lambda em: _emit_gr_inc(em.source),
+            'gr_scale': lambda em: _emit_gr_scale(em.source),
+        }
+
+        for partition_emitted in self._emitted:
+            for emitted in partition_emitted:
+                for em in emitted:
+                    handler = dispatch.get(em.opType)
+                    if handler:
+                        em.instructions = handler(em)
+
+        self._completed.add('populate')
 
     # ── Print helpers ───────────────────────────────────────
 
