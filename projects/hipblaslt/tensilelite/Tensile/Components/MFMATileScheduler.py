@@ -160,6 +160,7 @@ class MFMAPlacement:
     tileA: MFMATileRange       # A tiles consumed
     tileB: MFMATileRange       # B tiles consumed
     deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
+    preOps: List['DepOp'] = field(default_factory=list)     # populated by remove_cross_deps()
 
 
 @dataclass
@@ -171,6 +172,7 @@ class LRPlacement:
     subIterK_slot: int         # which subIterK this LR is placed in
     partition: int = 0         # which partition this LR belongs to
     deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
+    preOps: List['DepOp'] = field(default_factory=list)     # populated by remove_cross_deps()
 
 
 @dataclass
@@ -182,6 +184,7 @@ class GRPlacement:
     subIterK_slot: int         # which subIterK this GR is placed in
     partition: int = 0         # which partition this GR belongs to
     deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
+    preOps: List['DepOp'] = field(default_factory=list)     # populated by remove_cross_deps()
 
 
 # ── Per-subIterK container ──────────────────────────────────
@@ -210,6 +213,23 @@ class VGPRSetAssignment:
 # ── Dependency types ────────────────────────────────────────
 
 @dataclass
+class WaitGRCounts:
+    """Per-tensor inflight load counts for wait_gr preOp."""
+    A: int = 0
+    B: int = 0
+    SA: int = 0
+    SB: int = 0
+
+    def __str__(self):
+        parts = []
+        for t in ('A', 'B', 'SA', 'SB'):
+            v = getattr(self, t)
+            if v:
+                parts.append(f"{t}={v}")
+        return ",".join(parts) if parts else "0"
+
+
+@dataclass
 class DepOp:
     """A typed dependency in a before-chain.
 
@@ -227,8 +247,11 @@ class DepOp:
     kind: str
     tensor: str = ""
     ref: Optional[object] = None  # placement (annotate_deps) or AnnotatedOp (group)
+    wait_gr_counts: Optional[WaitGRCounts] = None  # only for kind='wait_gr'
 
     def __str__(self):
+        if self.kind == 'wait_gr' and self.wait_gr_counts:
+            return f"wait_gr({self.wait_gr_counts})"
         if self.tensor:
             return f"{self.kind}({self.tensor})"
         return self.kind
@@ -933,6 +956,134 @@ class MFMATileScheduler:
             for gr in slot.grs:
                 gr.deps = _dedup_deps(gr.deps)
 
+    # ── Remove cross-subIterK deps ─────────────────────────
+
+    def _gr_granularity(self, tensor: str) -> ReadGranularity:
+        """Return GR granularity for a tensor."""
+        return {'A': self.config.grA, 'B': self.config.grB,
+                'SA': self.config.grSA, 'SB': self.config.grSB}[tensor]
+
+    def _compute_inflight_loads(self, consumer_pi: int, consumer_slot: int,
+                                tensor: str, dep_ref: DepRef) -> int:
+        """Count inflight GR atomic loads between a dep GR and the consumer.
+
+        Walks backward through the flattened schedule (all partitions x subIterK)
+        from the consumer position, counting atomic GR loads for `tensor`.
+        Stops when reaching the dependency GR (dep_ref.ref) after accounting
+        for mt_offset wraps.
+
+        Returns the number of inflight atomic loads.
+        """
+        gr_gran = self._gr_granularity(tensor)
+        numP = len(self._partitions)
+        numK = len(self._partitions[0])
+        flat_len = numP * numK
+
+        # Flatten: flat_idx = pi * numK + slot_k
+        consumer_flat = consumer_pi * numK + consumer_slot
+
+        # How many full wraps we need before stopping at the dep.
+        # mt_offset is negative (e.g., -1 = previous MT, -2 = two MTs back).
+        wraps_needed = abs(dep_ref.mt_offset)
+        # If the dep is in the same MT (mt_offset == 0) we still walk backward
+        # up to the dep within the current "unwrapped" iteration.
+        # wraps_completed tracks how many full-loop wraps we've done.
+
+        count = 0
+        wraps_completed = 0
+        pos = consumer_flat
+
+        # Walk backward; maximum steps = wraps_needed * flat_len + flat_len
+        # (at most wraps_needed full loops + the partial first loop).
+        max_steps = (wraps_needed + 1) * flat_len
+        for _ in range(max_steps):
+            pos = (pos - 1) % flat_len
+            if pos == flat_len - 1 and _ > 0:
+                # We just wrapped around the loop boundary
+                wraps_completed += 1
+
+            pi = pos // numK
+            slot_k = pos % numK
+            slot = self._partitions[pi][slot_k]
+
+            for gr in slot.grs:
+                if gr.tensor != tensor:
+                    continue
+                # Check if this is the dependency GR
+                if gr is dep_ref.ref and wraps_completed >= wraps_needed:
+                    return count
+                # Count atomic loads for this GR
+                tiles = gr.tiles
+                n_tile = (tiles.tileId_end - tiles.tileId_start) // gr_gran.size.mn
+                n_k = (tiles.subIterK_end - tiles.subIterK_start) // gr_gran.size.k
+                count += n_tile * n_k
+
+        return count
+
+    def remove_cross_deps(self):
+        """Replace cross-subIterK deps with wait preOps.
+
+        For each placement, separates deps into same-subIterK (kept) and
+        cross-subIterK (converted to preOps):
+          - MFMA depending on LRs → single wait_lr
+          - GR depending on LRs   → single wait_lr_sync
+          - LR depending on GRs   → single wait_gr with per-tensor inflight counts
+        """
+        if 'deps' not in self._completed:
+            self.annotate_deps()
+
+        for pi, slots in enumerate(self._partitions):
+            for slot in slots:
+                # ── MFMA ──
+                if slot.mfma:
+                    same, cross = self._split_deps(slot.mfma.deps, pi, slot.subIterK)
+                    slot.mfma.deps = same
+                    slot.mfma.preOps = []
+                    if cross:
+                        slot.mfma.preOps.append(DepOp(kind='wait_lr'))
+
+                # ── LRs ──
+                for lr in slot.lrs:
+                    same, cross = self._split_deps(lr.deps, pi, lr.subIterK_slot)
+                    lr.deps = same
+                    lr.preOps = []
+                    if cross:
+                        counts = WaitGRCounts()
+                        for dep in cross:
+                            t = dep.ref.tensor
+                            inflight = self._compute_inflight_loads(
+                                pi, lr.subIterK_slot, t, dep)
+                            setattr(counts, t, inflight)
+                        lr.preOps.append(DepOp(kind='wait_gr',
+                                               wait_gr_counts=counts))
+
+                # ── GRs ──
+                for gr in slot.grs:
+                    same, cross = self._split_deps(gr.deps, pi, gr.subIterK_slot)
+                    gr.deps = same
+                    gr.preOps = []
+                    if cross:
+                        gr.preOps.append(DepOp(kind='wait_lr_sync'))
+
+        self._completed.add('remove_deps')
+
+    def _split_deps(self, deps: List[DepRef], consumer_pi: int,
+                    consumer_slot: int) -> Tuple[List[DepRef], List[DepRef]]:
+        """Split deps into same-subIterK and cross-subIterK lists.
+
+        A dep is "same subIterK" if mt_offset == 0 AND the producer is in the
+        same partition and same subIterK slot as the consumer.
+        """
+        same, cross = [], []
+        for dep in deps:
+            if (dep.mt_offset == 0 and
+                    dep.ref.partition == consumer_pi and
+                    dep.ref.subIterK_slot == consumer_slot):
+                same.append(dep)
+            else:
+                cross.append(dep)
+        return same, cross
+
     # ── Group and serialize (commented out — will be reworked) ──
 
     # def group(self) -> List[GroupedSubIterK]:
@@ -1257,6 +1408,36 @@ class MFMATileScheduler:
                     f"subIterK {placement.tiles.fmt_k()}) "
                     f"ids {placement.tiles.fmt_tiles()}")
         return str(placement)
+
+    def print_remove_deps(self) -> str:
+        """Print remove_cross_deps output: placements with preOps and remaining deps."""
+        buf = io.StringIO()
+        buf.write("MAINLOOP:\n")
+        for pi, slots in enumerate(self._partitions):
+            buf.write(f"  Partition {pi}:\n")
+            for slot in slots:
+                buf.write(f"    subIterK={slot.subIterK}:\n")
+                if slot.mfma:
+                    self._print_placement_with_preops(buf, slot.mfma, slot)
+                for lr in slot.lrs:
+                    self._print_placement_with_preops(buf, lr, slot)
+                for gr in slot.grs:
+                    self._print_placement_with_preops(buf, gr, slot)
+        return buf.getvalue()
+
+    def _print_placement_with_preops(self, buf, placement, slot: SubIterKSlot):
+        """Print a placement label followed by its preOps and remaining deps."""
+        label = self._format_placement_label(placement, slot)
+        buf.write(f"      {label}\n")
+        if placement.preOps:
+            buf.write("        preOps:\n")
+            for op in placement.preOps:
+                buf.write(f"            - {op}\n")
+        if placement.deps:
+            buf.write("        deps:\n")
+            for dep in placement.deps:
+                dep_str = self._format_dep_ref(dep)
+                buf.write(f"            - {dep_str}\n")
 
     # def print_group(self, grouped: List[GroupedSubIterK] = None) -> str:
     #     """Print group output: serialized ops with dependencies."""
