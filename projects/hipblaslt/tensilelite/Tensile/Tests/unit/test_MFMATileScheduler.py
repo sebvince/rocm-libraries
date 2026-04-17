@@ -1110,6 +1110,65 @@ def test_place_LRs_LR_1x1_partition_10x1():
 
 # ── Step 2: Assign VGPR tiles ────────────────────────────
 
+def assert_vgpr_no_conflict_and_unrolling(sched):
+    """Generic validation for assign_vgpr_tiles results.
+
+    1. MFMA and LR at same subIterK must not share vgprTileIds (per tensor, all iters).
+    2. If needs_unrolling: for each wrapping LR (mtIteration != "n") in the last
+       unroll iter, the tiles it writes must match what the first MFMA iteration
+       reads — i.e. the mainloop's last LR output feeds the next iteration's first MFMA.
+    """
+    cfg = sched.config
+    parts = sched._partitions
+    num_iters = sched.unroll_factor
+
+    # ── Check 1: no MFMA/LR vgprTileId overlap at same subIterK ──
+    for pi, slots in enumerate(parts):
+        for slot in slots:
+            if not slot.mfma:
+                continue
+            for lr in slot.lrs:
+                if lr.tensor not in ('A', 'B') or not lr.vgpr_tile_map:
+                    continue
+                mfma_map_list = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')
+                for ui in range(len(mfma_map_list)):
+                    mfma_vids = set(mfma_map_list[ui].values())
+                    lr_vids = set(lr.vgpr_tile_map[ui].values())
+                    assert mfma_vids.isdisjoint(lr_vids), \
+                        f"P{pi} k={slot.subIterK} iter={ui}: MFMA and LR {lr.tensor} share vgprTileIds " \
+                        f"(MFMA={mfma_vids}, LR={lr_vids})"
+
+    # ── Check 2: unrolling continuity ──
+    if sched.needs_unrolling:
+        last_ui = num_iters - 1
+        wrapping_writes = {}
+        for pi, slots in enumerate(parts):
+            for slot in slots:
+                for lr in slot.lrs:
+                    if lr.mtIteration == "n" or lr.tensor not in ('A', 'B'):
+                        continue
+                    if not lr.vgpr_tile_map:
+                        continue
+                    tile_map = lr.vgpr_tile_map[last_ui]
+                    for tileId, vid in tile_map.items():
+                        for lk in lr.tiles.subIterK_list:
+                            wrapping_writes[(lr.tensor, tileId, lk, pi)] = vid
+
+        for pi, slots in enumerate(parts):
+            for slot in slots:
+                if not slot.mfma:
+                    continue
+                for tensor, tileRange in [('A', slot.mfma.tileA), ('B', slot.mfma.tileB)]:
+                    mfma_map_0 = getattr(slot.mfma, f'vgpr_tile_map_{tensor}')[0]
+                    for tileId in tileRange.tileId_list:
+                        key = (tensor, tileId, slot.subIterK, pi)
+                        if key in wrapping_writes:
+                            assert mfma_map_0[tileId] == wrapping_writes[key], \
+                                f"P{pi} k={slot.subIterK}: MFMA iter0 {tensor} tile {tileId} " \
+                                f"uses vgpr {mfma_map_0[tileId]} but last wrapping LR wrote vgpr " \
+                                f"{wrapping_writes[key]}"
+
+
 def test_assign_vgpr_tiles_basic():
     """Validate Step 2: vgprTile allocation with scale tensors."""
     cfg = make_example_granularities_1()
@@ -1139,31 +1198,14 @@ def test_assign_vgpr_tiles_basic():
                 assert map_k0[tileId] != map_k1[tileId], \
                     f"{tensor} tile {tileId}: k=0 and k=1 must use different vgprTileIds"
 
-    # LRs must have tile maps
-    for slot in [s0, s1]:
-        for lr in slot.lrs:
-            assert len(lr.vgpr_tile_map) > 0, \
-                f"LR {lr.tensor} at k={slot.subIterK} missing tile map"
-
-    # MFMA and LR at same subIterK must not share vgprTileIds (same tensor, iter 0)
-    for slot in [s0, s1]:
-        if slot.mfma:
-            for lr in slot.lrs:
-                if lr.tensor in ('A', 'B'):
-                    mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')[0]
-                    mfma_vids = set(mfma_map.values())
-                    lr_vids = set(lr.vgpr_tile_map[0].values())
-                    assert mfma_vids.isdisjoint(lr_vids), \
-                        f"MFMA and LR {lr.tensor} at k={slot.subIterK} share vgprTileIds"
-
     # Per-tensor peaks should be set
     assert sched.tile_peaks['A'] > 0
     assert sched.tile_peaks['B'] > 0
     assert sched.tile_peaks['SA'] > 0
     assert sched.tile_peaks['SB'] > 0
 
-    # No unrolling needed
     assert sched.needs_unrolling
+    assert_vgpr_no_conflict_and_unrolling(sched)
 
 
 def test_assign_vgpr_tiles_no_scale_k_gran_1():
@@ -1197,6 +1239,7 @@ def test_assign_vgpr_tiles_no_scale_k_gran_1():
     assert 'SA' not in sched.tile_peaks
     assert 'SB' not in sched.tile_peaks
     assert not sched.needs_unrolling
+    assert_vgpr_no_conflict_and_unrolling(sched)
 
 
 def test_assign_vgpr_tiles_DU512():
@@ -1236,18 +1279,10 @@ def test_assign_vgpr_tiles_DU512():
         assert len(slot.mfma.vgpr_tile_map_SA) > 0
         assert len(slot.mfma.vgpr_tile_map_SB) > 0
 
-    # MFMA and LR at same subIterK don't share vgprTileIds (check iter 0)
-    for slot in sched._partitions[0]:
-        if slot.mfma:
-            for lr in slot.lrs:
-                if lr.tensor in ('A', 'B'):
-                    mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')[0]
-                    assert set(mfma_map.values()).isdisjoint(set(lr.vgpr_tile_map[0].values())), \
-                        f"MFMA and LR {lr.tensor} at k={slot.subIterK} share vgprTileIds"
-
     assert sched.needs_unrolling
     assert sched.tile_peaks['SA'] > 0
     assert sched.tile_peaks['SB'] > 0
+    assert_vgpr_no_conflict_and_unrolling(sched)
 
 
 def test_assign_vgpr_tiles_DU512_partition_2x2():
@@ -1287,16 +1322,6 @@ def test_assign_vgpr_tiles_DU512_partition_2x2():
             assert len(slot.mfma.vgpr_tile_map_A) > 0
             assert len(slot.mfma.vgpr_tile_map_B) > 0
 
-    # MFMA and LR at same subIterK don't share vgprTileIds (check iter 0)
-    for pi in range(4):
-        for slot in parts[pi]:
-            if slot.mfma:
-                for lr in slot.lrs:
-                    if lr.tensor in ('A', 'B'):
-                        mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')[0]
-                        assert set(mfma_map.values()).isdisjoint(set(lr.vgpr_tile_map[0].values())), \
-                            f"P{pi} MFMA and LR {lr.tensor} at k={slot.subIterK} share vgprTileIds"
-
     # Spot-check LR presence per partition (unchanged from place_LRs).
     assert [lr.tensor for lr in parts[0][0].lrs] == ['A', 'B', 'SA']
     assert [lr.tensor for lr in parts[0][1].lrs] == ['A', 'B', 'SB']
@@ -1309,6 +1334,7 @@ def test_assign_vgpr_tiles_DU512_partition_2x2():
     assert [lr.tensor for lr in parts[3][3].lrs] == ['A', 'B', 'SB']
 
     assert sched.needs_unrolling
+    assert_vgpr_no_conflict_and_unrolling(sched)
 
 
 # ── Step 3: Place GRs ────────────────────────────────────
