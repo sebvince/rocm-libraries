@@ -1196,9 +1196,7 @@ class MFMATileScheduler:
                 for gr in slot.grs:
                     same, cross = self._split_deps(gr.deps, pi, gr.subIterK_slot)
                     gr.deps = same
-                    gr.preOps = []
-                    if cross:
-                        gr.preOps.append(DepOp(kind='wait_lr_sync'))
+                    gr.preOps = [DepOp(kind='wait_lr_sync')]
 
         self._completed.add('remove_deps')
 
