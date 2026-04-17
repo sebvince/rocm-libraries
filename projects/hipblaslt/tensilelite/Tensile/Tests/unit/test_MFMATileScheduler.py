@@ -147,8 +147,8 @@ def test_place_LRs_LR_1x1_partition_1x1():
     assert s0.mfma.tileA.tileId_end == 8
     assert s0.mfma.tileB.tileId_end == 8
 
-    # 3 LRs: A, B (k=1), SA (k=2, placed at subIterK=0)
-    assert [lr.tensor for lr in s0.lrs] == ['A', 'B', 'SA']
+    # 2 LRs: A, B (k=1, non-wrapping → MT n)
+    assert [lr.tensor for lr in s0.lrs] == ['A', 'B']
 
     # LR A loads next subIterK [1], same MT, all 8 tiles
     lr_a0 = _get_lr(s0, 'A')
@@ -162,26 +162,26 @@ def test_place_LRs_LR_1x1_partition_1x1():
     assert lr_b0.mtIteration == "n"
     assert lr_b0.tiles.subIterK_start == 1
 
-    # LR SA loads all subIterKs [0,1] for next MT
-    lr_sa = _get_lr(s0, 'SA')
-    assert lr_sa.mtIteration == "n+1"
-    assert lr_sa.tiles.subIterK_start == 0
-    assert lr_sa.tiles.subIterK_end == 2
-    assert lr_sa.tiles.tileId_end == 8
-
     # ── subIterK=1 ──
     s1 = slots[1]
 
     assert s1.mfma.subIterK == 1
 
-    # 3 LRs: A, B (k=1 wrap-around → MT n+1), SB (k=2, placed at subIterK=1)
-    assert [lr.tensor for lr in s1.lrs] == ['A', 'B', 'SB']
+    # 4 LRs: A, B (k=1 wrap → MT n+1), SA, SB (k=2 wrap → MT n+1)
+    assert [lr.tensor for lr in s1.lrs] == ['A', 'B', 'SA', 'SB']
 
     # LR A wraps to subIterK [0] of next MT
     lr_a1 = _get_lr(s1, 'A')
     assert lr_a1.mtIteration == "n+1"
     assert lr_a1.tiles.subIterK_start == 0
     assert lr_a1.tiles.subIterK_end == 1
+
+    # LR SA loads all subIterKs [0,1] for next MT
+    lr_sa = _get_lr(s1, 'SA')
+    assert lr_sa.mtIteration == "n+1"
+    assert lr_sa.tiles.subIterK_start == 0
+    assert lr_sa.tiles.subIterK_end == 2
+    assert lr_sa.tiles.tileId_end == 8
 
     # LR SB loads all subIterKs [0,1] for next MT
     lr_sb = _get_lr(s1, 'SB')
@@ -231,7 +231,7 @@ def test_place_LRs_LR_1x2_partition_1x1():
 
     assert len(slots) == 2
 
-    # ── subIterK=0: LR A (loads MT n+1, all subIterKs) + LR SA ──
+    # ── subIterK=0: LR A + LR SA (side grouping, all MT n+1, no conflict) ──
     s0 = slots[0]
     assert [lr.tensor for lr in s0.lrs] == ['A', 'SA']
 
@@ -246,7 +246,7 @@ def test_place_LRs_LR_1x2_partition_1x1():
     assert lr_sa.tiles.subIterK_start == 0
     assert lr_sa.tiles.subIterK_end == 2
 
-    # ── subIterK=1: LR B (loads MT n+1, all subIterKs) + LR SB ──
+    # ── subIterK=1: LR B + LR SB (side grouping, all MT n+1, no conflict) ──
     s1 = slots[1]
     assert [lr.tensor for lr in s1.lrs] == ['B', 'SB']
 
@@ -301,7 +301,7 @@ def test_place_LRs_LR_1x1_partition_1x1_DU512():
 
     assert len(slots) == 4
 
-    # ── subIterK=0: LR A, LR B, LR SA (chunk 0: loads [2,3] of MT n) ──
+    # ── subIterK=0: LR A, B (k=1 non-wrap) + SA (k=2 non-wrap, A-side grouping) ──
     s0 = slots[0]
     assert s0.mfma.subIterK == 0
     assert s0.mfma.tileA.tileId_end == 8
@@ -317,7 +317,7 @@ def test_place_LRs_LR_1x1_partition_1x1_DU512():
     assert lr_sa0.tiles.subIterK_start == 2
     assert lr_sa0.tiles.subIterK_end == 4
 
-    # ── subIterK=1: LR A, LR B, LR SB (chunk 0: loads [2,3] of MT n) ──
+    # ── subIterK=1: LR A, B (k=1 non-wrap) + SB (k=2 non-wrap, B-side grouping) ──
     s1 = slots[1]
     assert [lr.tensor for lr in s1.lrs] == ['A', 'B', 'SB']
 
@@ -331,28 +331,28 @@ def test_place_LRs_LR_1x1_partition_1x1_DU512():
     assert lr_sb0.tiles.subIterK_start == 2
     assert lr_sb0.tiles.subIterK_end == 4
 
-    # ── subIterK=2: LR A, LR B, LR SA (chunk 1: loads [0,1] of MT n+1) ──
+    # ── subIterK=2: LR A, B only (k=1 non-wrap) ──
     s2 = slots[2]
-    assert [lr.tensor for lr in s2.lrs] == ['A', 'B', 'SA']
+    assert [lr.tensor for lr in s2.lrs] == ['A', 'B']
 
     lr_a2 = _get_lr(s2, 'A')
     assert lr_a2.mtIteration == "n"
     assert lr_a2.tiles.subIterK_start == 3
     assert lr_a2.tiles.subIterK_end == 4
 
-    lr_sa1 = _get_lr(s2, 'SA')
-    assert lr_sa1.mtIteration == "n+1"
-    assert lr_sa1.tiles.subIterK_start == 0
-    assert lr_sa1.tiles.subIterK_end == 2
-
-    # ── subIterK=3: LR A, LR B (wrap to MT n+1), LR SB (chunk 1: loads [0,1] of MT n+1) ──
+    # ── subIterK=3: all wrapping → MT n+1 (SA/SB redirected here) ──
     s3 = slots[3]
-    assert [lr.tensor for lr in s3.lrs] == ['A', 'B', 'SB']
+    assert [lr.tensor for lr in s3.lrs] == ['A', 'B', 'SA', 'SB']
 
     lr_a3 = _get_lr(s3, 'A')
     assert lr_a3.mtIteration == "n+1"
     assert lr_a3.tiles.subIterK_start == 0
     assert lr_a3.tiles.subIterK_end == 1
+
+    lr_sa1 = _get_lr(s3, 'SA')
+    assert lr_sa1.mtIteration == "n+1"
+    assert lr_sa1.tiles.subIterK_start == 0
+    assert lr_sa1.tiles.subIterK_end == 2
 
     lr_sb1 = _get_lr(s3, 'SB')
     assert lr_sb1.mtIteration == "n+1"
@@ -398,7 +398,7 @@ def test_place_LRs_LR_1x2_partition_1x1_DU512():
 
     assert len(slots) == 4
 
-    # ── subIterK=0: LR A + LR SA (chunk 0, loads [2,3] of MT n) ──
+    # ── subIterK=0: A+SA (A-side grouping, chunk 0, MT n) ──
     s0 = slots[0]
     assert [lr.tensor for lr in s0.lrs] == ['A', 'SA']
 
@@ -412,7 +412,7 @@ def test_place_LRs_LR_1x2_partition_1x1_DU512():
     assert lr_sa0.tiles.subIterK_start == 2
     assert lr_sa0.tiles.subIterK_end == 4
 
-    # ── subIterK=1: LR B + LR SB (chunk 0, loads [2,3] of MT n) ──
+    # ── subIterK=1: B+SB (B-side grouping, chunk 0, MT n) ──
     s1 = slots[1]
     assert [lr.tensor for lr in s1.lrs] == ['B', 'SB']
 
@@ -426,7 +426,7 @@ def test_place_LRs_LR_1x2_partition_1x1_DU512():
     assert lr_sb0.tiles.subIterK_start == 2
     assert lr_sb0.tiles.subIterK_end == 4
 
-    # ── subIterK=2: LR A + LR SA (chunk 1, loads [0,1] of MT n+1) ──
+    # ── subIterK=2: A+SA (A-side grouping, chunk 1 wrap, MT n+1) ──
     s2 = slots[2]
     assert [lr.tensor for lr in s2.lrs] == ['A', 'SA']
 
@@ -440,7 +440,7 @@ def test_place_LRs_LR_1x2_partition_1x1_DU512():
     assert lr_sa1.tiles.subIterK_start == 0
     assert lr_sa1.tiles.subIterK_end == 2
 
-    # ── subIterK=3: LR B + LR SB (chunk 1, loads [0,1] of MT n+1) ──
+    # ── subIterK=3: B+SB (B-side grouping, chunk 1 wrap, MT n+1) ──
     s3 = slots[3]
     assert [lr.tensor for lr in s3.lrs] == ['B', 'SB']
 
@@ -522,8 +522,7 @@ def test_place_LRs_LR_1x1_partition_2x2():
     assert p0[0].mfma.tileB.tileId_start == 0
     assert p0[0].mfma.tileB.tileId_end == 4
 
-    # subIterK=0: LR A + LR B (k=1, within-partition K-prefetch for subIterK=1, cur tiles)
-    #           + LR SA (k=2, next partition tiles [4-7])
+    # subIterK=0: LR A + LR B (k=1, K-prefetch) + LR SA (k=2, next partition tiles [4-7])
     assert [lr.tensor for lr in p0[0].lrs] == ['A', 'B', 'SA']
     lr_a0 = _get_lr(p0[0], 'A')
     assert lr_a0.tiles.tileId_start == 0
@@ -616,7 +615,7 @@ def test_place_LRs_LR_1x1_partition_2x2():
     assert p3[0].mfma.tileB.tileId_start == 4
     assert p3[0].mfma.tileB.tileId_end == 8
 
-    # subIterK=0: LR SA only (k=2, next partition P0 tiles [0-3])
+    # subIterK=0: LR SA only (k=2, A-side grouping, wrapping → MT n+1)
     #           LR A skipped (A[4-7] k[1] already placed by P1)
     #           LR B skipped (B[4-7] k[1] already placed by P2)
     assert [lr.tensor for lr in p3[0].lrs] == ['SA']
@@ -626,7 +625,7 @@ def test_place_LRs_LR_1x1_partition_2x2():
     assert lr_sa3.mtIteration == "n+1"
 
     # subIterK=1: LR A, LR B (k=1, wrapping → P0 of MT n+1, tiles [0-3])
-    #           + LR SB (k=2, P0 tiles [0-3])
+    #           + LR SB (k=2, B-side grouping)
     assert [lr.tensor for lr in p3[1].lrs] == ['A', 'B', 'SB']
     lr_a3_s1 = _get_lr(p3[1], 'A')
     assert lr_a3_s1.tiles.tileId_start == 0
@@ -1717,7 +1716,7 @@ def test_annotate_deps_1x1_partition_DU256():
     mfma0_deps = _dep_refs(s0.mfma)
     assert ('LR', 'A',  0, 1, -1) in mfma0_deps
     assert ('LR', 'B',  0, 1, -1) in mfma0_deps
-    assert ('LR', 'SA', 0, 0, -1) in mfma0_deps
+    assert ('LR', 'SA', 0, 1, -1) in mfma0_deps
     assert ('LR', 'SB', 0, 1, -1) in mfma0_deps
     assert len(mfma0_deps) == 4
 
@@ -1729,10 +1728,6 @@ def test_annotate_deps_1x1_partition_DU256():
     lr_b0 = _get_lr(s0, 'B')
     assert _dep_refs(lr_b0) == [('GR', 'B', 0, 1, -2)]
 
-    # LR SA @s0: depends on GR SA @s1 (mt="n+1" vs GR mt="n+2" → MT-1)
-    lr_sa0 = _get_lr(s0, 'SA')
-    assert _dep_refs(lr_sa0) == [('GR', 'SA', 0, 1, -1)]
-
     # GR A @s0: collision on LR A (mt="n") @s0 — same iteration (MT 0)
     gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
     assert _dep_refs(gr_a0) == [('LR', 'A', 0, 0, 0)]
@@ -1743,11 +1738,11 @@ def test_annotate_deps_1x1_partition_DU256():
 
     # ── subIterK=1 ──
 
-    # MFMA(k=1) at s1: LR A/B (mt="n") at s0 → same MT; LR SA/SB (mt="n+1") → MT-1
+    # MFMA(k=1) at s1: LR A/B (mt="n") at s0 → same MT; LR SA/SB (mt="n+1") at s1 → MT-1
     mfma1_deps = _dep_refs(s1.mfma)
     assert ('LR', 'A',  0, 0, 0) in mfma1_deps
     assert ('LR', 'B',  0, 0, 0) in mfma1_deps
-    assert ('LR', 'SA', 0, 0, -1) in mfma1_deps
+    assert ('LR', 'SA', 0, 1, -1) in mfma1_deps
     assert ('LR', 'SB', 0, 1, -1) in mfma1_deps
     assert len(mfma1_deps) == 4
 
@@ -1759,6 +1754,10 @@ def test_annotate_deps_1x1_partition_DU256():
     lr_b1 = _get_lr(s1, 'B')
     assert _dep_refs(lr_b1) == [('GR', 'B', 0, 1, -1)]
 
+    # LR SA @s1: depends on GR SA @s1 (mt="n+1" vs GR mt="n+2" → MT-1)
+    lr_sa1 = _get_lr(s1, 'SA')
+    assert _dep_refs(lr_sa1) == [('GR', 'SA', 0, 1, -1)]
+
     # LR SB @s1: depends on GR SB @s1 (mt="n+1" vs GR mt="n+2" → MT-1)
     lr_sb1 = _get_lr(s1, 'SB')
     assert _dep_refs(lr_sb1) == [('GR', 'SB', 0, 1, -1)]
@@ -1767,9 +1766,9 @@ def test_annotate_deps_1x1_partition_DU256():
     gr_b1 = [gr for gr in s1.grs if gr.tensor == 'B'][0]
     assert _dep_refs(gr_b1) == [('LR', 'B', 0, 0, 0)]
 
-    # GR SA @s1: LR SA (mt="n+1") @s0, prev iter handled data "n" → MT-1
+    # GR SA @s1: LR SA (mt="n+1") @s1, prev iter handled data "n" → MT-1
     gr_sa1 = [gr for gr in s1.grs if gr.tensor == 'SA'][0]
-    assert _dep_refs(gr_sa1) == [('LR', 'SA', 0, 0, -1)]
+    assert _dep_refs(gr_sa1) == [('LR', 'SA', 0, 1, -1)]
 
     # GR SB @s1: LR SB (mt="n+1") @s1, prev iter handled data "n" → MT-1
     gr_sb1 = [gr for gr in s1.grs if gr.tensor == 'SB'][0]
@@ -1915,11 +1914,6 @@ def test_remove_cross_deps_1x1_partition_DU256():
     assert _preop_kinds(lr_b0) == []
     assert len(lr_b0.deps) == 0
 
-    # LR SA @s0: dep on GR SA @s1 (MT-1) → cross, wait_gr_sync with SA=1
-    lr_sa0 = _get_lr(s0, 'SA')
-    assert _preop_kinds(lr_sa0) == [('wait_gr_sync', {'A': 0, 'B': 0, 'SA': 1, 'SB': 0})]
-    assert len(lr_sa0.deps) == 0
-
     # GR A @s0: dep on LR A @s0 (MT 0, same slot) → same-subIterK, stays in deps
     # All GRs get wait_lr_sync preOp unconditionally
     gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
@@ -1948,6 +1942,11 @@ def test_remove_cross_deps_1x1_partition_DU256():
     lr_b1 = _get_lr(s1, 'B')
     assert _preop_kinds(lr_b1) == [('wait_gr_sync', {'A': 0, 'B': 1, 'SA': 0, 'SB': 0})]
     assert len(lr_b1.deps) == 0
+
+    # LR SA @s1: dep on GR SA @s1 (MT-1) → cross, wait_gr_sync with SA=0 (same slot)
+    lr_sa1 = _get_lr(s1, 'SA')
+    assert _preop_kinds(lr_sa1) == [('wait_gr_sync', {'A': 0, 'B': 0, 'SA': 0, 'SB': 0})]
+    assert len(lr_sa1.deps) == 0
 
     # LR SB @s1: dep on GR SB @s1 (MT-1) → cross, wait_gr_sync with SB=0
     lr_sb1 = _get_lr(s1, 'SB')
@@ -2083,9 +2082,6 @@ def test_insert_gr_lr_inc_1x1_partition_DU256():
     # LR B @s0: mt=n, first seen → no inc
     assert _preop_inc_tensors(_get_lr(s0, 'B'), 'lr_inc') == []
 
-    # LR SA @s0: mt=n+1, first seen → no inc
-    assert _preop_inc_tensors(_get_lr(s0, 'SA'), 'lr_inc') == []
-
     # GR A @s0: mt=n+2, A was n → switch → gr_inc(A)
     gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
     assert _preop_inc_tensors(gr_a0, 'gr_inc') == ['A']
@@ -2105,6 +2101,9 @@ def test_insert_gr_lr_inc_1x1_partition_DU256():
 
     # LR B @s1: mt=n+1, B was n+2 → switch → lr_inc(B)
     assert _preop_inc_tensors(_get_lr(s1, 'B'), 'lr_inc') == ['B']
+
+    # LR SA @s1: mt=n+1, first seen → no inc
+    assert _preop_inc_tensors(_get_lr(s1, 'SA'), 'lr_inc') == []
 
     # LR SB @s1: mt=n+1, first seen → no inc
     assert _preop_inc_tensors(_get_lr(s1, 'SB'), 'lr_inc') == []
@@ -2171,9 +2170,9 @@ def test_compute_inflight_loads():
     lr_b1_final = _get_lr(sched3._partitions[0][1], 'B')
     assert lr_b1_final.preOps[0].wait_gr_counts.B == 1
 
-    # LR SA @s0 had wait_gr_sync SA=1
-    lr_sa0_final = _get_lr(sched3._partitions[0][0], 'SA')
-    assert lr_sa0_final.preOps[0].wait_gr_counts.SA == 1
+    # LR SA @s1 had wait_gr_sync SA=0 (same slot as GR SA)
+    lr_sa1_final = _get_lr(sched3._partitions[0][1], 'SA')
+    assert lr_sa1_final.preOps[0].wait_gr_counts.SA == 0
 
     # LR A @s1 had wait_gr_sync A=8
     lr_a1_final = _get_lr(sched3._partitions[0][1], 'A')
@@ -2348,19 +2347,13 @@ def test_group_lr_gr_1x1_partition_DU256():
     s0 = parts[0][0]
     s1 = parts[0][1]
 
-    # ── subIterK=0: LR chain ──
+    # ── subIterK=0: LR chain (A, B only — SA moved to s1) ──
 
     lr_a0 = _get_lr(s0, 'A')
     lr_b0 = _get_lr(s0, 'B')
-    lr_sa0 = _get_lr(s0, 'SA')
 
-    # First LR (A) has merged wait_gr_sync (only SA remains;
-    # A and B deps were removed by remove_unnecessary_gr_deps)
-    assert len(lr_a0.preOps) == 1
-    assert lr_a0.preOps[0].kind == 'wait_gr_sync'
-    assert lr_a0.preOps[0].wait_gr_counts.A == 0
-    assert lr_a0.preOps[0].wait_gr_counts.B == 0
-    assert lr_a0.preOps[0].wait_gr_counts.SA == 1
+    # First LR (A) has no preOps (A and B deps removed by remove_unnecessary_gr_deps)
+    assert lr_a0.preOps == []
     assert lr_a0.deps == []
 
     # LR B chains to LR A
@@ -2368,12 +2361,6 @@ def test_group_lr_gr_1x1_partition_DU256():
     assert len(lr_b0.deps) == 1
     assert lr_b0.deps[0].ref is lr_a0
     assert lr_b0.deps[0].mt_offset == 0
-
-    # LR SA chains to LR B
-    assert lr_sa0.preOps == []
-    assert len(lr_sa0.deps) == 1
-    assert lr_sa0.deps[0].ref is lr_b0
-    assert lr_sa0.deps[0].mt_offset == 0
 
     # ── subIterK=0: GR chain ──
 
@@ -2385,19 +2372,20 @@ def test_group_lr_gr_1x1_partition_DU256():
     assert gr_a0.preOps[0].kind == 'wait_lr_sync'
     assert gr_a0.preOps[1].kind == 'gr_inc' and gr_a0.preOps[1].tensor == 'A'
     assert gr_a0.preOps[2].kind == 'gr_inc' and gr_a0.preOps[2].tensor == 'B'
-    # First GR dep points to last LR (SA)
+    # First GR dep points to last LR (B now)
     assert len(gr_a0.deps) == 1
-    assert gr_a0.deps[0].ref is lr_sa0
+    assert gr_a0.deps[0].ref is lr_b0
 
     # GR B chains to GR A
     assert gr_b0.preOps == []
     assert len(gr_b0.deps) == 1
     assert gr_b0.deps[0].ref is gr_a0
 
-    # ── subIterK=1: LR chain ──
+    # ── subIterK=1: LR chain (A, B, SA, SB) ──
 
     lr_a1 = _get_lr(s1, 'A')
     lr_b1 = _get_lr(s1, 'B')
+    lr_sa1 = _get_lr(s1, 'SA')
     lr_sb1 = _get_lr(s1, 'SB')
 
     # First LR (A) has merged wait_gr_sync + lr_inc ops
@@ -2413,10 +2401,15 @@ def test_group_lr_gr_1x1_partition_DU256():
     assert len(lr_b1.deps) == 1
     assert lr_b1.deps[0].ref is lr_a1
 
-    # LR SB chains to LR B
+    # LR SA chains to LR B
+    assert lr_sa1.preOps == []
+    assert len(lr_sa1.deps) == 1
+    assert lr_sa1.deps[0].ref is lr_b1
+
+    # LR SB chains to LR SA
     assert lr_sb1.preOps == []
     assert len(lr_sb1.deps) == 1
-    assert lr_sb1.deps[0].ref is lr_b1
+    assert lr_sb1.deps[0].ref is lr_sa1
 
     # ── subIterK=1: GR chain ──
 
@@ -2424,7 +2417,7 @@ def test_group_lr_gr_1x1_partition_DU256():
     gr_sa1 = [gr for gr in s1.grs if gr.tensor == 'SA'][0]
     gr_sb1 = [gr for gr in s1.grs if gr.tensor == 'SB'][0]
 
-    # First GR (B) has merged preOps: wait_lr_sync (deduped) + gr_inc(B,SA,SB)
+    # First GR (B) has merged preOps: wait_lr_sync + gr_inc(B,SA,SB)
     assert gr_b1.preOps[0].kind == 'wait_lr_sync'
     assert gr_b1.preOps[1].kind == 'gr_inc' and gr_b1.preOps[1].tensor == 'B'
     assert gr_b1.preOps[2].kind == 'gr_inc' and gr_b1.preOps[2].tensor == 'SA'
@@ -2462,9 +2455,9 @@ def test_emit_1x1_partition_DU256():
     types0 = [(e.moduleId, e.opType, e.before) for e in em0]
     print("subIterK=0 modules:", types0)
 
-    # Primary modules: mfma + 3 LRs (A, B, SA) + 2 GRs (A, B)
+    # Primary modules: mfma + 2 LRs (A, B) + 2 GRs (A, B)
     primary0 = [e for e in em0 if e.opType in ('mfma', 'lr', 'gr')]
-    assert len(primary0) == 6
+    assert len(primary0) == 5
     assert primary0[0].opType == 'mfma'
 
     # MFMA has a before-link (wait_lr)
@@ -2472,13 +2465,9 @@ def test_emit_1x1_partition_DU256():
     wait_lr_0 = em0[em0[0].before]
     assert wait_lr_0.opType == 'wait_lr'
 
-    # wait_gr is standalone (no incoming before), followed by sync
+    # No wait_gr in s0 (SA moved to s1, no cross-deps remain)
     wait_grs_0 = [e for e in em0 if e.opType == 'wait_gr']
-    assert len(wait_grs_0) == 1
-    assert wait_grs_0[0].before is None
-    # sync after wait_gr (from wait_gr_sync expansion)
-    wgr_sync_0 = [e for e in em0 if e.opType == 'sync' and e.before == wait_grs_0[0].moduleId]
-    assert len(wgr_sync_0) == 1
+    assert len(wait_grs_0) == 0
 
     # ── subIterK=1 ──
     em1 = result[0][1]
@@ -2486,7 +2475,7 @@ def test_emit_1x1_partition_DU256():
     print("subIterK=1 modules:", types1)
 
     primary1 = [e for e in em1 if e.opType in ('mfma', 'lr', 'gr')]
-    assert len(primary1) == 7   # mfma + 3 LRs (A, B, SB) + 3 GRs (B, SA, SB)
+    assert len(primary1) == 8   # mfma + 4 LRs (A, B, SA, SB) + 3 GRs (B, SA, SB)
     assert primary1[0].opType == 'mfma'
 
     # wait_gr standalone, followed by sync

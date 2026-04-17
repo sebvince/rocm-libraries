@@ -390,6 +390,7 @@ class MFMATileScheduler:
         multi_part = cfg.numPartitions > 1
 
         slots = [SubIterKSlot(subIterK=k) for k in range(numK)]
+        slot_mt = {}  # slot_k → lr_mt string, for MT-homogeneity enforcement
 
         # MFMAs
         for k in range(numK):
@@ -437,6 +438,14 @@ class MFMATileScheduler:
 
                 for side_idx, side in enumerate(sides):
                     slot_k = base_slot + (side_idx % k_gran)
+                    # Redirect LRs away from slots committed to a different MT,
+                    # keeping each slot MT-homogeneous.
+                    # This reduce the number of wait_gr_sync needed as all LRs 
+                    # in the same subIterK wait for the same MT iterration.
+                    committed = slot_mt.get(slot_k)
+                    if committed is not None and committed != lr_mt:
+                        slot_k = numK - 1
+
                     for tensor, gran in side:
                         tile_range = nxt if (is_wrap or not multi_part) else cur
                         side_key = 'A' if tensor in ('A', 'SA') else 'B'
@@ -459,6 +468,7 @@ class MFMATileScheduler:
                             subIterK_slot=slot_k,
                         )
                         slots[slot_k].lrs.append(lr)
+                        slot_mt[slot_k] = lr_mt
 
         return slots
 
