@@ -1884,7 +1884,7 @@ def test_remove_cross_deps_1x1_partition_DU256():
     - All cross-subIterK deps are removed from .deps
     - preOps are generated:
       MFMA → wait_lr
-      LR → wait_gr(counts)
+      LR → wait_gr_sync(counts)
       GR → wait_lr_sync
     - Same-subIterK deps (MFMA(k=1) → LR A/B at s0) are preserved.
     """
@@ -1903,19 +1903,19 @@ def test_remove_cross_deps_1x1_partition_DU256():
     assert _preop_kinds(s0.mfma) == [('wait_lr', None)]
     assert len(s0.mfma.deps) == 0
 
-    # LR A @s0: dep on GR A @s0 (MT-2) → cross, wait_gr with A=16
+    # LR A @s0: dep on GR A @s0 (MT-2) → cross, wait_gr_sync with A=16
     lr_a0 = _get_lr(s0, 'A')
-    assert _preop_kinds(lr_a0) == [('wait_gr', {'A': 16, 'B': 0, 'SA': 0, 'SB': 0})]
+    assert _preop_kinds(lr_a0) == [('wait_gr_sync', {'A': 16, 'B': 0, 'SA': 0, 'SB': 0})]
     assert len(lr_a0.deps) == 0
 
-    # LR B @s0: dep on GR B @s1 (MT-2) → cross, wait_gr with B=16
+    # LR B @s0: dep on GR B @s1 (MT-2) → cross, wait_gr_sync with B=16
     lr_b0 = _get_lr(s0, 'B')
-    assert _preop_kinds(lr_b0) == [('wait_gr', {'A': 0, 'B': 16, 'SA': 0, 'SB': 0})]
+    assert _preop_kinds(lr_b0) == [('wait_gr_sync', {'A': 0, 'B': 16, 'SA': 0, 'SB': 0})]
     assert len(lr_b0.deps) == 0
 
-    # LR SA @s0: dep on GR SA @s1 (MT-1) → cross, wait_gr with SA=1
+    # LR SA @s0: dep on GR SA @s1 (MT-1) → cross, wait_gr_sync with SA=1
     lr_sa0 = _get_lr(s0, 'SA')
-    assert _preop_kinds(lr_sa0) == [('wait_gr', {'A': 0, 'B': 0, 'SA': 1, 'SB': 0})]
+    assert _preop_kinds(lr_sa0) == [('wait_gr_sync', {'A': 0, 'B': 0, 'SA': 1, 'SB': 0})]
     assert len(lr_sa0.deps) == 0
 
     # GR A @s0: dep on LR A @s0 (MT 0, same slot) → same-subIterK, stays in deps
@@ -1936,19 +1936,19 @@ def test_remove_cross_deps_1x1_partition_DU256():
     assert _preop_kinds(s1.mfma) == [('wait_lr', None)]
     assert len(s1.mfma.deps) == 0
 
-    # LR A @s1: dep on GR A @s0 (MT-1) → cross, wait_gr with A=8
+    # LR A @s1: dep on GR A @s0 (MT-1) → cross, wait_gr_sync with A=8
     lr_a1 = _get_lr(s1, 'A')
-    assert _preop_kinds(lr_a1) == [('wait_gr', {'A': 8, 'B': 0, 'SA': 0, 'SB': 0})]
+    assert _preop_kinds(lr_a1) == [('wait_gr_sync', {'A': 8, 'B': 0, 'SA': 0, 'SB': 0})]
     assert len(lr_a1.deps) == 0
 
-    # LR B @s1: dep on GR B @s1 (MT-1) → cross, wait_gr with B=1
+    # LR B @s1: dep on GR B @s1 (MT-1) → cross, wait_gr_sync with B=1
     lr_b1 = _get_lr(s1, 'B')
-    assert _preop_kinds(lr_b1) == [('wait_gr', {'A': 0, 'B': 1, 'SA': 0, 'SB': 0})]
+    assert _preop_kinds(lr_b1) == [('wait_gr_sync', {'A': 0, 'B': 1, 'SA': 0, 'SB': 0})]
     assert len(lr_b1.deps) == 0
 
-    # LR SB @s1: dep on GR SB @s1 (MT-1) → cross, wait_gr with SB=0
+    # LR SB @s1: dep on GR SB @s1 (MT-1) → cross, wait_gr_sync with SB=0
     lr_sb1 = _get_lr(s1, 'SB')
-    assert _preop_kinds(lr_sb1) == [('wait_gr', {'A': 0, 'B': 0, 'SA': 0, 'SB': 0})]
+    assert _preop_kinds(lr_sb1) == [('wait_gr_sync', {'A': 0, 'B': 0, 'SA': 0, 'SB': 0})]
     assert len(lr_sb1.deps) == 0
 
     # GR B @s1: dep on LR B @s0 (MT-2) → cross, wait_lr_sync
@@ -1995,12 +1995,12 @@ def test_remove_cross_deps_2x2_partition_DU512():
     assert _preop_kinds(p0[0].mfma) == [('wait_lr', None)]
     assert len(p0[0].mfma.deps) == 0
 
-    # LR A @P0:s0: dep on GR A @P2:s1 (MT-2) → wait_gr A=36
+    # LR A @P0:s0: dep on GR A @P2:s1 (MT-2) → wait_gr_sync A=36
     lr_a_p0_s0 = _get_lr(p0[0], 'A')
     assert lr_a_p0_s0.preOps[0].wait_gr_counts.A == 36
     assert len(lr_a_p0_s0.deps) == 0
 
-    # LR SA @P0:s0: dep on GR SA → wait_gr SA=2
+    # LR SA @P0:s0: dep on GR SA → wait_gr_sync SA=2
     lr_sa_p0_s0 = _get_lr(p0[0], 'SA')
     assert lr_sa_p0_s0.preOps[0].wait_gr_counts.SA == 2
     assert len(lr_sa_p0_s0.deps) == 0
@@ -2030,11 +2030,11 @@ def test_remove_cross_deps_2x2_partition_DU512():
     for slot in p3:
         assert _preop_kinds(slot.mfma) == [('wait_lr', None)]
 
-    # LR A @P3:s3: dep on GR A → wait_gr A=20
+    # LR A @P3:s3: dep on GR A → wait_gr_sync A=20
     lr_a_p3_s3 = _get_lr(p3[3], 'A')
     assert lr_a_p3_s3.preOps[0].wait_gr_counts.A == 20
 
-    # LR SA @P3:s2: dep on GR SA @P3:s0 (MT-1) → wait_gr SA=1
+    # LR SA @P3:s2: dep on GR SA @P3:s0 (MT-1) → wait_gr_sync SA=1
     lr_sa_p3_s2 = _get_lr(p3[2], 'SA')
     assert lr_sa_p3_s2.preOps[0].wait_gr_counts.SA == 1
 
@@ -2095,9 +2095,9 @@ def test_insert_gr_lr_inc_1x1_partition_DU256():
 
     # LR A @s1: mt=n+1, A was n+2 → switch → lr_inc(A)
     assert _preop_inc_tensors(_get_lr(s1, 'A'), 'lr_inc') == ['A']
-    # Also has wait_gr from remove_cross_deps — lr_inc is appended after
+    # Also has wait_gr_sync from remove_cross_deps — lr_inc is appended after
     lr_a1 = _get_lr(s1, 'A')
-    assert lr_a1.preOps[0].kind == 'wait_gr'
+    assert lr_a1.preOps[0].kind == 'wait_gr_sync'
     assert lr_a1.preOps[1].kind == 'lr_inc'
 
     # LR B @s1: mt=n+1, B was n+2 → switch → lr_inc(B)
@@ -2158,19 +2158,19 @@ def test_compute_inflight_loads():
     # Instead of manual calculation, verify against the actual remove_cross_deps output
     sched3 = MFMATileScheduler(cfg)
     sched3.remove_cross_deps()
-    # LR A @s0 had wait_gr A=16 in the dump
+    # LR A @s0 had wait_gr_sync A=16 in the dump
     lr_a0_final = _get_lr(sched3._partitions[0][0], 'A')
     assert lr_a0_final.preOps[0].wait_gr_counts.A == 16
 
-    # LR B @s1 had wait_gr B=1
+    # LR B @s1 had wait_gr_sync B=1
     lr_b1_final = _get_lr(sched3._partitions[0][1], 'B')
     assert lr_b1_final.preOps[0].wait_gr_counts.B == 1
 
-    # LR SA @s0 had wait_gr SA=1
+    # LR SA @s0 had wait_gr_sync SA=1
     lr_sa0_final = _get_lr(sched3._partitions[0][0], 'SA')
     assert lr_sa0_final.preOps[0].wait_gr_counts.SA == 1
 
-    # LR A @s1 had wait_gr A=8
+    # LR A @s1 had wait_gr_sync A=8
     lr_a1_final = _get_lr(sched3._partitions[0][1], 'A')
     assert lr_a1_final.preOps[0].wait_gr_counts.A == 8
 
@@ -2349,9 +2349,9 @@ def test_group_lr_gr_1x1_partition_DU256():
     lr_b0 = _get_lr(s0, 'B')
     lr_sa0 = _get_lr(s0, 'SA')
 
-    # First LR (A) has merged wait_gr
+    # First LR (A) has merged wait_gr_sync
     assert len(lr_a0.preOps) == 1
-    assert lr_a0.preOps[0].kind == 'wait_gr'
+    assert lr_a0.preOps[0].kind == 'wait_gr_sync'
     assert lr_a0.preOps[0].wait_gr_counts.A == 16
     assert lr_a0.preOps[0].wait_gr_counts.B == 16
     assert lr_a0.preOps[0].wait_gr_counts.SA == 1
@@ -2393,8 +2393,8 @@ def test_group_lr_gr_1x1_partition_DU256():
     lr_b1 = _get_lr(s1, 'B')
     lr_sb1 = _get_lr(s1, 'SB')
 
-    # First LR (A) has merged wait_gr + lr_inc ops
-    assert lr_a1.preOps[0].kind == 'wait_gr'
+    # First LR (A) has merged wait_gr_sync + lr_inc ops
+    assert lr_a1.preOps[0].kind == 'wait_gr_sync'
     assert lr_a1.preOps[0].wait_gr_counts.A == 8
     assert lr_a1.preOps[0].wait_gr_counts.B == 1
     assert lr_a1.preOps[1].kind == 'lr_inc' and lr_a1.preOps[1].tensor == 'A'
@@ -2465,10 +2465,13 @@ def test_emit_1x1_partition_DU256():
     wait_lr_0 = em0[em0[0].before]
     assert wait_lr_0.opType == 'wait_lr'
 
-    # wait_gr is standalone (no incoming before)
+    # wait_gr is standalone (no incoming before), followed by sync
     wait_grs_0 = [e for e in em0 if e.opType == 'wait_gr']
     assert len(wait_grs_0) == 1
     assert wait_grs_0[0].before is None
+    # sync after wait_gr (from wait_gr_sync expansion)
+    wgr_sync_0 = [e for e in em0 if e.opType == 'sync' and e.before == wait_grs_0[0].moduleId]
+    assert len(wgr_sync_0) == 1
 
     # ── subIterK=1 ──
     em1 = result[0][1]
@@ -2479,10 +2482,13 @@ def test_emit_1x1_partition_DU256():
     assert len(primary1) == 7   # mfma + 3 LRs (A, B, SB) + 3 GRs (B, SA, SB)
     assert primary1[0].opType == 'mfma'
 
-    # wait_gr standalone
+    # wait_gr standalone, followed by sync
     wait_grs_1 = [e for e in em1 if e.opType == 'wait_gr']
     assert len(wait_grs_1) == 1
     assert wait_grs_1[0].before is None
+    # sync after wait_gr (from wait_gr_sync expansion)
+    wgr_sync_1 = [e for e in em1 if e.opType == 'sync' and e.before == wait_grs_1[0].moduleId]
+    assert len(wgr_sync_1) == 1
 
     # No self-loops
     for em_list in [em0, em1]:

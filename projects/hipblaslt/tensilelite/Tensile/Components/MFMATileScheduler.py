@@ -230,7 +230,8 @@ class DepOp:
     """A typed dependency in a before-chain.
 
     Kinds:
-      'wait_gr'      — wait for global reads (includes implicit sync)
+      'wait_gr'      — wait for global reads (no sync)
+      'wait_gr_sync' — wait for global reads + sync barrier
       'wait_lr'      — wait for local reads (no sync, used before MFMAs)
       'wait_lr_sync' — wait for local reads + sync barrier (used before GRs,
                         to ensure LR finished reading LDS before GR overwrites it)
@@ -246,8 +247,8 @@ class DepOp:
     wait_gr_counts: Optional[WaitGRCounts] = None  # only for kind='wait_gr'
 
     def __str__(self):
-        if self.kind == 'wait_gr' and self.wait_gr_counts:
-            return f"wait_gr({self.wait_gr_counts})"
+        if self.kind in ('wait_gr', 'wait_gr_sync') and self.wait_gr_counts:
+            return f"{self.kind}({self.wait_gr_counts})"
         if self.tensor:
             return f"{self.kind}({self.tensor})"
         return self.kind
@@ -1162,7 +1163,7 @@ class MFMATileScheduler:
         cross-subIterK (converted to preOps):
           - MFMA depending on LRs → single wait_lr
           - GR depending on LRs   → single wait_lr_sync
-          - LR depending on GRs   → single wait_gr with per-tensor inflight counts
+          - LR depending on GRs   → single wait_gr_sync with per-tensor inflight counts
         """
         if 'deps' not in self._completed:
             self.annotate_deps()
@@ -1189,7 +1190,7 @@ class MFMATileScheduler:
                             inflight = self._compute_inflight_loads(
                                 pi, lr.subIterK_slot, t, dep)
                             setattr(counts, t, inflight)
-                        lr.preOps.append(DepOp(kind='wait_gr',
+                        lr.preOps.append(DepOp(kind='wait_gr_sync',
                                                wait_gr_counts=counts))
 
                 # ── GRs ──
@@ -1240,15 +1241,18 @@ class MFMATileScheduler:
     def _merge_preops(all_preops: List[List['DepOp']]) -> List['DepOp']:
         """Merge preOps from multiple placements.
 
-        Combines wait_gr counts into a single DepOp, deduplicates barrier ops
+        Combines wait_gr/wait_gr_sync counts into a single DepOp, deduplicates barrier ops
         (wait_lr_sync, wait_lr), and collects the rest.
         """
         merged_counts = None
+        has_wait_gr_sync = False
         seen_kinds = set()
         others = []
         for preops in all_preops:
             for op in preops:
-                if op.kind == 'wait_gr' and op.wait_gr_counts:
+                if op.kind in ('wait_gr', 'wait_gr_sync') and op.wait_gr_counts:
+                    if op.kind == 'wait_gr_sync':
+                        has_wait_gr_sync = True
                     if merged_counts is None:
                         merged_counts = WaitGRCounts()
                     for t in ('A', 'B', 'SA', 'SB'):
@@ -1263,7 +1267,8 @@ class MFMATileScheduler:
                     others.append(op)
         result = []
         if merged_counts is not None:
-            result.append(DepOp(kind='wait_gr', wait_gr_counts=merged_counts))
+            merged_kind = 'wait_gr_sync' if has_wait_gr_sync else 'wait_gr'
+            result.append(DepOp(kind=merged_kind, wait_gr_counts=merged_counts))
         result.extend(others)
         return result
 
@@ -1518,6 +1523,7 @@ class MFMATileScheduler:
 
         The before-link topology matches SubtileBasedScheduler._buildEmittedModules:
           - wait_gr is standalone (no incoming before-link), but later deps chain from it
+          - wait_gr_sync expands to two modules: wait_gr then sync
           - wait_lr_sync expands to two modules: wait_lr then sync
           - Same-subIterK DepRef deps become ordering constraints (no new module)
         """
@@ -1577,6 +1583,18 @@ class MFMATileScheduler:
                             prevId = depId
                             if firstPreOpId is None:
                                 firstPreOpId = depId
+                            continue
+                        elif preOp.kind == 'wait_gr_sync':
+                            # Expand to wait_gr + sync
+                            depId = add('wait_gr', str(preOp), source=preOp)
+                            prevId = depId
+                            if firstPreOpId is None:
+                                firstPreOpId = depId
+                            depId = add('sync', 'sync',
+                                        source=DepOp(kind='sync'))
+                            setBefore(depId, prevId)
+                            prevId = depId
+                            lastDepId = depId
                             continue
                         elif preOp.kind == 'wait_lr_sync':
                             # Expand to wait_lr + sync
