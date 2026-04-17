@@ -537,13 +537,15 @@ def test_PGR2_256_256_1x1_extract_paths_from_before_deps():
         (7, "gr_inc", 8, 2),
     ]
 
-    mfmaIdx0, pathOrders0 = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted0)
-    mfmaIdx1, pathOrders1 = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted1)
+    mfmaIdx0, pathOrders0, preMfma0 = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted0)
+    mfmaIdx1, pathOrders1, preMfma1 = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted1)
 
     assert mfmaIdx0 == 0
     assert pathOrders0 == [[1, 3, 4, 2]]
+    assert preMfma0 == []
     assert mfmaIdx1 == 0
     assert pathOrders1 == [[3, 4, 5, 1, 6], [2, 7]]
+    assert preMfma1 == []
 
 
 def _classify_inst(inst):

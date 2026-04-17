@@ -1767,13 +1767,15 @@ class SubtileBasedScheduler:
         return module
 
     @staticmethod
-    def _extractPathsFromBeforeDeps(emittedModules: List['EmittedModule']) -> Tuple[int, List[List[int]]]:
+    def _extractPathsFromBeforeDeps(emittedModules: List['EmittedModule']) -> Tuple[int, List[List[int]], List[List[int]]]:
         """Extract non-MFMA dependency paths using only EmittedModule.before links.
 
         Returns:
-          (mfmaIdx, paths)
+          (mfmaIdx, paths, preMfmaPaths)
           - mfmaIdx: index of the MFMA emitted module in emittedModules
-          - paths: list of non-MFMA module-index paths
+          - paths: list of non-MFMA module-index paths to interleave between MFMAs
+          - preMfmaPaths: paths that must be emitted before the first MFMA
+            (reachable from the MFMA's before link)
         """
         idToIdx = {em.moduleId: i for i, em in enumerate(emittedModules)}
         n = len(emittedModules)
@@ -1783,6 +1785,14 @@ class SubtileBasedScheduler:
         mfmaIdx = mfmaModuleIds[0]
         nonMfmaIds = [i for i in range(n) if i != mfmaIdx]
         nonMfmaSet = set(nonMfmaIds)
+
+        # Identify the non-MFMA module the MFMA depends on (if any).
+        mfmaBefore = emittedModules[mfmaIdx].before
+        preMfmaTarget = None
+        if mfmaBefore is not None:
+            bi = idToIdx.get(mfmaBefore)
+            if bi is not None and bi in nonMfmaSet:
+                preMfmaTarget = bi
 
         # Each non-MFMA module has at most one predecessor, and each predecessor
         # has at most one child, so paths are simple chains.
@@ -1831,7 +1841,16 @@ class SubtileBasedScheduler:
                 used[i] = True
             paths.append(order)
 
-        return mfmaIdx, paths
+        # Separate paths that the MFMA depends on (must go before first MFMA).
+        preMfmaPaths: List[List[int]] = []
+        regularPaths: List[List[int]] = []
+        for path in paths:
+            if preMfmaTarget is not None and preMfmaTarget in path:
+                preMfmaPaths.append(path)
+            else:
+                regularPaths.append(path)
+
+        return mfmaIdx, regularPaths, preMfmaPaths
 
     @staticmethod
     def instructionSchedule(emittedModules: List['EmittedModule']):
@@ -1855,12 +1874,19 @@ class SubtileBasedScheduler:
         isMFMA = lambda x: isinstance(x, (MFMAInstruction, MXMFMAInstruction))
         n = len(emittedModules)
 
-        mfmaIdx, pathOrders = SubtileBasedScheduler._extractPathsFromBeforeDeps(emittedModules)
+        mfmaIdx, pathOrders, preMfmaOrders = SubtileBasedScheduler._extractPathsFromBeforeDeps(emittedModules)
         mfmas = [x for x in emittedModules[mfmaIdx].instructions if isMFMA(x)]
 
-        # Single MFMA: no slots to interleave into — emit MFMA then all paths.
+        def _emitPreMfma(result):
+            for order in preMfmaOrders:
+                for mid in order:
+                    for inst in emittedModules[mid].instructions:
+                        result.add(inst)
+
+        # Single MFMA: no slots to interleave into — emit preMfma, MFMA, then paths.
         if len(mfmas) < 2:
             result = Module()
+            _emitPreMfma(result)
             for m in mfmas:
                 result.add(m)
             for order in pathOrders:
@@ -1886,7 +1912,9 @@ class SubtileBasedScheduler:
                 rules.setupBufLoadSpreading(placer, pathInsts, order)
             placer.placePath(pathInsts, reverse=hasWaitGR)
 
-        scheduled = placer.assemble(mfmas)
+        scheduled = Module()
+        _emitPreMfma(scheduled)
+        scheduled.add(placer.assemble(mfmas))
 
         # Post-pass: adjust vmcnt of any SWaitCnt to account for buffer_loads
         # that the scheduler placed before it within this subIterK.

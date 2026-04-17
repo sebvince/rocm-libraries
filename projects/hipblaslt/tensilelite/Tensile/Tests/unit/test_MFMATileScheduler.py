@@ -2714,9 +2714,12 @@ if __name__ == "__main__":
             scheduled = SubtileBasedScheduler.instructionSchedule(emitted)
 
             # Display paths that instructionSchedule extracts
-            mfmaIdx, paths = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted)
+            mfmaIdx, paths, preMfmaPaths = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted)
             mfma_em = emitted[mfmaIdx]
             buf.write(f"      MFMA [{mfma_em.moduleId}]: {mfma_em.label}\n")
+            for pi2, path in enumerate(preMfmaPaths):
+                labels = [f"[{emitted[mid].moduleId}] {emitted[mid].opType}" for mid in path]
+                buf.write(f"      PreMFMA {pi2}: {' -> '.join(labels)}\n")
             for pi2, path in enumerate(paths):
                 labels = [f"[{emitted[mid].moduleId}] {emitted[mid].opType}" for mid in path]
                 buf.write(f"      Path {pi2}: {' -> '.join(labels)}\n")

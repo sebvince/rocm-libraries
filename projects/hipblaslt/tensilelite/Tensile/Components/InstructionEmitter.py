@@ -114,22 +114,21 @@ class InstructionEmitter:
                     module.add(emitSingleDsRead(
                         ti, tileId, subtileK, subIterK_within, dstTile))
         elif tensor in ('SA', 'SB'):
-            # Scale LR: DSLoadB32
             tc = 'MXSA' if tensor == 'SA' else 'MXSB'
             ti = self.tileInfoMap[tensor]
+            lrGran = self.config.lrSA if tensor == 'SA' else self.config.lrSB
             vgprTilesScale = self.vgprTilesSA if tensor == 'SA' else self.vgprTilesSB
-            groupStride = 2 * ti.subtileSize
-            for tileId in placement.tiles.tileId_list:
-                scaleGroupIdx = tileId // 2
-                for k in placement.tiles.subIterK_list:
-                    subtileK = k // self.subtileShapeK
-                    dsOffset = groupStride * (scaleGroupIdx * (self.config.numSubIterK // self.subtileShapeK) + subtileK)
-                    vdst = next(iter(vgprTilesScale[tile_map[scaleGroupIdx]]))
-                    module.add(DSLoadB32(
-                        dst=vgpr(vdst),
-                        src=vgpr(ti.sharedVgprLROffset[0]),
-                        ds=DSModifiers(offset=dsOffset),
-                        comment=f"scale{tc}[group{scaleGroupIdx},K={k}]: load 4B from LDS"))
+            groupStride = lrGran.size.mn * ti.subtileSize
+            subtileK = placement.tiles.subIterK_start // self.subtileShapeK
+            for tileId in range(placement.tiles.tileId_start, placement.tiles.tileId_end, lrGran.size.mn):
+                scaleGroupIdx = tileId // lrGran.size.mn
+                dsOffset = groupStride * (scaleGroupIdx * (self.config.numSubIterK // self.subtileShapeK) + subtileK)
+                vdst = next(iter(vgprTilesScale[tile_map[scaleGroupIdx]]))
+                module.add(DSLoadB32(
+                    dst=vgpr(vdst),
+                    src=vgpr(ti.sharedVgprLROffset[0]),
+                    ds=DSModifiers(offset=dsOffset),
+                    comment=f"scale{tc}[group{scaleGroupIdx},K={placement.tiles.subIterK_start}]: load 4B from LDS"))
         return list(module.flatitems())
 
     def emit_gr(self, placement):
