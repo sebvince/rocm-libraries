@@ -106,8 +106,9 @@ class InstructionEmitter:
         if tensor in ('A', 'B'):
             ti = self.tileInfoMap[tensor]
             vgprTiles = self.vgprTilesA if tensor == 'A' else self.vgprTilesB
-            for tileId in placement.tiles.tileId_list:
-                for k in placement.tiles.subIterK_list:
+            lrGran = self.config.lrA if tensor == 'A' else self.config.lrB
+            for tileId in range(placement.tiles.tileId_start, placement.tiles.tileId_end, lrGran.size.mn):
+                for k in range(placement.tiles.subIterK_start, placement.tiles.subIterK_end, lrGran.size.k):
                     subtileK = k // self.subtileShapeK
                     subIterK_within = k % self.subtileShapeK
                     dstTile = vgprTiles[tile_map[tileId]]
@@ -137,8 +138,9 @@ class InstructionEmitter:
         tensor = placement.tensor
         if tensor in ('A', 'B'):
             ti = self.tileInfoMap[tensor]
-            for tileId in placement.tiles.tileId_list:
-                for k in placement.tiles.subIterK_list:
+            grGran = self.config.grA if tensor == 'A' else self.config.grB
+            for tileId in range(placement.tiles.tileId_start, placement.tiles.tileId_end, grGran.size.mn):
+                for k in range(placement.tiles.subIterK_start, placement.tiles.subIterK_end, grGran.size.k):
                     subtileK = k // self.subtileShapeK
                     module.add(emitSingleBufferLoad(ti, self.kernel, tileId, subtileK))
         elif tensor in ('SA', 'SB'):
