@@ -1621,52 +1621,67 @@ class MFMATileScheduler:
                        scaleTileInfoA=None, scaleTileInfoB=None):
         """Allocate physical VGPR tiles based on assign_vgpr_tiles() peaks.
 
+        Each vgprTile holds one LR granularity worth of data:
+          size = ceil(mmaTileRegCount * lrGranularity.k * lrGranularity.mn)
+
+        Ex: 4 VGPRs for A/B for 1 MFMATile, and 1 VGPR for a 2x2 MFMA tile for SA/SB if hasScale.
+
         Produces per-tensor lists indexed by vgprTileId:
-          vgprTilesA/B: List[RegisterTileInfo] with mmaTileRegCount VGPRs each
-          vgprTilesSA/SB: List[int] with 1 VGPR each
+          vgprTilesA/B:   List[RegisterTileInfo]
+          vgprTilesSA/SB: List[RegisterTileInfo]
         """
         if 'vgpr_tiles' not in self._completed:
             self.assign_vgpr_tiles()
 
         from Tensile.Components.SubtileBasedKernel import TileInfo
 
-        mmaTileRegCount = int(math.ceil(tileInfoA.mmaTileRegCount))
+        cfg = self.config
 
-        def _alloc_data_tiles(count):
+        def _tile_vgpr_count(tileInfo, lrGran):
+            return int(math.ceil(tileInfo.mmaTileRegCount * lrGran.size.k * lrGran.size.mn))
+
+        def _alloc_tiles(count, numRegs):
             tiles = []
             for _ in range(count):
                 tile = TileInfo.RegisterTileInfo(writer.vgprPool)
-                for j in range(0, mmaTileRegCount, 4):
-                    vstart = writer.vgprPool.checkOutAligned(4, 4)
-                    for k in range(4):
+                for j in range(0, numRegs, 4):
+                    blockSize = min(4, numRegs - j)
+                    vstart = writer.vgprPool.checkOutAligned(blockSize, blockSize)
+                    for k in range(blockSize):
                         tile.append(vstart + k)
                 tiles.append(tile)
             return tiles
 
-        self.vgprTilesA = _alloc_data_tiles(self.tile_peaks.get('A', 0))
-        self.vgprTilesB = _alloc_data_tiles(self.tile_peaks.get('B', 0))
+        self.vgprTilesA = _alloc_tiles(self.tile_peaks.get('A', 0),
+                                       _tile_vgpr_count(tileInfoA, cfg.lrA))
+        self.vgprTilesB = _alloc_tiles(self.tile_peaks.get('B', 0),
+                                       _tile_vgpr_count(tileInfoB, cfg.lrB))
 
-        self.vgprTilesSA = [writer.vgprPool.checkOut(1)
-                            for _ in range(self.tile_peaks.get('SA', 0))]
-        self.vgprTilesSB = [writer.vgprPool.checkOut(1)
-                            for _ in range(self.tile_peaks.get('SB', 0))]
+        if cfg.hasScale and scaleTileInfoA and scaleTileInfoB:
+            self.vgprTilesSA = _alloc_tiles(self.tile_peaks.get('SA', 0),
+                                            _tile_vgpr_count(scaleTileInfoA, cfg.lrSA))
+            self.vgprTilesSB = _alloc_tiles(self.tile_peaks.get('SB', 0),
+                                            _tile_vgpr_count(scaleTileInfoB, cfg.lrSB))
+        else:
+            self.vgprTilesSA = []
+            self.vgprTilesSB = []
 
     def deallocVgprTiles(self, writer):
         """Deallocate VGPR tiles allocated by allocVgprTiles."""
-        for tiles in [self.vgprTilesA, self.vgprTilesB]:
+        def _dealloc_tiles(tiles):
             for tile in tiles:
                 pool = tile.regList.regPool
                 for val in tile:
                     if tile.index(val) % 4 == 0:
                         pool.checkIn(val)
+
+        _dealloc_tiles(self.vgprTilesA)
+        _dealloc_tiles(self.vgprTilesB)
+        _dealloc_tiles(self.vgprTilesSA)
+        _dealloc_tiles(self.vgprTilesSB)
         self.vgprTilesA = []
         self.vgprTilesB = []
-
-        for v in self.vgprTilesSA:
-            writer.vgprPool.checkIn(v)
         self.vgprTilesSA = []
-        for v in self.vgprTilesSB:
-            writer.vgprPool.checkIn(v)
         self.vgprTilesSB = []
 
     # ── Populate instructions ──────────────────────────────

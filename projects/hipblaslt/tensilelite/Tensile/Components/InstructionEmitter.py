@@ -80,8 +80,10 @@ class InstructionEmitter:
                 if self.hasScale:
                     scaleGroupA = a // 2
                     scaleGroupB = b // 2
-                    scaleAVgpr = self.vgprTilesSA[tile_map_SA[scaleGroupA]]
-                    scaleBVgpr = self.vgprTilesSB[tile_map_SB[scaleGroupB]]
+                    scaleATile = self.vgprTilesSA[tile_map_SA[scaleGroupA]]
+                    scaleBTile = self.vgprTilesSB[tile_map_SB[scaleGroupB]]
+                    scaleAVgpr = next(iter(scaleATile))
+                    scaleBVgpr = next(iter(scaleBTile))
                     sAsel = (a % 2) + 2 * subIterK
                     sBsel = (b % 2) + 2 * subIterK
                 else:
@@ -122,7 +124,7 @@ class InstructionEmitter:
                 for k in placement.tiles.subIterK_list:
                     subtileK = k // self.subtileShapeK
                     dsOffset = groupStride * (scaleGroupIdx * (self.config.numSubIterK // self.subtileShapeK) + subtileK)
-                    vdst = vgprTilesScale[tile_map[scaleGroupIdx]]
+                    vdst = next(iter(vgprTilesScale[tile_map[scaleGroupIdx]]))
                     module.add(DSLoadB32(
                         dst=vgpr(vdst),
                         src=vgpr(ti.sharedVgprLROffset[0]),
