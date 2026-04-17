@@ -1279,7 +1279,7 @@ def test_assign_vgpr_tiles_DU512():
         assert len(slot.mfma.vgpr_tile_map_SA) > 0
         assert len(slot.mfma.vgpr_tile_map_SB) > 0
 
-    assert sched.needs_unrolling
+    assert not sched.needs_unrolling
     assert sched.tile_peaks['SA'] > 0
     assert sched.tile_peaks['SB'] > 0
     assert_vgpr_no_conflict_and_unrolling(sched)
@@ -1333,7 +1333,7 @@ def test_assign_vgpr_tiles_DU512_partition_2x2():
     assert [lr.tensor for lr in parts[3][2].lrs] == ['SA']
     assert [lr.tensor for lr in parts[3][3].lrs] == ['A', 'B', 'SB']
 
-    assert sched.needs_unrolling
+    assert not sched.needs_unrolling
     assert_vgpr_no_conflict_and_unrolling(sched)
 
 

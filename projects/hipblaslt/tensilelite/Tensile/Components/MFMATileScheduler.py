@@ -623,11 +623,15 @@ class MFMATileScheduler:
                         elif tensor in ('SA', 'SB') and cfg.hasScale:
                             tile_map = {}
                             sk_gran = scale_k_gran[tensor]
+                            seen_keys = set()
                             for t in lr.tiles.tileId_list:
                                 sg = t // 2
                                 for lk in lr.tiles.subIterK_list:
                                     k_chunk = (lk // sk_gran) * sk_gran
                                     key = (tensor, sg, k_chunk)
+                                    if key in seen_keys:
+                                        continue
+                                    seen_keys.add(key)
                                     if key in target:
                                         pools[tensor].release(target[key])
                                     vid = pools[tensor].alloc()
@@ -1730,6 +1734,8 @@ class MFMATileScheduler:
         buf = io.StringIO()
         buf.write(f"needsUnrolling: {self.needs_unrolling}, "
                   f"unrollFactor: {self.unroll_factor}\n")
+        peaks_str = ", ".join(f"{t}: {cnt}" for t, cnt in sorted(self.tile_peaks.items()))
+        buf.write(f"vgprTiles: {peaks_str}\n")
         for ui in range(self.unroll_factor):
             if self.unroll_factor > 1:
                 buf.write(f"MAINLOOP (unroll {ui}):\n")
