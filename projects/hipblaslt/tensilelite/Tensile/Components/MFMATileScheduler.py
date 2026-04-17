@@ -1092,6 +1092,53 @@ class MFMATileScheduler:
             for gr in slot.grs:
                 gr.deps = _dedup_deps(gr.deps)
 
+    # ── Remove unnecessary GR deps ────────────────────────
+
+    def remove_unnecessary_gr_deps(self):
+        """Remove GR deps on LRs that are already guaranteed by an earlier LR's wait.
+
+        Per tensor, walks LR placements in execution order. If an earlier LR
+        already waits for a GR with equal or higher exec_order, the later LR's
+        dep is redundant and removed.
+
+        Wraps around: the first LR's dep is compared against the last from the
+        previous MT iteration (max dep exec_order shifted by mt_offset -1).
+        """
+        if 'deps' not in self._completed:
+            self.annotate_deps()
+
+        def _dep_exec_order(dep):
+            return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
+
+        tensors = ['A', 'B']
+        if self.config.hasScale:
+            tensors += ['SA', 'SB']
+
+        for tensor in tensors:
+            lr_with_gr_deps = []
+            for pi, slots in enumerate(self._partitions):
+                for slot in slots:
+                    for lr in slot.lrs:
+                        if lr.tensor == tensor and lr.deps:
+                            dep = lr.deps[0]
+                            if isinstance(dep.ref, GRPlacement):
+                                lr_with_gr_deps.append((lr, dep))
+
+            if len(lr_with_gr_deps) <= 1:
+                continue
+
+            max_eo = max(_dep_exec_order(dep) for _, dep in lr_with_gr_deps)
+            max_guaranteed = (max_eo[0] - 1, max_eo[1], max_eo[2])
+
+            for lr, dep in lr_with_gr_deps:
+                eo = _dep_exec_order(dep)
+                if eo <= max_guaranteed:
+                    lr.deps.clear()
+                else:
+                    max_guaranteed = eo
+
+        self._completed.add('remove_gr_deps')
+
     # ── Remove cross-subIterK deps ─────────────────────────
 
     def _gr_granularity(self, tensor: str) -> ReadGranularity:
@@ -1165,8 +1212,8 @@ class MFMATileScheduler:
           - GR depending on LRs   → single wait_lr_sync
           - LR depending on GRs   → single wait_gr_sync with per-tensor inflight counts
         """
-        if 'deps' not in self._completed:
-            self.annotate_deps()
+        if 'remove_gr_deps' not in self._completed:
+            self.remove_unnecessary_gr_deps()
 
         for pi, slots in enumerate(self._partitions):
             for slot in slots:

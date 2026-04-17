@@ -1903,14 +1903,16 @@ def test_remove_cross_deps_1x1_partition_DU256():
     assert _preop_kinds(s0.mfma) == [('wait_lr', None)]
     assert len(s0.mfma.deps) == 0
 
-    # LR A @s0: dep on GR A @s0 (MT-2) → cross, wait_gr_sync with A=16
+    # LR A @s0: dep on GR A @s0 (MT-2) removed by remove_unnecessary_gr_deps
+    # (guaranteed by LR A @s1's dep on GR A @s0 MT-1 from previous iteration)
     lr_a0 = _get_lr(s0, 'A')
-    assert _preop_kinds(lr_a0) == [('wait_gr_sync', {'A': 16, 'B': 0, 'SA': 0, 'SB': 0})]
+    assert _preop_kinds(lr_a0) == []
     assert len(lr_a0.deps) == 0
 
-    # LR B @s0: dep on GR B @s1 (MT-2) → cross, wait_gr_sync with B=16
+    # LR B @s0: dep on GR B @s1 (MT-2) removed by remove_unnecessary_gr_deps
+    # (guaranteed by LR B @s1's dep on GR B @s1 MT-1 from previous iteration)
     lr_b0 = _get_lr(s0, 'B')
-    assert _preop_kinds(lr_b0) == [('wait_gr_sync', {'A': 0, 'B': 16, 'SA': 0, 'SB': 0})]
+    assert _preop_kinds(lr_b0) == []
     assert len(lr_b0.deps) == 0
 
     # LR SA @s0: dep on GR SA @s1 (MT-1) → cross, wait_gr_sync with SA=1
@@ -1919,13 +1921,14 @@ def test_remove_cross_deps_1x1_partition_DU256():
     assert len(lr_sa0.deps) == 0
 
     # GR A @s0: dep on LR A @s0 (MT 0, same slot) → same-subIterK, stays in deps
+    # All GRs get wait_lr_sync preOp unconditionally
     gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
-    assert _preop_kinds(gr_a0) == []
+    assert _preop_kinds(gr_a0) == [('wait_lr_sync', None)]
     assert len(gr_a0.deps) == 1
 
     # GR B @s0: dep on LR B @s0 (MT 0, same slot) → same-subIterK, stays in deps
     gr_b0 = [gr for gr in s0.grs if gr.tensor == 'B'][0]
-    assert _preop_kinds(gr_b0) == []
+    assert _preop_kinds(gr_b0) == [('wait_lr_sync', None)]
     assert len(gr_b0.deps) == 1
 
     # ── subIterK=1 ──
@@ -1995,14 +1998,14 @@ def test_remove_cross_deps_2x2_partition_DU512():
     assert _preop_kinds(p0[0].mfma) == [('wait_lr', None)]
     assert len(p0[0].mfma.deps) == 0
 
-    # LR A @P0:s0: dep on GR A @P2:s1 (MT-2) → wait_gr_sync A=36
+    # LR A @P0:s0: dep on GR A @P2:s1 (MT-2) removed by remove_unnecessary_gr_deps
     lr_a_p0_s0 = _get_lr(p0[0], 'A')
-    assert lr_a_p0_s0.preOps[0].wait_gr_counts.A == 36
+    assert _preop_kinds(lr_a_p0_s0) == []
     assert len(lr_a_p0_s0.deps) == 0
 
-    # LR SA @P0:s0: dep on GR SA → wait_gr_sync SA=2
+    # LR SA @P0:s0: dep removed by remove_unnecessary_gr_deps
     lr_sa_p0_s0 = _get_lr(p0[0], 'SA')
-    assert lr_sa_p0_s0.preOps[0].wait_gr_counts.SA == 2
+    assert _preop_kinds(lr_sa_p0_s0) == []
     assert len(lr_sa_p0_s0.deps) == 0
 
     # GR A @P0:s0: dep on LR A @P0:s3 (MT-1) → wait_lr_sync
@@ -2155,12 +2158,14 @@ def test_compute_inflight_loads():
     # Walk: s1→s0 (wrap1, count GR A=8 since it's dep but wraps<2), s1→s0 (wrap2, dep found) → 8
     assert count_a == 16  # Wait, let me verify with actual output
 
-    # Instead of manual calculation, verify against the actual remove_cross_deps output
+    # Verify against actual remove_cross_deps output
+    # Note: LR A @s0 and LR B @s0 deps are removed by remove_unnecessary_gr_deps
     sched3 = MFMATileScheduler(cfg)
     sched3.remove_cross_deps()
-    # LR A @s0 had wait_gr_sync A=16 in the dump
+
+    # LR A @s0: dep removed (guaranteed by prev MT) → no preOps
     lr_a0_final = _get_lr(sched3._partitions[0][0], 'A')
-    assert lr_a0_final.preOps[0].wait_gr_counts.A == 16
+    assert _preop_kinds(lr_a0_final) == []
 
     # LR B @s1 had wait_gr_sync B=1
     lr_b1_final = _get_lr(sched3._partitions[0][1], 'B')
@@ -2349,11 +2354,12 @@ def test_group_lr_gr_1x1_partition_DU256():
     lr_b0 = _get_lr(s0, 'B')
     lr_sa0 = _get_lr(s0, 'SA')
 
-    # First LR (A) has merged wait_gr_sync
+    # First LR (A) has merged wait_gr_sync (only SA remains;
+    # A and B deps were removed by remove_unnecessary_gr_deps)
     assert len(lr_a0.preOps) == 1
     assert lr_a0.preOps[0].kind == 'wait_gr_sync'
-    assert lr_a0.preOps[0].wait_gr_counts.A == 16
-    assert lr_a0.preOps[0].wait_gr_counts.B == 16
+    assert lr_a0.preOps[0].wait_gr_counts.A == 0
+    assert lr_a0.preOps[0].wait_gr_counts.B == 0
     assert lr_a0.preOps[0].wait_gr_counts.SA == 1
     assert lr_a0.deps == []
 
@@ -2374,10 +2380,11 @@ def test_group_lr_gr_1x1_partition_DU256():
     gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
     gr_b0 = [gr for gr in s0.grs if gr.tensor == 'B'][0]
 
-    # First GR (A) has merged preOps: gr_inc(A), gr_inc(B)
-    assert len(gr_a0.preOps) == 2
-    assert gr_a0.preOps[0].kind == 'gr_inc' and gr_a0.preOps[0].tensor == 'A'
-    assert gr_a0.preOps[1].kind == 'gr_inc' and gr_a0.preOps[1].tensor == 'B'
+    # First GR (A) has merged preOps: wait_lr_sync, gr_inc(A), gr_inc(B)
+    assert len(gr_a0.preOps) == 3
+    assert gr_a0.preOps[0].kind == 'wait_lr_sync'
+    assert gr_a0.preOps[1].kind == 'gr_inc' and gr_a0.preOps[1].tensor == 'A'
+    assert gr_a0.preOps[2].kind == 'gr_inc' and gr_a0.preOps[2].tensor == 'B'
     # First GR dep points to last LR (SA)
     assert len(gr_a0.deps) == 1
     assert gr_a0.deps[0].ref is lr_sa0
@@ -2644,14 +2651,15 @@ if __name__ == "__main__":
     sched = MFMATileScheduler(cfg)
 
     steps = [
-        ("Step 1: Place LRs",          lambda: (sched.place_LRs(), sched.print_lr())),
-        ("Step 2: Assign VGPR tiles",   lambda: (sched.assign_vgpr_tiles(), sched.print_vgpr())),
-        ("Step 3: Place GRs",           lambda: (sched.place_GRs(), sched.print_gr())),
-        ("Step 4: Annotate deps",       lambda: (sched.annotate_deps(), sched.print_deps())),
-        ("Step 5: Remove cross deps",  lambda: (sched.remove_cross_deps(), sched.print_remove_deps())),
-        ("Step 6: Insert gr/lr inc",   lambda: (sched.insert_gr_lr_inc(), sched.print_group_lr_gr())),
-        ("Step 7: Group LR/GR",        lambda: (sched.group_lr_gr(), sched.print_group_lr_gr())),
-        ("Step 8: Emit",               lambda: (sched.emit(), sched.print_emit())),
+        ("Step 1: Place LRs",              lambda: (sched.place_LRs(), sched.print_lr())),
+        ("Step 2: Assign VGPR tiles",       lambda: (sched.assign_vgpr_tiles(), sched.print_vgpr())),
+        ("Step 3: Place GRs",               lambda: (sched.place_GRs(), sched.print_gr())),
+        ("Step 4: Annotate deps",           lambda: (sched.annotate_deps(), sched.print_deps())),
+        ("Step 5: Remove unnecessary GR deps", lambda: (sched.remove_unnecessary_gr_deps(), sched.print_deps())),
+        ("Step 6: Remove cross deps",       lambda: (sched.remove_cross_deps(), sched.print_remove_deps())),
+        ("Step 7: Insert gr/lr inc",        lambda: (sched.insert_gr_lr_inc(), sched.print_group_lr_gr())),
+        ("Step 8: Group LR/GR",             lambda: (sched.group_lr_gr(), sched.print_group_lr_gr())),
+        ("Step 9: Emit",                    lambda: (sched.emit(), sched.print_emit())),
     ]
 
     interactive = "--interactive" in sys.argv or "-i" in sys.argv
@@ -2740,7 +2748,7 @@ if __name__ == "__main__":
                 buf.write(f"      Instructions: (empty — logical level, no GPU instructions)\n")
 
     print(f"{'=' * 60}")
-    print(f"  Step 9: instructionSchedule")
+    print(f"  Step 10: instructionSchedule")
     print(f"{'=' * 60}")
     print(buf.getvalue())
 
