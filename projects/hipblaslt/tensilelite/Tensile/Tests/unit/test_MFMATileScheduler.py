@@ -2659,9 +2659,50 @@ if __name__ == "__main__":
         if interactive and i < len(steps) - 1:
             input("Press Enter for next step...")
 
-    # ── instructionSchedule: extract paths and validate topology ──
+    # ── populate_instructions: fill GPU instructions ──
+    from types import SimpleNamespace
+    from rocisa import rocIsa
+    from rocisa.register import RegisterPool
+    from rocisa.enum import RegisterType
     from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler
 
+    ri = rocIsa.getInstance()
+    if not ri.isInit():
+        import shutil
+        asmpath = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asmpath)
+    ri.setKernel((9, 5, 0), 64)
+
+    writer = SimpleNamespace()
+    writer.vgprPool = RegisterPool(0, RegisterType.Vgpr, False)
+    writer.agprPool = RegisterPool(0, RegisterType.Accvgpr, False)
+    writer.sgprPool = RegisterPool(0, RegisterType.Sgpr, False)
+    writer.states = SimpleNamespace(
+        regCaps={"MaxSgpr": 106, "MaxVgpr": 256, "PhysicalMaxVgpr": 512},
+    )
+    dTileInfo = TileInfo('D', kernel)
+    dTileInfo.allocVgprTileRegisters(writer, kernel)
+    writer.states.d = SimpleNamespace(tileInfo=dTileInfo)
+    writer.states.a = SimpleNamespace(tileInfo=tiA)
+    writer.states.b = SimpleNamespace(tileInfo=tiB)
+    writer.states.mxsa = SimpleNamespace(tileInfo=scaleTiA)
+    writer.states.mxsb = SimpleNamespace(tileInfo=scaleTiB)
+    tiA.allocOffsetRegisters(writer, kernel)
+    tiB.allocOffsetRegisters(writer, kernel)
+    scaleTiA.allocOffsetRegisters(writer, kernel)
+    scaleTiB.allocOffsetRegisters(writer, kernel)
+
+    sched.allocVgprTiles(writer, tiA, tiB,
+                         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+
+    sched.populate_instructions(
+        writer, kernel,
+        tileInfoA=tiA, tileInfoB=tiB,
+        dtileInfo=dTileInfo,
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+    )
+
+    # ── instructionSchedule: extract paths and display instructions ──
     all_emitted = sched._emitted
     buf = io.StringIO()
     buf.write("MAINLOOP (instructionSchedule):\n")
@@ -2685,7 +2726,7 @@ if __name__ == "__main__":
             if insts:
                 buf.write(f"      Instructions:\n")
                 for inst in insts:
-                    buf.write(f"        {str(inst)}\n")
+                    buf.write(f"        {str(inst).rstrip()}\n")
             else:
                 buf.write(f"      Instructions: (empty — logical level, no GPU instructions)\n")
 
@@ -2693,3 +2734,5 @@ if __name__ == "__main__":
     print(f"  Step 9: instructionSchedule")
     print(f"{'=' * 60}")
     print(buf.getvalue())
+
+    sched.deallocVgprTiles(writer)
