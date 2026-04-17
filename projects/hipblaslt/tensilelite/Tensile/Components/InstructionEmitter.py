@@ -49,27 +49,27 @@ class InstructionEmitter:
             self.tileInfoMap['SA'] = scaleTileInfoA
             self.tileInfoMap['SB'] = scaleTileInfoB
 
-        # Dispatch table
+        # Dispatch table — unroll_iter is passed for mfma/lr
         self._dispatch = {
-            'mfma':     lambda em: self.emit_mfma(em.source),
-            'lr':       lambda em: self.emit_lr(em.source),
-            'gr':       lambda em: self.emit_gr(em.source),
-            'wait_gr':  lambda em: self.emit_wait_gr(em.source),
-            'wait_lr':  lambda em: self.emit_wait_lr(),
-            'sync':     lambda em: self.emit_sync(),
-            'lr_inc':   lambda em: self.emit_lr_inc(em.source),
-            'gr_inc':   lambda em: self.emit_gr_inc(em.source),
-            'gr_scale': lambda em: self.emit_gr_scale(em.source),
+            'mfma':     lambda em, ui: self.emit_mfma(em.source, ui),
+            'lr':       lambda em, ui: self.emit_lr(em.source, ui),
+            'gr':       lambda em, ui: self.emit_gr(em.source),
+            'wait_gr':  lambda em, ui: self.emit_wait_gr(em.source),
+            'wait_lr':  lambda em, ui: self.emit_wait_lr(),
+            'sync':     lambda em, ui: self.emit_sync(),
+            'lr_inc':   lambda em, ui: self.emit_lr_inc(em.source),
+            'gr_inc':   lambda em, ui: self.emit_gr_inc(em.source),
+            'gr_scale': lambda em, ui: self.emit_gr_scale(em.source),
         }
 
-    def emit_mfma(self, placement):
+    def emit_mfma(self, placement, unroll_iter=0):
         """Emit MFMA instructions from MFMAPlacement."""
         module = Module()
         subIterK = placement.subIterK
-        tile_map_A = placement.vgpr_tile_map_A or {}
-        tile_map_B = placement.vgpr_tile_map_B or {}
-        tile_map_SA = placement.vgpr_tile_map_SA or {}
-        tile_map_SB = placement.vgpr_tile_map_SB or {}
+        tile_map_A = placement.vgpr_tile_map_A[unroll_iter] if placement.vgpr_tile_map_A else {}
+        tile_map_B = placement.vgpr_tile_map_B[unroll_iter] if placement.vgpr_tile_map_B else {}
+        tile_map_SA = placement.vgpr_tile_map_SA[unroll_iter] if placement.vgpr_tile_map_SA else {}
+        tile_map_SB = placement.vgpr_tile_map_SB[unroll_iter] if placement.vgpr_tile_map_SB else {}
 
         for a in placement.tileA.tileId_list:
             for b in placement.tileB.tileId_list:
@@ -95,11 +95,11 @@ class InstructionEmitter:
                     comment=f"MFMA C[{a},{b}] += A[{a},K={subIterK}] * B[{b},K={subIterK}]"))
         return list(module.flatitems())
 
-    def emit_lr(self, placement):
+    def emit_lr(self, placement, unroll_iter=0):
         """Emit LR (ds_read) instructions from LRPlacement."""
         module = Module()
         tensor = placement.tensor
-        tile_map = placement.vgpr_tile_map or {}
+        tile_map = placement.vgpr_tile_map[unroll_iter] if placement.vgpr_tile_map else {}
 
         if tensor in ('A', 'B'):
             ti = self.tileInfoMap[tensor]
@@ -189,11 +189,11 @@ class InstructionEmitter:
         module.add(globalReadDoScaleSubtile('MXSB', self.writer, self.kernel))
         return list(module.flatitems())
 
-    def populate(self, emitted):
+    def populate(self, emitted, unroll_iter=0):
         """Walk emitted partitions and fill em.instructions."""
         for partition_emitted in emitted:
             for emitted_group in partition_emitted:
                 for em in emitted_group:
                     handler = self._dispatch.get(em.opType)
                     if handler:
-                        em.instructions = handler(em)
+                        em.instructions = handler(em, unroll_iter)

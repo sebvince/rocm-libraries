@@ -1124,16 +1124,16 @@ def test_assign_vgpr_tiles_basic():
     s1 = parts[0][1]
 
     # Every MFMA must have tile maps for A, B, SA, SB
-    assert s0.mfma.vgpr_tile_map_A is not None
-    assert s0.mfma.vgpr_tile_map_B is not None
-    assert s0.mfma.vgpr_tile_map_SA is not None
-    assert s0.mfma.vgpr_tile_map_SB is not None
+    assert len(s0.mfma.vgpr_tile_map_A) > 0
+    assert len(s0.mfma.vgpr_tile_map_B) > 0
+    assert len(s0.mfma.vgpr_tile_map_SA) > 0
+    assert len(s0.mfma.vgpr_tile_map_SB) > 0
 
-    # MFMA at k=0 and k=1 must use different vgprTileIds for A/B
+    # MFMA at k=0 and k=1 must use different vgprTileIds for A/B (check iter 0)
     # (LR at k=0 writes new tiles for k=1)
     for tensor in ('A', 'B'):
-        map_k0 = getattr(s0.mfma, f'vgpr_tile_map_{tensor}')
-        map_k1 = getattr(s1.mfma, f'vgpr_tile_map_{tensor}')
+        map_k0 = getattr(s0.mfma, f'vgpr_tile_map_{tensor}')[0]
+        map_k1 = getattr(s1.mfma, f'vgpr_tile_map_{tensor}')[0]
         for tileId in map_k0:
             if tileId in map_k1:
                 assert map_k0[tileId] != map_k1[tileId], \
@@ -1142,17 +1142,17 @@ def test_assign_vgpr_tiles_basic():
     # LRs must have tile maps
     for slot in [s0, s1]:
         for lr in slot.lrs:
-            assert lr.vgpr_tile_map is not None, \
+            assert len(lr.vgpr_tile_map) > 0, \
                 f"LR {lr.tensor} at k={slot.subIterK} missing tile map"
 
-    # MFMA and LR at same subIterK must not share vgprTileIds (same tensor)
+    # MFMA and LR at same subIterK must not share vgprTileIds (same tensor, iter 0)
     for slot in [s0, s1]:
         if slot.mfma:
             for lr in slot.lrs:
                 if lr.tensor in ('A', 'B'):
-                    mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')
+                    mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')[0]
                     mfma_vids = set(mfma_map.values())
-                    lr_vids = set(lr.vgpr_tile_map.values())
+                    lr_vids = set(lr.vgpr_tile_map[0].values())
                     assert mfma_vids.isdisjoint(lr_vids), \
                         f"MFMA and LR {lr.tensor} at k={slot.subIterK} share vgprTileIds"
 
@@ -1190,8 +1190,8 @@ def test_assign_vgpr_tiles_no_scale_k_gran_1():
     for tensor in ('A', 'B'):
         map0 = getattr(s0.mfma, f'vgpr_tile_map_{tensor}')
         map1 = getattr(s1.mfma, f'vgpr_tile_map_{tensor}')
-        assert map0 is not None
-        assert map1 is not None
+        assert len(map0) > 0
+        assert len(map1) > 0
 
     # No SA/SB peaks
     assert 'SA' not in sched.tile_peaks
@@ -1231,18 +1231,18 @@ def test_assign_vgpr_tiles_DU512():
 
     # All MFMAs have tile maps
     for slot in sched._partitions[0]:
-        assert slot.mfma.vgpr_tile_map_A is not None
-        assert slot.mfma.vgpr_tile_map_B is not None
-        assert slot.mfma.vgpr_tile_map_SA is not None
-        assert slot.mfma.vgpr_tile_map_SB is not None
+        assert len(slot.mfma.vgpr_tile_map_A) > 0
+        assert len(slot.mfma.vgpr_tile_map_B) > 0
+        assert len(slot.mfma.vgpr_tile_map_SA) > 0
+        assert len(slot.mfma.vgpr_tile_map_SB) > 0
 
-    # MFMA and LR at same subIterK don't share vgprTileIds
+    # MFMA and LR at same subIterK don't share vgprTileIds (check iter 0)
     for slot in sched._partitions[0]:
         if slot.mfma:
             for lr in slot.lrs:
                 if lr.tensor in ('A', 'B'):
-                    mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')
-                    assert set(mfma_map.values()).isdisjoint(set(lr.vgpr_tile_map.values())), \
+                    mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')[0]
+                    assert set(mfma_map.values()).isdisjoint(set(lr.vgpr_tile_map[0].values())), \
                         f"MFMA and LR {lr.tensor} at k={slot.subIterK} share vgprTileIds"
 
     assert sched.needs_unrolling
@@ -1284,17 +1284,17 @@ def test_assign_vgpr_tiles_DU512_partition_2x2():
     # All partitions' MFMAs have tile maps
     for pi in range(4):
         for slot in parts[pi]:
-            assert slot.mfma.vgpr_tile_map_A is not None
-            assert slot.mfma.vgpr_tile_map_B is not None
+            assert len(slot.mfma.vgpr_tile_map_A) > 0
+            assert len(slot.mfma.vgpr_tile_map_B) > 0
 
-    # MFMA and LR at same subIterK don't share vgprTileIds
+    # MFMA and LR at same subIterK don't share vgprTileIds (check iter 0)
     for pi in range(4):
         for slot in parts[pi]:
             if slot.mfma:
                 for lr in slot.lrs:
                     if lr.tensor in ('A', 'B'):
-                        mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')
-                        assert set(mfma_map.values()).isdisjoint(set(lr.vgpr_tile_map.values())), \
+                        mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')[0]
+                        assert set(mfma_map.values()).isdisjoint(set(lr.vgpr_tile_map[0].values())), \
                             f"P{pi} MFMA and LR {lr.tensor} at k={slot.subIterK} share vgprTileIds"
 
     # Spot-check LR presence per partition (unchanged from place_LRs).
@@ -2547,10 +2547,10 @@ def test_populate_instructions_256x256_fp4():
                 if slot.mfma and slot.lrs:
                     for lr in slot.lrs:
                         if lr.vgpr_tile_map and lr.tensor in ('A', 'B'):
-                            mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')
-                            if mfma_map:
-                                mfma_vids = set(mfma_map.values())
-                                lr_vids = set(lr.vgpr_tile_map.values())
+                            mfma_map_list = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')
+                            if mfma_map_list:
+                                mfma_vids = set(mfma_map_list[0].values())
+                                lr_vids = set(lr.vgpr_tile_map[0].values())
                                 assert mfma_vids.isdisjoint(lr_vids), \
                                     f"P{pi} subIterK={slot.subIterK}: MFMA and LR {lr.tensor} " \
                                     f"share vgprTileIds"

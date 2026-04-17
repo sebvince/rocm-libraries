@@ -164,10 +164,10 @@ class MFMAPlacement:
     tileB: MFMATileRange       # B tiles consumed
     deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['DepOp'] = field(default_factory=list)     # populated by remove_cross_deps()
-    vgpr_tile_map_A: Optional[dict] = None   # {tileId: vgprTileId} — populated by assign_vgpr_tiles()
-    vgpr_tile_map_B: Optional[dict] = None   # {tileId: vgprTileId} — populated by assign_vgpr_tiles()
-    vgpr_tile_map_SA: Optional[dict] = None  # {scaleGroupIdx: vgprTileId} — populated by assign_vgpr_tiles()
-    vgpr_tile_map_SB: Optional[dict] = None  # {scaleGroupIdx: vgprTileId} — populated by assign_vgpr_tiles()
+    vgpr_tile_map_A: List[dict] = field(default_factory=list)   # [{tileId: vgprTileId}] per unroll iter
+    vgpr_tile_map_B: List[dict] = field(default_factory=list)   # [{tileId: vgprTileId}] per unroll iter
+    vgpr_tile_map_SA: List[dict] = field(default_factory=list)  # [{scaleGroupIdx: vgprTileId}] per unroll iter
+    vgpr_tile_map_SB: List[dict] = field(default_factory=list)  # [{scaleGroupIdx: vgprTileId}] per unroll iter
 
 
 @dataclass
@@ -180,7 +180,7 @@ class LRPlacement:
     partition: int = 0         # which partition this LR belongs to
     deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['DepOp'] = field(default_factory=list)     # populated by remove_cross_deps()
-    vgpr_tile_map: Optional[dict] = None  # {tileId: vgprTileId} — populated by assign_vgpr_tiles()
+    vgpr_tile_map: List[dict] = field(default_factory=list)  # [{tileId: vgprTileId}] per unroll iter
 
 
 @dataclass
@@ -466,30 +466,31 @@ class MFMATileScheduler:
     def assign_vgpr_tiles(self):
         """Assign physical vgprTileIds to all placements (A, B, SA, SB).
 
-        Single-pass free-list allocator with per-tensor FIFO queues.
-        No sets concept — the allocator enforces that within a subIterK,
-        an LR cannot write to the same vgprTile that an MFMA reads.
+        Free-list allocator with per-tensor FIFO queues, iterated until
+        convergence (or max 4 unroll iterations).
 
         Three phases:
           1. Scan all MFMAs to find last read position for each
              (tensor, tileId, k_data_group) key.
-          2. Walk execution order: seed preloop tiles, allocate at
-             LR writes, release after last MFMA reads.
-          3. Detect unrolling: compare end-of-loop active state to
-             start-of-loop state.
+          2. Walk execution order in a loop: each iteration feeds the
+             previous next_iter as the starting active state.  Appends
+             one tile-map dict per iteration to each placement's list.
+             Stops when next_iter matches the seeded state (convergence).
+          3. Record unroll_factor, needs_unrolling, and max tile_peaks.
 
         Keys:
           A/B:   (tensor, tileId, subIterK)
           SA/SB: (tensor, scaleGroupIdx, k_chunk_start)
 
-        Sets self.tile_peaks (per-tensor), self.needs_unrolling,
-        self.unroll_factor.
+        Sets self.tile_peaks (per-tensor max across unrolls),
+        self.needs_unrolling, self.unroll_factor.
         """
         if 'lr' not in self._completed:
             self.place_LRs()
 
         cfg = self.config
         numK = cfg.numSubIterK
+        MAX_UNROLL = 8
 
         # Build k_gran lookup for scale tensors
         scale_k_gran = {}
@@ -520,7 +521,7 @@ class MFMATileScheduler:
                             sg = t // 2
                             last_read[(stensor, sg, k_chunk)] = pos
 
-        # ── Phase 2: walk execution order with per-tensor FIFO free-lists ──
+        # ── Phase 2: iterate until convergence ──
         from collections import deque
 
         class _FreeList:
@@ -543,108 +544,144 @@ class MFMATileScheduler:
                 self.free.append(vid)
                 self.active_count -= 1
 
-        pools = {t: _FreeList() for t in ['A', 'B']}
+        tensor_names = ['A', 'B']
         if cfg.hasScale:
-            pools['SA'] = _FreeList()
-            pools['SB'] = _FreeList()
+            tensor_names += ['SA', 'SB']
 
-        active = {}      # (tensor, tileIdx, k_data) -> vgprTileId (current iteration)
-        next_iter = {}   # same keys but for wrapping LR writes (next iteration data)
-        seeded = {}      # keys auto-seeded by first MFMA encounter -> vgprTileId
+        max_peaks = {t: 0 for t in tensor_names}
+        carry_active = {}
+        all_next_iters = []     # next_iter from each iteration, for cycle detection
 
-        for pi, slots in enumerate(self._partitions):
-            for slot in slots:
-                pos = pi * numK + slot.subIterK
-                k = slot.subIterK
+        pools = {t: _FreeList() for t in tensor_names}
 
-                # ── MFMA reads: look up or seed (preloop) ──
-                if slot.mfma:
-                    map_A, map_B = {}, {}
-                    for tensor, tileRange, tile_map in [
-                            ('A', slot.mfma.tileA, map_A),
-                            ('B', slot.mfma.tileB, map_B)]:
-                        for t in tileRange.tileId_list:
-                            key = (tensor, t, k)
-                            if key not in active:
-                                active[key] = pools[tensor].alloc()
-                                seeded[key] = active[key]
-                            tile_map[t] = active[key]
-                    slot.mfma.vgpr_tile_map_A = map_A
-                    slot.mfma.vgpr_tile_map_B = map_B
+        for unroll_iter in range(MAX_UNROLL):
+            if unroll_iter == 0:
+                active = {}
+            else:
+                active = dict(carry_active)
+                # Reset active_count to match carry_active (tiles that survived
+                # as live from the previous iteration's wrapping LRs).
+                for t in tensor_names:
+                    pools[t].active_count = sum(
+                        1 for key in active if key[0] == t)
 
-                    # SA/SB reads
-                    if cfg.hasScale:
-                        map_SA, map_SB = {}, {}
-                        for stensor, tileRange, tile_map in [
-                                ('SA', slot.mfma.tileA, map_SA),
-                                ('SB', slot.mfma.tileB, map_SB)]:
-                            sk_gran = scale_k_gran[stensor]
-                            k_chunk = (k // sk_gran) * sk_gran
+            next_iter = {}
+
+            for pi, slots in enumerate(self._partitions):
+                for slot in slots:
+                    pos = pi * numK + slot.subIterK
+                    k = slot.subIterK
+
+                    # ── MFMA reads: look up or seed ──
+                    if slot.mfma:
+                        map_A, map_B = {}, {}
+                        for tensor, tileRange, tile_map in [
+                                ('A', slot.mfma.tileA, map_A),
+                                ('B', slot.mfma.tileB, map_B)]:
                             for t in tileRange.tileId_list:
-                                sg = t // 2
-                                key = (stensor, sg, k_chunk)
+                                key = (tensor, t, k)
                                 if key not in active:
-                                    active[key] = pools[stensor].alloc()
-                                    seeded[key] = active[key]
-                                tile_map[sg] = active[key]
-                        slot.mfma.vgpr_tile_map_SA = map_SA
-                        slot.mfma.vgpr_tile_map_SB = map_SB
+                                    active[key] = pools[tensor].alloc()
+                                tile_map[t] = active[key]
+                        slot.mfma.vgpr_tile_map_A.append(map_A)
+                        slot.mfma.vgpr_tile_map_B.append(map_B)
 
-                # ── LR writes: allocate new tiles ──
-                # Wrapping LRs (mt != "n") write to next_iter so they
-                # don't corrupt tiles still needed by current-iteration MFMAs.
-                for lr in slot.lrs:
-                    tensor = lr.tensor
-                    is_wrapping = lr.mtIteration != "n"
-                    target = next_iter if is_wrapping else active
+                        # SA/SB reads
+                        if cfg.hasScale:
+                            map_SA, map_SB = {}, {}
+                            for stensor, tileRange, tile_map in [
+                                    ('SA', slot.mfma.tileA, map_SA),
+                                    ('SB', slot.mfma.tileB, map_SB)]:
+                                sk_gran = scale_k_gran[stensor]
+                                k_chunk = (k // sk_gran) * sk_gran
+                                for t in tileRange.tileId_list:
+                                    sg = t // 2
+                                    key = (stensor, sg, k_chunk)
+                                    if key not in active:
+                                        active[key] = pools[stensor].alloc()
+                                    tile_map[sg] = active[key]
+                            slot.mfma.vgpr_tile_map_SA.append(map_SA)
+                            slot.mfma.vgpr_tile_map_SB.append(map_SB)
 
-                    if tensor in ('A', 'B'):
-                        tile_map = {}
-                        for t in lr.tiles.tileId_list:
-                            for lk in lr.tiles.subIterK_list:
-                                key = (tensor, t, lk)
-                                if key in target:
-                                    pools[tensor].release(target[key])
-                                vid = pools[tensor].alloc()
-                                target[key] = vid
-                                tile_map[t] = vid
-                        lr.vgpr_tile_map = tile_map
-                    elif tensor in ('SA', 'SB') and cfg.hasScale:
-                        tile_map = {}
-                        sk_gran = scale_k_gran[tensor]
-                        for t in lr.tiles.tileId_list:
-                            sg = t // 2
-                            for lk in lr.tiles.subIterK_list:
-                                k_chunk = (lk // sk_gran) * sk_gran
-                                key = (tensor, sg, k_chunk)
-                                if key in target:
-                                    pools[tensor].release(target[key])
-                                vid = pools[tensor].alloc()
-                                target[key] = vid
-                                tile_map[sg] = vid
-                        lr.vgpr_tile_map = tile_map
+                    # ── LR writes: allocate new tiles ──
+                    for lr in slot.lrs:
+                        tensor = lr.tensor
+                        is_wrapping = lr.mtIteration != "n"
+                        target = next_iter if is_wrapping else active
 
-                # ── Release tiles whose last read was at this position ──
-                # Done AFTER LR writes so that same-subIterK LRs can't
-                # recycle VGPRs that the MFMA at this position still owns.
-                to_release = [key for key, lr_pos in last_read.items()
-                              if lr_pos == pos and key in active]
-                for key in to_release:
-                    pools[key[0]].release(active[key])
-                    del active[key]
+                        if tensor in ('A', 'B'):
+                            tile_map = {}
+                            for t in lr.tiles.tileId_list:
+                                for lk in lr.tiles.subIterK_list:
+                                    key = (tensor, t, lk)
+                                    if key in target:
+                                        pools[tensor].release(target[key])
+                                    vid = pools[tensor].alloc()
+                                    target[key] = vid
+                                    tile_map[t] = vid
+                            lr.vgpr_tile_map.append(tile_map)
+                        elif tensor in ('SA', 'SB') and cfg.hasScale:
+                            tile_map = {}
+                            sk_gran = scale_k_gran[tensor]
+                            for t in lr.tiles.tileId_list:
+                                sg = t // 2
+                                for lk in lr.tiles.subIterK_list:
+                                    k_chunk = (lk // sk_gran) * sk_gran
+                                    key = (tensor, sg, k_chunk)
+                                    if key in target:
+                                        pools[tensor].release(target[key])
+                                    vid = pools[tensor].alloc()
+                                    target[key] = vid
+                                    tile_map[sg] = vid
+                            lr.vgpr_tile_map.append(tile_map)
 
-        # ── Phase 3: unrolling detection ──
-        # Compare what wrapping LRs wrote (next_iter) to what the first
-        # iteration's MFMAs were seeded with (seeded).  If any seeded key
-        # has a different vgprTileId in next_iter, the loop body isn't
-        # self-consistent and must be unrolled.
-        self.needs_unrolling = any(
-            next_iter.get(key) != vid for key, vid in seeded.items()
-        )
-        self.unroll_factor = 2 if self.needs_unrolling else 1
+                    # ── Release tiles whose last read was at this position ──
+                    to_release = [key for key, lr_pos in last_read.items()
+                                  if lr_pos == pos and key in active]
+                    for key in to_release:
+                        pools[key[0]].release(active[key])
+                        del active[key]
 
-        # Per-tensor peaks
-        self.tile_peaks = {t: pools[t].peak for t in pools}
+            # Track max peaks across iterations
+            for t in tensor_names:
+                max_peaks[t] = max(max_peaks[t], pools[t].peak)
+
+            # Check convergence: if this iteration's next_iter matches
+            # any previous iteration's next_iter, we found a cycle.
+            # The cycle period is (current_iter - matching_iter).
+            # All iterations from matching_iter to current_iter-1 form
+            # the repeating pattern; iterations before that are prologue.
+            converged = False
+            for prev_idx, prev_ni in enumerate(all_next_iters):
+                if next_iter == prev_ni:
+                    # Strip tile maps from the redundant convergence iteration.
+                    for pi2, slots2 in enumerate(self._partitions):
+                        for slot2 in slots2:
+                            if slot2.mfma:
+                                slot2.mfma.vgpr_tile_map_A.pop()
+                                slot2.mfma.vgpr_tile_map_B.pop()
+                                if cfg.hasScale:
+                                    slot2.mfma.vgpr_tile_map_SA.pop()
+                                    slot2.mfma.vgpr_tile_map_SB.pop()
+                            for lr2 in slot2.lrs:
+                                lr2.vgpr_tile_map.pop()
+                    converged = True
+                    break
+            if converged:
+                break
+
+            # Carry next_iter forward as active for next iteration
+            all_next_iters.append(next_iter)
+            carry_active = next_iter
+        else:
+            assert False, (f"assign_vgpr_tiles did not converge after "
+                           f"{MAX_UNROLL} unroll iterations")
+
+        # ── Phase 3: record results ──
+        # unroll_factor = number of unique iterations (convergence iteration excluded)
+        self.unroll_factor = unroll_iter
+        self.needs_unrolling = self.unroll_factor > 1
+        self.tile_peaks = max_peaks
 
         self._completed.add('vgpr_tiles')
 
@@ -1691,37 +1728,42 @@ class MFMATileScheduler:
         """Print assign_vgpr_tiles output: LRs + MFMAs with vgprTileId annotations."""
         partitions = self._partitions
         buf = io.StringIO()
-        buf.write(f"needsUnrolling: {self.needs_unrolling}\n")
-        buf.write("MAINLOOP:\n")
-        for pi, slots in enumerate(partitions):
-            buf.write(f"  Partition {pi}:\n")
-            for slot in slots:
-                buf.write(f"    subIterK={slot.subIterK}:\n")
-                if slot.mfma:
-                    m = slot.mfma
-                    tiles_str = ""
-                    parts = []
-                    if m.vgpr_tile_map_A:
-                        parts.append("A:" + str(m.vgpr_tile_map_A))
-                    if m.vgpr_tile_map_B:
-                        parts.append("B:" + str(m.vgpr_tile_map_B))
-                    if m.vgpr_tile_map_SA:
-                        parts.append("SA:" + str(m.vgpr_tile_map_SA))
-                    if m.vgpr_tile_map_SB:
-                        parts.append("SB:" + str(m.vgpr_tile_map_SB))
-                    if parts:
-                        tiles_str = " " + ", ".join(parts)
-                    buf.write(f"      MFMAs (MT n, subIterK {m.subIterK}  ) "
-                              f"A : {m.tileA.fmt_tiles()} , "
-                              f"B : {m.tileB.fmt_tiles()}{tiles_str}\n")
-                for lr in slot.lrs:
-                    tile_str = ""
-                    if lr.vgpr_tile_map:
-                        tile_str = f" tiles:{lr.vgpr_tile_map}"
-                    t = self._fmt_tensor(lr.tensor)
-                    buf.write(f"      LR {t} (MT {lr.mtIteration}, "
-                              f"subIterK {lr.tiles.fmt_k()}) "
-                              f"{lr.tiles.fmt_tiles()}{tile_str}\n")
+        buf.write(f"needsUnrolling: {self.needs_unrolling}, "
+                  f"unrollFactor: {self.unroll_factor}\n")
+        for ui in range(self.unroll_factor):
+            if self.unroll_factor > 1:
+                buf.write(f"MAINLOOP (unroll {ui}):\n")
+            else:
+                buf.write("MAINLOOP:\n")
+            for pi, slots in enumerate(partitions):
+                buf.write(f"  Partition {pi}:\n")
+                for slot in slots:
+                    buf.write(f"    subIterK={slot.subIterK}:\n")
+                    if slot.mfma:
+                        m = slot.mfma
+                        tiles_str = ""
+                        parts = []
+                        if m.vgpr_tile_map_A:
+                            parts.append("A:" + str(m.vgpr_tile_map_A[ui]))
+                        if m.vgpr_tile_map_B:
+                            parts.append("B:" + str(m.vgpr_tile_map_B[ui]))
+                        if m.vgpr_tile_map_SA:
+                            parts.append("SA:" + str(m.vgpr_tile_map_SA[ui]))
+                        if m.vgpr_tile_map_SB:
+                            parts.append("SB:" + str(m.vgpr_tile_map_SB[ui]))
+                        if parts:
+                            tiles_str = " " + ", ".join(parts)
+                        buf.write(f"      MFMAs (MT n, subIterK {m.subIterK}  ) "
+                                  f"A : {m.tileA.fmt_tiles()} , "
+                                  f"B : {m.tileB.fmt_tiles()}{tiles_str}\n")
+                    for lr in slot.lrs:
+                        tile_str = ""
+                        if lr.vgpr_tile_map:
+                            tile_str = f" tiles:{lr.vgpr_tile_map[ui]}"
+                        t = self._fmt_tensor(lr.tensor)
+                        buf.write(f"      LR {t} (MT {lr.mtIteration}, "
+                                  f"subIterK {lr.tiles.fmt_k()}) "
+                                  f"{lr.tiles.fmt_tiles()}{tile_str}\n")
         return buf.getvalue()
 
     def print_gr(self) -> str:
