@@ -1568,6 +1568,7 @@ class MFMATileScheduler:
                     curId = placement_to_id[id(placement)]
                     prevId = None
                     lastDepId = None
+                    firstPreOpId = None
 
                     # preOps
                     for preOp in placement.preOps:
@@ -1576,6 +1577,8 @@ class MFMATileScheduler:
                             # deps chain from it
                             depId = add('wait_gr', str(preOp), source=preOp)
                             prevId = depId
+                            if firstPreOpId is None:
+                                firstPreOpId = depId
                             continue
                         elif preOp.kind == 'wait_lr_sync':
                             # Expand to wait_lr + sync
@@ -1584,6 +1587,8 @@ class MFMATileScheduler:
                             setBefore(depId, prevId)
                             prevId = depId
                             lastDepId = depId
+                            if firstPreOpId is None:
+                                firstPreOpId = depId
                             depId = add('sync', 'sync',
                                         source=DepOp(kind='sync'))
                             setBefore(depId, prevId)
@@ -1595,12 +1600,19 @@ class MFMATileScheduler:
                             setBefore(depId, prevId)
                             prevId = depId
                             lastDepId = depId
+                            if firstPreOpId is None:
+                                firstPreOpId = depId
 
                     # deps (same-subIterK DepRefs — ordering constraints)
+                    # Wire dep refs as roots of the preOp chain so the
+                    # dependency is not lost when preOps are present.
                     for dep in placement.deps:
                         ref_id = placement_to_id.get(id(dep.ref))
                         if ref_id is not None:
-                            prevId = ref_id
+                            if firstPreOpId is not None:
+                                setBefore(firstPreOpId, ref_id)
+                            else:
+                                prevId = ref_id
 
                     # Final link: primary module points to last dep
                     if lastDepId is not None:
