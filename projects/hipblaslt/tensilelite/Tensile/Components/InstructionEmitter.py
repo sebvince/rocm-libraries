@@ -179,11 +179,11 @@ class InstructionEmitter:
         tensor = source.tensor
         tc = {'A': 'A', 'B': 'B', 'SA': 'MXSA', 'SB': 'MXSB'}.get(tensor, tensor)
         module = Module()
-        module.add(globalReadPtrUpdates(tc, self.writer, self.kernel))
-        module.add(globalReadLDSBufferSwap(tc, self.writer, self.kernel))
         if tensor in ('SA', 'SB'):
             module.add(globalReadScalePtrUpdates(tc, self.writer, self.kernel))
-            module.add(globalReadLDSBufferSwap(tc, self.writer, self.kernel))
+        else:
+            module.add(globalReadPtrUpdates(tc, self.writer, self.kernel))
+        module.add(globalReadLDSBufferSwap(tc, self.writer, self.kernel))
         return list(module.flatitems())
 
     def emit_gr_scale(self, source):
