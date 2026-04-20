@@ -1272,6 +1272,7 @@ class MFMATileScheduler:
             self.remove_cross_deps()
 
         last_mt = {}  # tensor -> mtIteration string
+        last_gr_mt = {}  # tensor -> mtIteration for GR only (suppress duplicates)
 
         for pi, slots in enumerate(self._partitions):
             for slot in slots:
@@ -1285,8 +1286,10 @@ class MFMATileScheduler:
                     tensor = gr.tensor
                     mt = gr.mtIteration
                     if tensor in last_mt and last_mt[tensor] != mt:
-                        gr.preOps.append(DepOp(kind='gr_inc', tensor=tensor))
+                        if last_gr_mt.get(tensor) != mt:
+                            gr.preOps.append(DepOp(kind='gr_inc', tensor=tensor))
                     last_mt[tensor] = mt
+                    last_gr_mt[tensor] = mt
 
         self._completed.add('gr_inc')
 

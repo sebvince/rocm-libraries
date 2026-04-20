@@ -2108,9 +2108,9 @@ def test_insert_gr_lr_inc_1x1_partition_DU256():
     # LR SB @s1: mt=n+1, first seen → no inc
     assert _preop_inc_tensors(_get_lr(s1, 'SB'), 'lr_inc') == []
 
-    # GR B @s1: mt=n+2, B was n+1 → switch → gr_inc(B)
+    # GR B @s1: mt=n+2, but GR B[0] @s0 already set last_gr_mt['B']=n+2 → no duplicate gr_inc
     gr_b1 = [gr for gr in s1.grs if gr.tensor == 'B'][0]
-    assert _preop_inc_tensors(gr_b1, 'gr_inc') == ['B']
+    assert _preop_inc_tensors(gr_b1, 'gr_inc') == []
 
     # GR SA @s1: mt=n+2, SA was n+1 → switch → gr_inc(SA)
     gr_sa1 = [gr for gr in s1.grs if gr.tensor == 'SA'][0]
@@ -2417,12 +2417,12 @@ def test_group_lr_gr_1x1_partition_DU256():
     gr_sa1 = [gr for gr in s1.grs if gr.tensor == 'SA'][0]
     gr_sb1 = [gr for gr in s1.grs if gr.tensor == 'SB'][0]
 
-    # First GR (B) has merged preOps: wait_lr_sync + gr_inc(B,SA,SB)
+    # First GR (B) has merged preOps: wait_lr_sync + gr_inc(SA,SB)
+    # No gr_inc(B) here — GR B[0] @s0 already advanced B's SRD to mt n+2
     assert gr_b1.preOps[0].kind == 'wait_lr_sync'
-    assert gr_b1.preOps[1].kind == 'gr_inc' and gr_b1.preOps[1].tensor == 'B'
-    assert gr_b1.preOps[2].kind == 'gr_inc' and gr_b1.preOps[2].tensor == 'SA'
-    assert gr_b1.preOps[3].kind == 'gr_inc' and gr_b1.preOps[3].tensor == 'SB'
-    assert len(gr_b1.preOps) == 4
+    assert gr_b1.preOps[1].kind == 'gr_inc' and gr_b1.preOps[1].tensor == 'SA'
+    assert gr_b1.preOps[2].kind == 'gr_inc' and gr_b1.preOps[2].tensor == 'SB'
+    assert len(gr_b1.preOps) == 3
     # No deps (none originally)
     assert gr_b1.deps == []
 
