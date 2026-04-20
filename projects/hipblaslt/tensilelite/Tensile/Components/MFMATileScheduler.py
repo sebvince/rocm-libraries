@@ -1273,14 +1273,19 @@ class MFMATileScheduler:
 
         last_mt = {}  # tensor -> mtIteration string
         last_gr_mt = {}  # tensor -> mtIteration for GR only (suppress duplicates)
+        first_lr = {}  # tensor -> first LR placement seen
+        lr_inc_tensors = set()  # tensors that already received lr_inc
 
         for pi, slots in enumerate(self._partitions):
             for slot in slots:
                 for lr in slot.lrs:
                     tensor = lr.tensor
                     mt = lr.mtIteration
+                    if tensor not in first_lr:
+                        first_lr[tensor] = lr
                     if tensor in last_mt and last_mt[tensor] != mt:
                         lr.preOps.append(DepOp(kind='lr_inc', tensor=tensor))
+                        lr_inc_tensors.add(tensor)
                     last_mt[tensor] = mt
                 for gr in slot.grs:
                     tensor = gr.tensor
@@ -1290,6 +1295,14 @@ class MFMATileScheduler:
                             gr.preOps.append(DepOp(kind='gr_inc', tensor=tensor))
                     last_mt[tensor] = mt
                     last_gr_mt[tensor] = mt
+
+        # Handle wrap-around: tensors with a single LR per iteration (e.g. SA, SB)
+        # still need lr_inc because the GR at end-of-iteration writes to the other
+        # LDS buffer, and the next iteration's LR must swap to read from it.
+        for tensor, lr in first_lr.items():
+            if tensor not in lr_inc_tensors:
+                if tensor in last_mt and last_mt[tensor] != lr.mtIteration:
+                    lr.preOps.append(DepOp(kind='lr_inc', tensor=tensor))
 
         self._completed.add('gr_inc')
 

@@ -2102,11 +2102,11 @@ def test_insert_gr_lr_inc_1x1_partition_DU256():
     # LR B @s1: mt=n+1, B was n+2 → switch → lr_inc(B)
     assert _preop_inc_tensors(_get_lr(s1, 'B'), 'lr_inc') == ['B']
 
-    # LR SA @s1: mt=n+1, first seen → no inc
-    assert _preop_inc_tensors(_get_lr(s1, 'SA'), 'lr_inc') == []
+    # LR SA @s1: mt=n+1, only LR for SA — wrap-around detects GR SA(n+2) → lr_inc(SA)
+    assert _preop_inc_tensors(_get_lr(s1, 'SA'), 'lr_inc') == ['SA']
 
-    # LR SB @s1: mt=n+1, first seen → no inc
-    assert _preop_inc_tensors(_get_lr(s1, 'SB'), 'lr_inc') == []
+    # LR SB @s1: mt=n+1, only LR for SB — wrap-around detects GR SB(n+2) → lr_inc(SB)
+    assert _preop_inc_tensors(_get_lr(s1, 'SB'), 'lr_inc') == ['SB']
 
     # GR B @s1: mt=n+2, but GR B[0] @s0 already set last_gr_mt['B']=n+2 → no duplicate gr_inc
     gr_b1 = [gr for gr in s1.grs if gr.tensor == 'B'][0]
@@ -2388,25 +2388,27 @@ def test_group_lr_gr_1x1_partition_DU256():
     lr_sa1 = _get_lr(s1, 'SA')
     lr_sb1 = _get_lr(s1, 'SB')
 
-    # First LR (A) has merged wait_gr_sync + lr_inc ops
+    # First LR (A) has merged wait_gr_sync + all lr_inc ops (A, B, SA, SB)
     assert lr_a1.preOps[0].kind == 'wait_gr_sync'
     assert lr_a1.preOps[0].wait_gr_counts.A == 8
     assert lr_a1.preOps[0].wait_gr_counts.B == 1
     assert lr_a1.preOps[1].kind == 'lr_inc' and lr_a1.preOps[1].tensor == 'A'
     assert lr_a1.preOps[2].kind == 'lr_inc' and lr_a1.preOps[2].tensor == 'B'
-    assert len(lr_a1.preOps) == 3
+    assert lr_a1.preOps[3].kind == 'lr_inc' and lr_a1.preOps[3].tensor == 'SA'
+    assert lr_a1.preOps[4].kind == 'lr_inc' and lr_a1.preOps[4].tensor == 'SB'
+    assert len(lr_a1.preOps) == 5
 
     # LR B chains to LR A
     assert lr_b1.preOps == []
     assert len(lr_b1.deps) == 1
     assert lr_b1.deps[0].ref is lr_a1
 
-    # LR SA chains to LR B
+    # LR SA chains to LR B (lr_inc merged into first LR)
     assert lr_sa1.preOps == []
     assert len(lr_sa1.deps) == 1
     assert lr_sa1.deps[0].ref is lr_b1
 
-    # LR SB chains to LR SA
+    # LR SB chains to LR SA (lr_inc merged into first LR)
     assert lr_sb1.preOps == []
     assert len(lr_sb1.deps) == 1
     assert lr_sb1.deps[0].ref is lr_sa1
