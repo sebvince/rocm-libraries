@@ -1298,7 +1298,7 @@ class MFMATileScheduler:
                     tensor = gr.tensor
                     mt = gr.mtIteration
                     if tensor in last_mt and last_mt[tensor] != mt:
-                        if last_gr_mt.get(tensor) != mt:
+                        if last_gr_mt.get(tensor) != mt and gr.tiles.tileId_start == 0:
                             gr.preOps.append(DepOp(kind='gr_inc', tensor=tensor))
                     last_mt[tensor] = mt
                     last_gr_mt[tensor] = mt

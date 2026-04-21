@@ -2121,6 +2121,66 @@ def test_insert_gr_lr_inc_1x1_partition_DU256():
     assert _preop_inc_tensors(gr_sb1, 'gr_inc') == ['SB']
 
 
+def test_insert_gr_lr_inc_multipartition_bf16():
+    """Step 5: 128x128, BF16, DU64, 4 partitions (2x2), no scale.
+
+    Validates that gr_inc is only inserted at tileId_start=0 (grBaseId 0),
+    not at higher grBaseIds that continue the same tile load cycle.
+
+    GR layout across partitions:
+      P0: GR A ids[2-3] (MT n+1) — continues tile from preloop grBaseId 0-1
+      P1: GR B ids[2-3] (MT n+1) — continues tile from preloop grBaseId 0-1
+      P2: GR A ids[0-0] (MT n+2) — new tile, needs gr_inc(A)
+      P3: GR B ids[0-0] (MT n+2) — new tile, needs gr_inc(B)
+
+    Bug regression: if gr_inc fires on ids[2-3] at P0/P1, the SRD advances
+    before grBaseId 2-3 are loaded, causing them to read from the wrong K chunk.
+    """
+    kernel = create_kernel(128, 128, fp4=False, depthU=64)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+
+    cfg = SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        numPartitionsM=2, numPartitionsN=2,
+    )
+    assert cfg.numPartitions == 4
+
+    sched = MFMATileScheduler(cfg)
+    sched.insert_gr_lr_inc()
+    parts = sched._partitions
+
+    # P0: GR A (MT n+1) with tileId_start > 0 → must NOT have gr_inc
+    for slot in parts[0]:
+        for gr in slot.grs:
+            if gr.tensor == 'A':
+                assert gr.tiles.tileId_start > 0
+                assert _preop_inc_tensors(gr, 'gr_inc') == []
+
+    # P1: GR B (MT n+1) with tileId_start > 0 → must NOT have gr_inc
+    for slot in parts[1]:
+        for gr in slot.grs:
+            if gr.tensor == 'B':
+                assert gr.tiles.tileId_start > 0
+                assert _preop_inc_tensors(gr, 'gr_inc') == []
+
+    # P2: GR A (MT n+2) with tileId_start=0 → must have gr_inc(A)
+    gr_a_p2 = [gr for s in parts[2] for gr in s.grs
+               if gr.tensor == 'A' and gr.tiles.tileId_start == 0]
+    assert len(gr_a_p2) == 1
+    assert _preop_inc_tensors(gr_a_p2[0], 'gr_inc') == ['A']
+
+    # P3: GR B (MT n+2) with tileId_start=0 → must have gr_inc(B)
+    gr_b_p3 = [gr for s in parts[3] for gr in s.grs
+               if gr.tensor == 'B' and gr.tiles.tileId_start == 0]
+    assert len(gr_b_p3) == 1
+    assert _preop_inc_tensors(gr_b_p3[0], 'gr_inc') == ['B']
+
+
 def test_compute_inflight_loads():
     """Unit test for _compute_inflight_loads.
 
@@ -2724,7 +2784,7 @@ if __name__ == "__main__":
 
     if use_bf16:
         # BF16: MT=128x128, DU=128, no scale
-        kernel = create_kernel(128, 128, fp4=False, depthU=128)
+        kernel = create_kernel(256, 256, fp4=False, depthU=64)
         tiA = TileInfo('A', kernel)
         tiB = TileInfo('B', kernel)
         scaleTiA = None
@@ -2736,6 +2796,8 @@ if __name__ == "__main__":
             lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
             grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
             grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            numPartitionsM=2,
+            numPartitionsN=2
         )
     else:
         # FP4: MT=256x256, DU=256, with scale
