@@ -1947,7 +1947,7 @@ class MFMATileScheduler:
             DepOp(kind='wait_lr'),
             DepOp(kind='skip', tensor='LE:1:NLL'),
             *self._preloop_make_gr('1', part0_tiles),
-            *self._make_tensor_depops('gr_inc'),
+            # *self._make_tensor_depops('gr_inc'),
             DepOp(kind='skip', tensor='LE:2:NGLL'),
         ])
 
