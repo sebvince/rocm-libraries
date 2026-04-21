@@ -1274,11 +1274,11 @@ def emitSingleBufferLoad(tileInfo, kernel, sId0, sId1):
 
   # When loadRatioGR > 1, multiple subtiles share one global read.
   # Only emit the load for the first subtile of each group.
-  if tileInfo.loadRatioGR > 1:
-    linearId = tileInfo.getLocalSubtileLinearId(sId0, sId1)
-    firstInGroup = int(grBaseId * tileInfo.loadRatioGR)
-    if linearId != firstInGroup:
-      return module
+  # if tileInfo.loadRatioGR > 1:
+  #   linearId = tileInfo.getLocalSubtileLinearId(sId0, sId1)
+  #   firstInGroup = int(grBaseId * tileInfo.loadRatioGR)
+  #   if linearId != firstInGroup:
+  #     return module
 
   tc = tileInfo.tc
   isGlc = bool(kernel["NonTemporal%s"%tc] & 0x1)
@@ -1801,12 +1801,16 @@ def mainLoop(writer, kernel):
     scaleTiA = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
     scaleTiB = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
 
+    # Based on current subtile shape. loadRatioGR == 2.0 has 2x2 granularity.
+    grAGran = ReadGranularity(MFMATileSize(k=2, mn=1)) if tiA.loadRatioGR <= 1.0 else ReadGranularity(MFMATileSize(k=2, mn=2))
+    grBGran = ReadGranularity(MFMATileSize(k=2, mn=1)) if tiB.loadRatioGR <= 1.0 else ReadGranularity(MFMATileSize(k=2, mn=2))
+
     cfg = MFMASchedulerConfig.from_tile_info(
         tiA, tiB,
         lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
         lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grA=grAGran,
+        grB=grBGran,
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)) if scaleTiA else None,
         lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)) if scaleTiB else None,
