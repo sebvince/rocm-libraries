@@ -2720,25 +2720,43 @@ if __name__ == "__main__":
     import sys
     import io
 
-    # Build config from TileInfo (MT=64, fp4 = Example Granularities 1)
-    kernel = create_kernel(256, 256, fp4=True)
-    tiA = TileInfo('A', kernel)
-    tiB = TileInfo('B', kernel)
-    scaleTiA = TileInfo('MXSA', kernel)
-    scaleTiB = TileInfo('MXSB', kernel)
+    use_bf16 = "--bf16" in sys.argv
 
-    cfg = SchedulerConfig.from_tile_info(
-        tiA, tiB,
-        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
-    )
+    if use_bf16:
+        # BF16: MT=128x128, DU=128, no scale
+        kernel = create_kernel(128, 128, fp4=False, depthU=128)
+        tiA = TileInfo('A', kernel)
+        tiB = TileInfo('B', kernel)
+        scaleTiA = None
+        scaleTiB = None
+
+        cfg = SchedulerConfig.from_tile_info(
+            tiA, tiB,
+            lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+            lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+            grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        )
+    else:
+        # FP4: MT=256x256, DU=256, with scale
+        kernel = create_kernel(256, 256, fp4=True)
+        tiA = TileInfo('A', kernel)
+        tiB = TileInfo('B', kernel)
+        scaleTiA = TileInfo('MXSA', kernel)
+        scaleTiB = TileInfo('MXSB', kernel)
+
+        cfg = SchedulerConfig.from_tile_info(
+            tiA, tiB,
+            lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+            lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+            grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+            lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+            lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+            grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+            grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        )
 
     print(f"Config: numMFMATilesM={cfg.numMFMATilesM}, "
           f"numMFMATilesN={cfg.numMFMATilesN}, "
@@ -2827,12 +2845,14 @@ if __name__ == "__main__":
     writer.states.d = SimpleNamespace(tileInfo=dTileInfo)
     writer.states.a = SimpleNamespace(tileInfo=tiA)
     writer.states.b = SimpleNamespace(tileInfo=tiB)
-    writer.states.mxsa = SimpleNamespace(tileInfo=scaleTiA)
-    writer.states.mxsb = SimpleNamespace(tileInfo=scaleTiB)
     tiA.allocOffsetRegisters(writer, kernel)
     tiB.allocOffsetRegisters(writer, kernel)
-    scaleTiA.allocOffsetRegisters(writer, kernel)
-    scaleTiB.allocOffsetRegisters(writer, kernel)
+
+    if scaleTiA and scaleTiB:
+        writer.states.mxsa = SimpleNamespace(tileInfo=scaleTiA)
+        writer.states.mxsb = SimpleNamespace(tileInfo=scaleTiB)
+        scaleTiA.allocOffsetRegisters(writer, kernel)
+        scaleTiB.allocOffsetRegisters(writer, kernel)
 
     sched.allocVgprTiles(writer, tiA, tiB,
                          scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
