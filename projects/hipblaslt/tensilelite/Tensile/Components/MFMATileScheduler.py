@@ -2196,11 +2196,13 @@ class MFMATileScheduler:
             self._emitted_per_unroll.append(em_copy)
 
             ngll_copy = copy.deepcopy(self._ngll_emitted)
-            emitter.populate(ngll_copy, unroll_iter=ui)
+            ngll_ui = (ui + 1) % self.unroll_factor
+            emitter.populate(ngll_copy, unroll_iter=ngll_ui)
             self._ngll_per_unroll.append(ngll_copy)
 
             nll_copy = copy.deepcopy(self._nll_emitted)
-            emitter.populate(nll_copy, unroll_iter=ui)
+            nll_ui = (ui + 2) % self.unroll_factor
+            emitter.populate(nll_copy, unroll_iter=nll_ui)
             self._nll_per_unroll.append(nll_copy)
 
         self._completed.add('populate')
