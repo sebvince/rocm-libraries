@@ -155,11 +155,18 @@ class InstructionEmitter:
         counts = source.wait_gr_counts
         if counts is None:
             return []
-        grCnt = (int(counts.A / self.tileInfoA.loadRatioGR) +
-                 int(counts.B / self.tileInfoB.loadRatioGR) +
-                 counts.SA + counts.SB)
+        
+        # TODO. Hardcoded for now, but we should just get this from atomic emit codes (emitSingleBufferLoad, ...)
+        grMap = {'A': max(1,int(1.0/self.tileInfoA.loadRatioGR)),
+                 'B':  max(1,int(1.0/self.tileInfoB.loadRatioGR)),
+                 'SA': 1, 
+                 'SB': 1}  
+        grCnt = (counts.A * grMap['A'] +
+                 counts.B * grMap['B'] +
+                 counts.SA * grMap['SA'] +
+                 counts.SB * grMap['SB'])
         return [SWaitCnt(vlcnt=grCnt, vscnt=-1,
-                         comment=f"Wait GR: A={counts.A} B={counts.B} SA={counts.SA} SB={counts.SB} => vlcnt={grCnt}")]
+                         comment=f"Wait GR (per-subIterK): A={counts.A} B={counts.B} SA={counts.SA} SB={counts.SB}")]
 
     def emit_wait_lr(self):
         return [SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1,
