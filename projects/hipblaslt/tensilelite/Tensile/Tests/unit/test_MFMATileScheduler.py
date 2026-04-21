@@ -2737,63 +2737,26 @@ if __name__ == "__main__":
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
     )
 
-    # ── Preloop assembly ──
-    def _print_assembly(label, emitted_3d):
+    # ── emitLoop: generate assembly via the real code path ──
+    def _print_emitLoop(label, emitted_3d, scaleSet=0, scaleLRSet=None):
+        module = sched._emitLoop(writer, kernel, label, emitted_3d,
+                                 scaleSet=scaleSet, scaleLRSet=scaleLRSet)
         buf = io.StringIO()
-        buf.write(f"{label} (assembly):\n")
-        for pi, partition_emitted in enumerate(emitted_3d):
-            buf.write(f"  Partition {pi}:\n")
-            for k, emitted in enumerate(partition_emitted):
-                buf.write(f"    subIterK={k}:\n")
-                for em in emitted:
-                    buf.write(f"      [{em.moduleId:2d}] {em.opType:10s} {em.label}\n")
-                    for inst in em.instructions:
-                        if hasattr(inst, 'flatitems'):
-                            for line in inst.flatitems():
-                                buf.write(f"            {str(line).rstrip()}\n")
-                        else:
-                            buf.write(f"            {str(inst).rstrip()}\n")
+        for inst in module.flatitems():
+            buf.write(f"  {str(inst).rstrip()}\n")
         return buf.getvalue()
 
-    print(f"{'=' * 60}")
-    print(f"  Step 13: Preloop assembly")
-    print(f"{'=' * 60}")
-    print(_print_assembly("PRELOOP", sched._preloop_emitted))
-    if interactive:
-        input("Press Enter for next step...")
-
-    # ── instructionSchedule: extract paths and display instructions ──
-    all_emitted = sched._emitted
-    buf = io.StringIO()
-    buf.write("MAINLOOP (instructionSchedule):\n")
-    for pi, partition_emitted in enumerate(all_emitted):
-        buf.write(f"  Partition {pi}:\n")
-        for k, emitted in enumerate(partition_emitted):
-            buf.write(f"    subIterK={k}:\n")
-
-            scheduled = SubtileBasedScheduler.instructionSchedule(emitted)
-
-            mfmaIdx, paths, preMfmaPaths = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted)
-            mfma_em = emitted[mfmaIdx]
-            buf.write(f"      MFMA [{mfma_em.moduleId}]: {mfma_em.label}\n")
-            for pi2, path in enumerate(preMfmaPaths):
-                labels = [f"[{emitted[mid].moduleId}] {emitted[mid].opType}" for mid in path]
-                buf.write(f"      PreMFMA {pi2}: {' -> '.join(labels)}\n")
-            for pi2, path in enumerate(paths):
-                labels = [f"[{emitted[mid].moduleId}] {emitted[mid].opType}" for mid in path]
-                buf.write(f"      Path {pi2}: {' -> '.join(labels)}\n")
-
-            insts = list(scheduled.flatitems())
-            if insts:
-                buf.write(f"      Instructions:\n")
-                for inst in insts:
-                    buf.write(f"        {str(inst).rstrip()}\n")
-            else:
-                buf.write(f"      Instructions: (empty — logical level, no GPU instructions)\n")
-
-    print(f"{'=' * 60}")
-    print(f"  Step 14: instructionSchedule")
-    print(f"{'=' * 60}")
-    print(buf.getvalue())
+    for label, emitted_3d, kwargs in [
+        ("PRELOOP",  sched._preloop_emitted, dict(scaleSet=0, scaleLRSet=0)),
+        ("MAINLOOP", sched._emitted,         dict(scaleSet=0)),
+        ("NGLL",     sched._ngll_emitted,    dict(scaleSet=0)),
+        ("NLL",      sched._nll_emitted,     dict(scaleSet=0)),
+    ]:
+        print(f"{'=' * 60}")
+        print(f"  Step 13: {label} (emitLoop)")
+        print(f"{'=' * 60}")
+        print(_print_emitLoop(label, emitted_3d, **kwargs))
+        if interactive:
+            input("Press Enter for next step...")
 
     sched.deallocVgprTiles(writer)

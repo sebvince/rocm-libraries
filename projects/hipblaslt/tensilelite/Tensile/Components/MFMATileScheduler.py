@@ -1837,147 +1837,128 @@ class MFMATileScheduler:
         self._nll_emitted = nll
         return nll
 
+    def _preloop_tensors(self) -> List[str]:
+        """Return tensor list for preloop: ['A', 'B'] + ['SA', 'SB'] if hasScale."""
+        tensors = ['A', 'B']
+        if self.config.hasScale:
+            tensors += ['SA', 'SB']
+        return tensors
+
+    @staticmethod
+    def _to_emitted(ops) -> List[EmittedModule]:
+        """Wrap GRPlacement/LRPlacement/DepOp objects into EmittedModules."""
+        result = []
+        for mid, op in enumerate(ops):
+            if isinstance(op, GRPlacement):
+                t = op.tiles
+                em = EmittedModule(moduleId=mid, opType='gr',
+                                   label=f'GR {op.tensor} (MT {op.mtIteration}, subIterK {t.fmt_k()}) ids {t.fmt_tiles()}',
+                                   source=op)
+            elif isinstance(op, LRPlacement):
+                t = op.tiles
+                em = EmittedModule(moduleId=mid, opType='lr',
+                                   label=f'LR {op.tensor} (MT {op.mtIteration}, subIterK {t.fmt_k()}) ids {t.fmt_tiles()}',
+                                   source=op)
+            elif isinstance(op, DepOp):
+                if op.kind == 'skip':
+                    parts = op.tensor.split(':')
+                    label = f'skip {parts[0]} {parts[1]} → {parts[2]}'
+                else:
+                    label = f'{op.kind.upper()} {op.tensor}'.strip()
+                em = EmittedModule(moduleId=mid, opType=op.kind,
+                                   label=label, source=op)
+            else:
+                raise ValueError(f"Unknown op type: {type(op)}")
+            result.append(em)
+        return result
+
+    def _preloop_make_gr(self, mt: str, tiles: dict) -> List[GRPlacement]:
+        """Create GR placements for all tensors at the given MT iteration.
+
+        tiles: {'A': MFMATileRange, 'B': MFMATileRange}
+        """
+        return [GRPlacement(tensor=tensor, mtIteration=mt,
+                            tiles=tiles['A' if tensor in ('A', 'SA') else 'B'],
+                            subIterK_slot=0)
+                for tensor in self._preloop_tensors()]
+
+    def _preloop_make_lr(self, tiles: dict) -> List[LRPlacement]:
+        """Create LR placements for first partition.
+
+        tiles: per-tensor MFMATileRange, e.g. {'A': MFMATileRange(0, k, mn0, mn1), ...}
+
+        Uses the first MFMA's vgpr tile maps (the preloop loads data consumed
+        by the first MFMA, not the next subIterK like mainloop LRs).
+        """
+        first_mfma = self._partitions[0][0].mfma
+        mfma_maps = {'A': first_mfma.vgpr_tile_map_A,
+                     'B': first_mfma.vgpr_tile_map_B}
+        if self.config.hasScale:
+            mfma_maps['SA'] = first_mfma.vgpr_tile_map_SA
+            mfma_maps['SB'] = first_mfma.vgpr_tile_map_SB
+
+        placements = []
+        for tensor in self._preloop_tensors():
+            lr = LRPlacement(
+                tensor=tensor, mtIteration='0',
+                tiles=tiles[tensor],
+                subIterK_slot=0, partition=0)
+            if tensor in mfma_maps:
+                lr.vgpr_tile_map = copy.deepcopy(mfma_maps[tensor])
+            placements.append(lr)
+        return placements
+
+    def _make_tensor_depops(self, kind: str) -> List[DepOp]:
+        """Create a DepOp of the given kind for each tensor."""
+        return [DepOp(kind=kind, tensor=tensor)
+                for tensor in self._preloop_tensors()]
+
     def build_preloop(self) -> List[List[List[EmittedModule]]]:
         """Build preloop: pipeline initialization sequence before mainloop.
 
-        Sequence:
-          GR(MT 0)  — all tiles, all subIterK  (one GRPlacement per tensor per subIterK)
-          GRScale(MT 0) — if hasScale
-          GR_INC    — per tensor
-          WaitGR(MT 0) + Sync
-          LR        — first subIterK of first partition (prefetch)
-          WaitLR
-          skip(LE 1, NLL/NLLEarly)
-          GR(MT 1)  — first partition tiles, all subIterK
-          GRScale(MT 1) — if hasScale
-          GR_INC    — per tensor
+        High-level sequence (waits/syncs auto-inserted by _insert_preloop_waits):
+          GR(MT 0)  — all tensors, all tiles
+          GR_INC
+          LR        — first partition, subIterK=0
+          LR_INC
+          skip(LE 1, NLLEarly/NLL)
+          GR(MT 1)  — first partition tiles
+          GR_INC
           skip(LE 2, NGLL)
 
         Returns [1 partition][1 subIterK][EmittedModules] to match emit() shape.
         """
-        if 'lr' not in self._completed:
-            self.place_LRs()
-
         cfg = self.config
-        emitted: List[EmittedModule] = []
-
-        def add(opType: str, label: str, source: object = None) -> int:
-            mid = len(emitted)
-            emitted.append(EmittedModule(
-                moduleId=mid, opType=opType, label=label, source=source))
-            return mid
-
         numK = cfg.numSubIterK
-        part0_range = self._partition_tile_range(0)
-
-        # GR(MT 0): load all tiles for all subIterK
-        for tensor, gran in [('A', cfg.grA), ('B', cfg.grB)]:
-            tile_end = cfg.numMFMATilesM if tensor == 'A' else cfg.numMFMATilesN
-            add('gr', f'GR {tensor} MT0',
-                source=GRPlacement(
-                    tensor=tensor, mtIteration='0',
-                    tiles=MFMATileRange(0, numK, 0, tile_end),
-                    subIterK_slot=0))
-        if cfg.hasScale:
-            for tensor, gran in [('SA', cfg.grSA), ('SB', cfg.grSB)]:
-                base = 'A' if tensor == 'SA' else 'B'
-                tile_end = cfg.numMFMATilesM if base == 'A' else cfg.numMFMATilesN
-                add('gr', f'GR {tensor} MT0',
-                    source=GRPlacement(
-                        tensor=tensor, mtIteration='0',
-                        tiles=MFMATileRange(0, numK, 0, tile_end),
-                        subIterK_slot=0))
-
-        # GR_INC per tensor
-        for tensor in ['A', 'B']:
-            add('gr_inc', f'GR_INC {tensor} MT0',
-                source=DepOp(kind='gr_inc', tensor=tensor))
-        if cfg.hasScale:
-            for tensor in ['SA', 'SB']:
-                add('gr_inc', f'GR_INC {tensor} MT0',
-                    source=DepOp(kind='gr_inc', tensor=tensor))
-
-        # WaitGR(MT 0) + Sync
-        add('wait_gr', 'WaitGR MT0',
-            source=DepOp(kind='wait_gr',
-                         wait_gr_counts=WaitGRCounts(A=0, B=0, SA=0, SB=0)))
-        add('sync', 'Sync MT0', source=DepOp(kind='sync'))
-
-        # LR: first partition, first subIterK only (half-prefetch).
-        # The preloop loads data consumed by the first MFMA (subIterK=0),
-        # so use the MFMA's vgpr tile maps (not the mainloop LR's, which prefetch
-        # for the *next* subIterK).
-        first_mfma = self._partitions[0][0].mfma
-        mfma_maps = {
-            'A': first_mfma.vgpr_tile_map_A,
-            'B': first_mfma.vgpr_tile_map_B,
+        part0 = self._partition_tile_range(0)
+        all_tiles = {
+            'A': MFMATileRange(0, numK, 0, cfg.numMFMATilesM),
+            'B': MFMATileRange(0, numK, 0, cfg.numMFMATilesN),
+        }
+        part0_tiles = {
+            'A': MFMATileRange(0, numK, *part0['A']),
+            'B': MFMATileRange(0, numK, *part0['B']),
+        }
+        lr_tiles = {
+            'A':  MFMATileRange(0, cfg.lrA.size.k, *part0['A']),
+            'B':  MFMATileRange(0, cfg.lrB.size.k, *part0['B']),
         }
         if cfg.hasScale:
-            mfma_maps['SA'] = first_mfma.vgpr_tile_map_SA
-            mfma_maps['SB'] = first_mfma.vgpr_tile_map_SB
+            lr_tiles['SA'] = MFMATileRange(0, cfg.lrSA.size.k, *part0['A'])
+            lr_tiles['SB'] = MFMATileRange(0, cfg.lrSB.size.k, *part0['B'])
 
-        for tensor, lr_gran in [('A', cfg.lrA), ('B', cfg.lrB)]:
-            t_start, t_end = part0_range[tensor]
-            lr = LRPlacement(
-                tensor=tensor, mtIteration='0',
-                tiles=MFMATileRange(0, lr_gran.size.k, t_start, t_end),
-                subIterK_slot=0, partition=0)
-            if tensor in mfma_maps:
-                lr.vgpr_tile_map = copy.deepcopy(mfma_maps[tensor])
-            add('lr', f'LR {tensor} preloop', source=lr)
-        if cfg.hasScale:
-            for tensor, lr_gran in [('SA', cfg.lrSA), ('SB', cfg.lrSB)]:
-                base = 'A' if tensor == 'SA' else 'B'
-                t_start, t_end = part0_range[base]
-                lr = LRPlacement(
-                    tensor=tensor, mtIteration='0',
-                    tiles=MFMATileRange(0, lr_gran.size.k, t_start, t_end),
-                    subIterK_slot=0, partition=0)
-                if tensor in mfma_maps:
-                    lr.vgpr_tile_map = copy.deepcopy(mfma_maps[tensor])
-                add('lr', f'LR {tensor} preloop', source=lr)
-
-        # WaitLR
-        add('wait_lr', 'WaitLR preloop', source=DepOp(kind='wait_lr'))
-
-        # Skip(LE 1, NLLEarly/NLL)
-        nll_target = 'NLLEarly' if cfg.hasScale else 'NLL'
-        add('skip', f'skip LE 1 → {nll_target}',
-            source=DepOp(kind='skip', tensor=f'LE:1:{nll_target}'))
-
-        # GR(MT 1): first partition tiles
-        for tensor, gran in [('A', cfg.grA), ('B', cfg.grB)]:
-            t_start, t_end = part0_range[tensor]
-            add('gr', f'GR {tensor} MT1',
-                source=GRPlacement(
-                    tensor=tensor, mtIteration='1',
-                    tiles=MFMATileRange(0, numK, t_start, t_end),
-                    subIterK_slot=0, partition=0))
-        if cfg.hasScale:
-            for tensor, gran in [('SA', cfg.grSA), ('SB', cfg.grSB)]:
-                base = 'A' if tensor == 'SA' else 'B'
-                t_start, t_end = part0_range[base]
-                add('gr', f'GR {tensor} MT1',
-                    source=GRPlacement(
-                        tensor=tensor, mtIteration='1',
-                        tiles=MFMATileRange(0, numK, t_start, t_end),
-                        subIterK_slot=0, partition=0))
-
-        # GR_INC per tensor for MT 1
-        mt1_complete = (part0_range['A'] == (0, cfg.numMFMATilesM) and
-                        part0_range['B'] == (0, cfg.numMFMATilesN))
-        if mt1_complete:
-            for tensor in ['A', 'B']:
-                add('gr_inc', f'GR_INC {tensor} MT1',
-                    source=DepOp(kind='gr_inc', tensor=tensor))
-            if cfg.hasScale:
-                for tensor in ['SA', 'SB']:
-                    add('gr_inc', f'GR_INC {tensor} MT1',
-                        source=DepOp(kind='gr_inc', tensor=tensor))
-
-        # Skip(LE 2, NGLL)
-        add('skip', 'skip LE 2 → NGLL',
-            source=DepOp(kind='skip', tensor='LE:2:NGLL'))
+        emitted = self._to_emitted([
+            *self._preloop_make_gr('0', all_tiles),
+            *self._make_tensor_depops('gr_inc'),
+            DepOp(kind='wait_gr', wait_gr_counts=WaitGRCounts()),
+            DepOp(kind='sync'),
+            *self._preloop_make_lr(lr_tiles),
+            DepOp(kind='wait_lr'),
+            DepOp(kind='skip', tensor='LE:1:NLL'),
+            *self._preloop_make_gr('1', part0_tiles),
+            *self._make_tensor_depops('gr_inc'),
+            DepOp(kind='skip', tensor='LE:2:NGLL'),
+        ])
 
         self._preloop_emitted = [[emitted]]
         return self._preloop_emitted
