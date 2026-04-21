@@ -1722,11 +1722,8 @@ class MFMATileScheduler:
         return all_partitions
 
     def build(self):
-        """Build mainloop + all loop variants (preloop, NGLL, NLL)."""
+        """Build mainloop """
         self.emit()
-        self.build_preloop()
-        self.build_ngll()
-        self.build_nll()
         self._completed.add('build')
 
     # ── Loop variant derivation ────────────────────────────
