@@ -1276,9 +1276,8 @@ class MFMATileScheduler:
         if 'remove_deps' not in self._completed:
             self.remove_cross_deps()
 
-        last_mt = {}  # tensor -> mtIteration string (updated by both LR and GR)
         last_lr_mt = {}  # tensor -> mtIteration for LR only
-        last_gr_mt = {}  # tensor -> mtIteration for GR only (suppress duplicates)
+        last_gr_mt = {}  # tensor -> mtIteration for GR only
         first_lr = {}  # tensor -> first LR placement seen
         lr_inc_tensors = set()  # tensors that already received lr_inc
 
@@ -1293,14 +1292,13 @@ class MFMATileScheduler:
                         lr.preOps.append(DepOp(kind='lr_inc', tensor=tensor))
                         lr_inc_tensors.add(tensor)
                     last_lr_mt[tensor] = mt
-                    last_mt[tensor] = mt
                 for gr in slot.grs:
                     tensor = gr.tensor
                     mt = gr.mtIteration
-                    if tensor in last_mt and last_mt[tensor] != mt:
-                        if last_gr_mt.get(tensor) != mt and gr.tiles.tileId_start == 0:
+                    prev_mt = last_gr_mt.get(tensor, last_lr_mt.get(tensor))
+                    if prev_mt is not None and prev_mt != mt:
+                        if gr.tiles.tileId_start == 0:
                             gr.preOps.append(DepOp(kind='gr_inc', tensor=tensor))
-                    last_mt[tensor] = mt
                     last_gr_mt[tensor] = mt
 
         # Handle wrap-around: tensors with a single LR per iteration (e.g. SA, SB)
@@ -1308,7 +1306,8 @@ class MFMATileScheduler:
         # LDS buffer, and the next iteration's LR must swap to read from it.
         for tensor, lr in first_lr.items():
             if tensor not in lr_inc_tensors:
-                if tensor in last_mt and last_mt[tensor] != lr.mtIteration:
+                last = last_gr_mt.get(tensor, last_lr_mt.get(tensor))
+                if last is not None and last != lr.mtIteration:
                     lr.preOps.append(DepOp(kind='lr_inc', tensor=tensor))
 
         self._completed.add('gr_inc')
