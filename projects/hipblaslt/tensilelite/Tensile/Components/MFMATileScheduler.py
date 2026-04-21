@@ -1957,20 +1957,16 @@ class MFMATileScheduler:
         self._preloop_emitted = [[emitted]]
         return self._preloop_emitted
 
-    def _emitLoop(self, writer, kernel, label, emitted_3d, scaleSet=0, scaleLRSet=None):
+    def _emitLoop(self, writer, kernel, label, emitted_3d):
         """Emit a loop section from a 3D emitted structure.
 
         emitted_3d: [partition][subIterK][EmittedModule]
 
         For subIterKs with MFMAs: calls instructionSchedule for interleaving.
         For subIterKs without MFMAs (preloop): emits instructions sequentially.
-        Handles scaleSet/scaleLRSet rotation at partition boundaries.
         """
         from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler
         from rocisa.code import Module
-
-        if scaleLRSet is None:
-            scaleLRSet = 1 - scaleSet if self.config.hasScale else scaleSet
 
         module = Module(label)
         module.addComment0(f"{label} start")
@@ -1984,9 +1980,112 @@ class MFMATileScheduler:
                     for em in em_list:
                         for inst in em.instructions:
                             module.add(inst)
-            if self.config.hasScale:
-                scaleSet, scaleLRSet = scaleLRSet, scaleSet
         module.addComment0(f"{label} end")
+        return module
+
+    def emitAllLoops(self, writer, kernel):
+        """Emit complete loop structure: preloop + mainloop + NGLL + NLL.
+
+        Owns all control flow (labels, branches, counter management).
+        For unroll_factor > 1, emits per-unroll copies with correct vgpr tiles.
+        Each mainloop exit jumps to its corresponding NGLL→NLL pair.
+        """
+        from rocisa.code import Module, Label
+        from rocisa.instruction import (SSubU32, SCmpEQU32, SCBranchSCC0,
+                                        SCBranchSCC1, SBranch)
+        from rocisa.container import sgpr
+
+        assert 'populate' in self._completed, \
+            "populate_instructions() must be called before emitAllLoops()"
+
+        module = Module("AllLoops")
+        uf = self.unroll_factor
+
+        # ── Preloop ──
+        module.add(self._emitLoop(writer, kernel, "PRELOOP",
+                                  self._preloop_emitted))
+
+        # ── Mainloop ──
+        module.addComment0("MAINLOOP")
+        loopBegin = Label("LoopBeginL", "")
+
+        if uf == 1:
+            module.add(loopBegin)
+            module.add(self._emitLoop(writer, kernel, "MAINLOOP",
+                                      self._emitted_per_unroll[0]))
+            module.add(SSubU32(dst=sgpr("LoopCounterL"),
+                               src0=sgpr("LoopCounterL"), src1=1,
+                               comment="dec counterL"))
+            module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
+                                 comment="counterL == 2?"))
+            module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
+                                    comment="restart mainloop"))
+        else:
+            exitLabels = [Label(f"ExitC{ui}", "") for ui in range(uf - 1)]
+            module.add(loopBegin)
+            for ui in range(uf):
+                module.add(self._emitLoop(writer, kernel, f"MAINLOOP_C{ui}",
+                                          self._emitted_per_unroll[ui]))
+                module.add(SSubU32(dst=sgpr("LoopCounterL"),
+                                   src0=sgpr("LoopCounterL"), src1=1,
+                                   comment=f"dec counterL (copy {ui})"))
+                module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
+                                     comment=f"counterL == 2? (copy {ui} exit)"))
+                if ui < uf - 1:
+                    module.add(SCBranchSCC1(
+                        labelName=exitLabels[ui].getLabelName(),
+                        comment=f"copy {ui} exit → NGLL_C{ui}"))
+                else:
+                    module.add(SCBranchSCC0(
+                        labelName=loopBegin.getLabelName(),
+                        comment="restart mainloop"))
+
+        # ── NGLL + NLL exit paths ──
+        endLabel = Label("SkipToEnd", "")
+        module.add(Label("SkipMainloop", ""))
+        module.add(Label("SkipToNGLL", ""))
+
+        if uf == 1:
+            module.addComment0("NGLL")
+            module.add(self._emitLoop(writer, kernel, "NGLL",
+                                      self._ngll_per_unroll[0]))
+            module.addComment0("NLL")
+            module.add(Label("SkipToNLL", ""))
+            module.add(self._emitLoop(writer, kernel, "NLL",
+                                      self._nll_per_unroll[0]))
+        else:
+            # Fall-through from last mainloop copy
+            last = uf - 1
+            module.addComment0(f"NGLL_C{last}")
+            module.add(self._emitLoop(writer, kernel, f"NGLL_C{last}",
+                                      self._ngll_per_unroll[last]))
+            module.addComment0(f"NLL_C{last}")
+            module.add(self._emitLoop(writer, kernel, f"NLL_C{last}",
+                                      self._nll_per_unroll[last]))
+            module.add(SBranch(labelName=endLabel.getLabelName(),
+                               comment="skip other exit paths"))
+
+            for ui in range(uf - 1):
+                module.add(exitLabels[ui])
+                module.addComment0(f"NGLL_C{ui}")
+                module.add(self._emitLoop(writer, kernel, f"NGLL_C{ui}",
+                                          self._ngll_per_unroll[ui]))
+                module.addComment0(f"NLL_C{ui}")
+                module.add(self._emitLoop(writer, kernel, f"NLL_C{ui}",
+                                          self._nll_per_unroll[ui]))
+                if ui < uf - 2:
+                    module.add(SBranch(labelName=endLabel.getLabelName(),
+                                       comment="skip other exit paths"))
+
+            # NLLEarly: reached from preloop when LoopCounterL <= 1
+            module.add(SBranch(labelName=endLabel.getLabelName(),
+                               comment="skip NLLEarly"))
+            module.addComment0("NLLEarly")
+            module.add(Label("SkipToNLL", ""))
+            module.add(self._emitLoop(writer, kernel, "NLLEarly",
+                                      self._nll_per_unroll[0]))
+            module.add(endLabel)
+
         return module
 
     # ── VGPR tile allocation ──────────────────────────────
@@ -2081,10 +2180,31 @@ class MFMATileScheduler:
             scaleTileInfoA, scaleTileInfoB,
             self.vgprTilesSA, self.vgprTilesSB,
         )
-        emitter.populate(self._emitted)
-        emitter.populate(self._preloop_emitted)
-        emitter.populate(self._ngll_emitted)
-        emitter.populate(self._nll_emitted)
+
+        # Rebuild all loop variants from current _emitted (which now has
+        # vgpr_tile_maps populated by assign_vgpr_tiles, unlike the stale
+        # copies from build()).
+        self.build_preloop()
+        self.build_ngll()
+        self.build_nll()
+
+        emitter.populate(self._preloop_emitted, unroll_iter=0)
+
+        self._emitted_per_unroll = []
+        self._ngll_per_unroll = []
+        self._nll_per_unroll = []
+        for ui in range(self.unroll_factor):
+            em_copy = copy.deepcopy(self._emitted)
+            emitter.populate(em_copy, unroll_iter=ui)
+            self._emitted_per_unroll.append(em_copy)
+
+            ngll_copy = copy.deepcopy(self._ngll_emitted)
+            emitter.populate(ngll_copy, unroll_iter=ui)
+            self._ngll_per_unroll.append(ngll_copy)
+
+            nll_copy = copy.deepcopy(self._nll_emitted)
+            emitter.populate(nll_copy, unroll_iter=ui)
+            self._nll_per_unroll.append(nll_copy)
 
         self._completed.add('populate')
 

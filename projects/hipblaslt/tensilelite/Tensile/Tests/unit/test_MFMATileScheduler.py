@@ -2564,8 +2564,13 @@ def test_populate_instructions_256x256_fp4():
             scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         )
 
+        # Verify per-unroll copies were created
+        assert len(sched._emitted_per_unroll) == sched.unroll_factor
+        assert len(sched._ngll_per_unroll) == sched.unroll_factor
+        assert len(sched._nll_per_unroll) == sched.unroll_factor
+
         # Verify instructions were populated
-        for pi, partition_emitted in enumerate(sched._emitted):
+        for pi, partition_emitted in enumerate(sched._emitted_per_unroll[0]):
             for k, emitted in enumerate(partition_emitted):
                 for em in emitted:
                     assert len(em.instructions) > 0, \
@@ -2586,7 +2591,7 @@ def test_populate_instructions_256x256_fp4():
                                     f"share vgprTileIds"
 
         # Call instructionSchedule on each subIterK and verify no crash
-        for pi, partition_emitted in enumerate(sched._emitted):
+        for pi, partition_emitted in enumerate(sched._emitted_per_unroll[0]):
             for k, emitted in enumerate(partition_emitted):
                 scheduled = SubtileBasedScheduler.instructionSchedule(emitted)
                 insts = list(scheduled.flatitems())
@@ -2594,7 +2599,7 @@ def test_populate_instructions_256x256_fp4():
                     f"P{pi} subIterK={k}: instructionSchedule returned empty"
 
         # Print for visualization
-        for pi, partition_emitted in enumerate(sched._emitted):
+        for pi, partition_emitted in enumerate(sched._emitted_per_unroll[0]):
             print(f"Partition {pi}:")
             for k, emitted in enumerate(partition_emitted):
                 scheduled = SubtileBasedScheduler.instructionSchedule(emitted)
@@ -2602,6 +2607,108 @@ def test_populate_instructions_256x256_fp4():
                 print(f"  subIterK={k}: {len(insts)} instructions")
                 for inst in insts:
                     print(f"    {str(inst)}")
+
+    finally:
+        sched.deallocVgprTiles(writer)
+
+
+def test_emitAllLoops_256x256_fp4():
+    """Test emitAllLoops: verify label structure and per-unroll VGPR differences."""
+    from types import SimpleNamespace
+    from rocisa import rocIsa
+    from rocisa.register import RegisterPool
+    from rocisa.enum import RegisterType
+
+    ri = rocIsa.getInstance()
+    if not ri.isInit():
+        import shutil
+        asmpath = shutil.which('amdclang++') or '/usr/bin/amdclang++'
+        ri.init((9, 5, 0), asmpath)
+    ri.setKernel((9, 5, 0), 64)
+
+    kernel = create_kernel(256, 256, fp4=True)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+
+    writer = SimpleNamespace()
+    writer.vgprPool = RegisterPool(0, RegisterType.Vgpr, False)
+    writer.agprPool = RegisterPool(0, RegisterType.Accvgpr, False)
+    writer.sgprPool = RegisterPool(0, RegisterType.Sgpr, False)
+    writer.states = SimpleNamespace(
+        regCaps={"MaxSgpr": 106, "MaxVgpr": 256, "PhysicalMaxVgpr": 512},
+    )
+    dTileInfo = TileInfo('D', kernel)
+    dTileInfo.allocVgprTileRegisters(writer, kernel)
+    writer.states.d = SimpleNamespace(tileInfo=dTileInfo)
+    writer.states.a = SimpleNamespace(tileInfo=tiA)
+    writer.states.b = SimpleNamespace(tileInfo=tiB)
+    writer.states.mxsa = SimpleNamespace(tileInfo=scaleTiA)
+    writer.states.mxsb = SimpleNamespace(tileInfo=scaleTiB)
+    tiA.allocOffsetRegisters(writer, kernel)
+    tiB.allocOffsetRegisters(writer, kernel)
+    scaleTiA.allocOffsetRegisters(writer, kernel)
+    scaleTiB.allocOffsetRegisters(writer, kernel)
+
+    cfg = make_256x256_fp4()
+    sched = MFMATileScheduler(cfg)
+    sched.build()
+    sched.allocVgprTiles(writer, tiA, tiB,
+                         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+
+    try:
+        sched.populate_instructions(
+            writer, kernel,
+            tileInfoA=tiA, tileInfoB=tiB,
+            dtileInfo=dTileInfo,
+            scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        )
+
+        # Verify per-unroll copy count matches unroll_factor
+        uf = sched.unroll_factor
+        assert len(sched._emitted_per_unroll) == uf
+        assert len(sched._ngll_per_unroll) == uf
+        assert len(sched._nll_per_unroll) == uf
+
+        # Emit full loop structure
+        module = sched.emitAllLoops(writer, kernel)
+        asm = str(module)
+
+        # Verify essential labels exist
+        assert "LoopBeginL:" in asm
+        assert "SkipToNGLL:" in asm
+
+        if uf > 1:
+            for ui in range(uf):
+                assert f"MAINLOOP_C{ui}" in asm
+                assert f"NGLL_C{ui}" in asm
+                assert f"NLL_C{ui}" in asm
+            assert "SkipToEnd:" in asm
+            assert "SkipToNLL:" in asm  # NLLEarly target
+        else:
+            assert "MAINLOOP" in asm
+            assert "NGLL" in asm
+            assert "NLL" in asm
+            assert "SkipToNLL:" in asm
+
+        # For unroll_factor > 1, verify per-unroll copies differ in scale VGPRs
+        if uf > 1:
+            def get_mfma_vgprs(emitted_3d):
+                vgprs = set()
+                for partition in emitted_3d:
+                    for group in partition:
+                        for em in group:
+                            if em.opType == 'mfma':
+                                for inst in em.instructions:
+                                    s = str(inst)
+                                    vgprs.add(s)
+                return vgprs
+
+            vgprs_0 = get_mfma_vgprs(sched._emitted_per_unroll[0])
+            vgprs_1 = get_mfma_vgprs(sched._emitted_per_unroll[1])
+            assert vgprs_0 != vgprs_1, \
+                "Per-unroll copies should produce different MFMA instructions (different scale VGPRs)"
 
     finally:
         sched.deallocVgprTiles(writer)
@@ -2738,24 +2845,23 @@ if __name__ == "__main__":
     )
 
     # ── emitLoop: generate assembly via the real code path ──
-    def _print_emitLoop(label, emitted_3d, scaleSet=0, scaleLRSet=None):
-        module = sched._emitLoop(writer, kernel, label, emitted_3d,
-                                 scaleSet=scaleSet, scaleLRSet=scaleLRSet)
+    def _print_emitLoop(label, emitted_3d):
+        module = sched._emitLoop(writer, kernel, label, emitted_3d)
         buf = io.StringIO()
         for inst in module.flatitems():
             buf.write(f"  {str(inst).rstrip()}\n")
         return buf.getvalue()
 
-    for label, emitted_3d, kwargs in [
-        ("PRELOOP",  sched._preloop_emitted, dict(scaleSet=0, scaleLRSet=0)),
-        ("MAINLOOP", sched._emitted,         dict(scaleSet=0)),
-        ("NGLL",     sched._ngll_emitted,    dict(scaleSet=0)),
-        ("NLL",      sched._nll_emitted,     dict(scaleSet=0)),
+    for label, emitted_3d in [
+        ("PRELOOP",  sched._preloop_emitted),
+        ("MAINLOOP", sched._emitted_per_unroll[0]),
+        ("NGLL",     sched._ngll_per_unroll[0]),
+        ("NLL",      sched._nll_per_unroll[0]),
     ]:
         print(f"{'=' * 60}")
         print(f"  Step 13: {label} (emitLoop)")
         print(f"{'=' * 60}")
-        print(_print_emitLoop(label, emitted_3d, **kwargs))
+        print(_print_emitLoop(label, emitted_3d))
         if interactive:
             input("Press Enter for next step...")
 
