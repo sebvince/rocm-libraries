@@ -1443,152 +1443,6 @@ class MFMATileScheduler:
                 cross.append(dep)
         return same, cross
 
-    # ── Group and serialize (commented out — will be reworked) ──
-
-    # def group(self) -> List[GroupedSubIterK]:
-    #     """Serialize operations within each subIterK.
-    #
-    #     Takes annotate_deps' raw deps and transforms them:
-    #     - Cross-subIterK LR deps → WaitLROp barrier
-    #     - Cross-subIterK GR deps → WaitGROp barrier
-    #     - Same-subIterK deps → node refs for serialization
-    #     - LRs serialized: A → B → SA → SB with WaitGROp before first
-    #     - GRs serialized: SA → A (or SB → B) with merged deps
-    #     """
-    #     if 'gr' not in self._completed:
-    #         self.place_GRs()
-    #     slots = self._partitions[0]
-    #     if 'deps' not in self._completed:
-    #         self.annotate_deps()
-    #     cfg = self.config
-    #     numK = cfg.numSubIterK
-    #
-    #     grouped = []
-    #     for k, slot in enumerate(slots):
-    #         gslot = GroupedSubIterK(subIterK=k)
-    #
-    #         # MFMA with WaitLROp before
-    #         if slot.mfma:
-    #             gslot.ops.append(AnnotatedOp(
-    #                 kind='MFMA',
-    #                 before=[DepOp(kind='wait_lr')],
-    #                 placement=slot.mfma,
-    #             ))
-    #
-    #         # LRs serialized: A → B → SA → SB
-    #         # First LR gets WaitGROp + any LR_INCOps
-    #         lr_order = ['A', 'B', 'SA', 'SB']
-    #         ordered_lrs = sorted(slot.lrs, key=lambda lr: lr_order.index(lr.tensor))
-    #
-    #         prev_lr_op = None
-    #         for i, lr in enumerate(ordered_lrs):
-    #             before = []
-    #             if i == 0:
-    #                 before.append(DepOp(kind='wait_gr'))
-    #                 for lr2 in ordered_lrs:
-    #                     if lr2.mtIteration != "n":
-    #                         before.append(DepOp(kind='lr_inc', tensor=lr2.tensor))
-    #             else:
-    #                 before.append(DepOp(kind='ref', ref=prev_lr_op))
-    #
-    #             lr_op = AnnotatedOp(
-    #                 kind='LR', before=before, placement=lr,
-    #             )
-    #             gslot.ops.append(lr_op)
-    #             prev_lr_op = lr_op
-    #
-    #         # GRs serialized: SA → A or SB → B
-    #         gr_order = ['SA', 'A', 'SB', 'B']
-    #         ordered_grs = sorted(slot.grs, key=lambda gr: gr_order.index(gr.tensor))
-    #
-    #         # Only subIterK=0 needs collision wait (same-subIterK LR still async).
-    #         # Later subIterKs: collision LR covered by MFMAs' WaitLROp.
-    #         needs_collision_wait = self._needs_collision_wait(k, ordered_lrs)
-    #         collision_lr_op = None
-    #         if needs_collision_wait:
-    #             collision_lr_op = self._find_collision_LR_op(gslot, ordered_lrs)
-    #
-    #         prev_gr_op = None
-    #         for i, gr in enumerate(ordered_grs):
-    #             before = []
-    #             if i == 0:
-    #                 for gr2 in ordered_grs:
-    #                     before.append(DepOp(kind='gr_inc', tensor=gr2.tensor))
-    #                 if collision_lr_op:
-    #                     before.append(DepOp(kind='ref', ref=collision_lr_op))
-    #                     before.append(DepOp(kind='wait_lr_sync'))
-    #             else:
-    #                 before.append(DepOp(kind='ref', ref=prev_gr_op))
-    #
-    #             gr_op = AnnotatedOp(
-    #                 kind='GR', before=before, placement=gr,
-    #             )
-    #             gslot.ops.append(gr_op)
-    #             prev_gr_op = gr_op
-    #
-    #         grouped.append(gslot)
-    #
-    #     self._grouped = grouped
-    #     self._completed.add('group')
-    #     return grouped
-    #
-    # def _needs_collision_wait(self, subIterK: int, ordered_lrs: list) -> bool:
-    #     """Check if GRs at this subIterK need explicit wait_lr_sync."""
-    #     return subIterK == 0
-    #
-    # def _find_collision_LR_op(self, gslot: GroupedSubIterK, ordered_lrs: list) -> Optional[AnnotatedOp]:
-    #     """Find the last LR AnnotatedOp in this subIterK that GR must wait for."""
-    #     last_lr = None
-    #     for op in gslot.ops:
-    #         if op.kind == 'LR':
-    #             last_lr = op
-    #     return last_lr
-    #
-    # def emit(self) -> List[List[EmittedModule]]:
-    #     """Convert grouped ops into a flat List[EmittedModule] per subIterK."""
-    #     if 'group' not in self._completed:
-    #         self.group()
-    #     grouped = self._grouped
-    #
-    #     all_emitted = []
-    #     for gslot in grouped:
-    #         emitted: List[EmittedModule] = []
-    #         op_to_id = {}
-    #
-    #         def add(opType, label, before=None):
-    #             mid = len(emitted)
-    #             emitted.append(EmittedModule(
-    #                 moduleId=mid, opType=opType,
-    #                 label=label, before=before))
-    #             return mid
-    #
-    #         for op in gslot.ops:
-    #             opType = op.kind.lower()
-    #
-    #             prev_id = None
-    #             for dep in op.before:
-    #                 if dep.kind == 'ref':
-    #                     ref_id = op_to_id.get(id(dep.ref))
-    #                     if ref_id is not None:
-    #                         prev_id = ref_id
-    #                 elif dep.kind == 'wait_lr_sync':
-    #                     prev_id = add('wait_lr', 'wait_lr', before=prev_id)
-    #                     prev_id = add('sync', 'sync', before=prev_id)
-    #                 else:
-    #                     prev_id = add(dep.kind, str(dep), before=prev_id)
-    #
-    #             label = self._format_op_label(op, gslot)
-    #             mid = add(opType, label, before=prev_id)
-    #             op_to_id[id(op)] = mid
-    #
-    #         all_emitted.append(emitted)
-    #
-    #     self._emitted = all_emitted
-    #     self._completed.add('emit')
-    #     return all_emitted
-
-    # ── Emit ───────────────────────────────────────────────
-
     def emit(self) -> List[List[List[EmittedModule]]]:
         """Convert placements into EmittedModule chains per partition per subIterK.
 
@@ -2399,29 +2253,7 @@ class MFMATileScheduler:
             for dep in placement.deps:
                 dep_str = self._format_dep_ref(dep)
                 buf.write(f"            - {dep_str}\n")
-
-    # def print_group(self, grouped: List[GroupedSubIterK] = None) -> str:
-    #     """Print group output: serialized ops with dependencies."""
-    #     if grouped is None:
-    #         grouped = self._grouped
-    #     buf = io.StringIO()
-    #     buf.write("MAINLOOP:\n")
-    #     buf.write("  Partition 0:\n")
-    #     self._print_grouped_slots(buf, grouped)
-    #     return buf.getvalue()
-    #
-    # def _print_grouped_slots(self, buf, grouped: List[GroupedSubIterK]):
-    #     """Print a list of GroupedSubIterK slots with their deps."""
-    #     for gslot in grouped:
-    #         buf.write(f"    subIterK={gslot.subIterK}:\n")
-    #         for op in gslot.ops:
-    #             label = self._format_op_label(op, gslot)
-    #             buf.write(f"      {label}\n")
-    #             if op.before:
-    #                 buf.write("        before:\n")
-    #                 for dep in op.before:
-    #                     dep_str = self._format_dep(dep)
-    #                     buf.write(f"            - {dep_str}\n")
+    
 
     def _format_dep_ref(self, dep: DepRef) -> str:
         """Format a DepRef for display."""
@@ -2432,16 +2264,7 @@ class MFMATileScheduler:
         mt = f" (MT{dep.mt_offset})" if dep.mt_offset != 0 else ""
         return f"{kind} {p.tensor} @P{part}:subIterK={slot}{mt}"
 
-    # def _format_dep(self, dep: DepOp) -> str:
-    #     """Format a DepOp for display (used by group/emit)."""
-    #     if dep.kind == 'ref' and dep.ref and isinstance(dep.ref, AnnotatedOp):
-    #         p = dep.ref.placement
-    #         slot = self._get_slot_data(p.subIterK_slot) if hasattr(p, 'subIterK_slot') else None
-    #         if slot:
-    #             return self._format_placement_label(p, slot)
-    #         return self._format_placement_label(p, SubIterKSlot(subIterK=0))
-    #     return str(dep)
-    #
+
     def print_emit(self, all_partitions: List[List[List[EmittedModule]]] = None) -> str:
         """Print emit output: EmittedModule list with before-links."""
         if all_partitions is None:
