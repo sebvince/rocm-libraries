@@ -1825,6 +1825,7 @@ class MFMATileScheduler:
         module.addComment0(f"{label} start")
         for pi, partition_emitted in enumerate(emitted_3d):
             for k, em_list in enumerate(partition_emitted):
+                module.addComment0(f"partition={pi} subIterK={k}")
                 hasMFMA = any(em.opType == 'mfma' for em in em_list)
                 if hasMFMA:
                     scheduled = SubtileBasedScheduler.instructionSchedule(em_list)
