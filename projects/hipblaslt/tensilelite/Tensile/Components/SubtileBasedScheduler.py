@@ -1919,7 +1919,7 @@ class SubtileBasedScheduler:
         # Post-pass: adjust vmcnt of any SWaitCnt to account for buffer_loads
         # that the scheduler placed before it within this subIterK.
         bufLoadCount = 0
-        for inst in scheduled.items():
+        for inst in scheduled.flatitems():
             if _isBufferLoad(inst):
                 bufLoadCount += 1
             elif _isWaitCnt(inst) and inst.vlcnt >= 0:
