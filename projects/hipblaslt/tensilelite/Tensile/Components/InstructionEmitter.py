@@ -13,8 +13,9 @@ from Tensile.Components.SubtileBasedKernel import (
     globalReadDoScaleSubtile, globalReadScalePtrUpdates,
 )
 from rocisa.code import Module
-from rocisa.instruction import SWaitCnt, SBarrier, DSLoadB32
-from rocisa.container import vgpr, DSModifiers
+from rocisa.instruction import SWaitCnt, SBarrier, DSLoadB32, SCmpEQU32, SCmpLeU32, SCBranchSCC1
+from rocisa.container import vgpr, sgpr, DSModifiers
+from rocisa.code import Label
 
 
 class InstructionEmitter:
@@ -60,6 +61,7 @@ class InstructionEmitter:
             'lr_inc':   lambda em, ui: self.emit_lr_inc(em.source),
             'gr_inc':   lambda em, ui: self.emit_gr_inc(em.source),
             'gr_scale': lambda em, ui: self.emit_gr_scale(em.source),
+            'skip':     lambda em, ui: self.emit_skip(em.source),
         }
 
     def emit_mfma(self, placement, unroll_iter=0):
@@ -192,6 +194,22 @@ class InstructionEmitter:
         module.add(globalReadDoScaleSubtile('MXSA', self.writer, self.kernel))
         module.add(globalReadDoScaleSubtile('MXSB', self.writer, self.kernel))
         return list(module.flatitems())
+
+    def emit_skip(self, source):
+        """Emit skip guard: compare LoopCounterL and branch.
+
+        source.tensor encodes 'LE:value:target' or 'EQ:value:target'.
+        """
+        parts = source.tensor.split(':')
+        compare, value, target = parts[0], int(parts[1]), parts[2]
+        skipLabel = Label(f"SkipTo{target}", "")
+        cmpMap = {"EQ": SCmpEQU32, "LE": SCmpLeU32}
+        return [
+            cmpMap[compare](src0=sgpr("LoopCounterL"), src1=value,
+                            comment=f"LoopCounter {compare} {value}?"),
+            SCBranchSCC1(labelName=skipLabel.getLabelName(),
+                         comment=f"skip to {target}"),
+        ]
 
     def populate(self, emitted, unroll_iter=0):
         """Walk emitted partitions and fill em.instructions."""

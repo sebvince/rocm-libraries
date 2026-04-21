@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Optional, Tuple
+import copy
 import io
 import math
 
@@ -313,6 +314,9 @@ class MFMATileScheduler:
         self._partitions: Optional[List[List[SubIterKSlot]]] = None  # shared mutable state across passes
         self._grouped: Optional[List[GroupedSubIterK]] = None
         self._emitted: Optional[List[List[EmittedModule]]] = None
+        self._preloop_emitted: Optional[List[List[List[EmittedModule]]]] = None
+        self._ngll_emitted: Optional[List[List[List[EmittedModule]]]] = None
+        self._nll_emitted: Optional[List[List[List[EmittedModule]]]] = None
 
     # ── Place LRs ─────────────────────────────────────────
 
@@ -1716,6 +1720,300 @@ class MFMATileScheduler:
         self._completed.add('emit')
         return all_partitions
 
+    def build(self):
+        """Build mainloop + all loop variants (preloop, NGLL, NLL)."""
+        self.emit()
+        self.build_preloop()
+        self.build_ngll()
+        self.build_nll()
+        self._completed.add('build')
+
+    # ── Loop variant derivation ────────────────────────────
+
+    @staticmethod
+    def _rewire_before(emitted: List[EmittedModule],
+                       removed_ids: set) -> List[EmittedModule]:
+        """Rewire before-links that point to removed modules.
+
+        If em.before points to a removed module, follow that module's own
+        before link until we find a non-removed module (or None).
+        """
+        id_to_em = {em.moduleId: em for em in emitted}
+        for em in emitted:
+            if em.moduleId in removed_ids:
+                continue
+            b = em.before
+            while b is not None and b in removed_ids:
+                b = id_to_em[b].before
+            em.before = b
+        return [em for em in emitted if em.moduleId not in removed_ids]
+
+    def build_ngll(self) -> List[List[List[EmittedModule]]]:
+        """NGLL (No Global Load Loop): mainloop without GR(n+2), GR_INC, GRScale(n+2).
+
+        WaitGR inflight counts are zeroed since no new GRs are in flight.
+        """
+        if 'emit' not in self._completed:
+            self.emit()
+
+        ngll = []
+        for partition_emitted in self._emitted:
+            part_ngll = []
+            for emitted in partition_emitted:
+                new_emitted = copy.deepcopy(emitted)
+                removed = set()
+                for em in new_emitted:
+                    src = em.source
+                    if em.opType == 'gr' and isinstance(src, GRPlacement) \
+                            and src.mtIteration == 'n+2':
+                        removed.add(em.moduleId)
+                    elif em.opType == 'gr_inc':
+                        removed.add(em.moduleId)
+                    elif em.opType == 'gr_scale' and isinstance(src, DepOp) \
+                            and hasattr(src, 'mtIteration') \
+                            and getattr(src, 'mtIteration', None) == 'n+2':
+                        removed.add(em.moduleId)
+                    elif em.opType == 'wait_gr':
+                        if isinstance(src, DepOp) and src.wait_gr_counts is not None:
+                            src.wait_gr_counts = WaitGRCounts()
+                part_ngll.append(self._rewire_before(new_emitted, removed))
+            ngll.append(part_ngll)
+
+        self._ngll_emitted = ngll
+        return ngll
+
+    def build_nll(self) -> List[List[List[EmittedModule]]]:
+        """NLL (No Load Loop): mainloop without GR, LR(n+1), GR_INC, LR_INC,
+        GRScale, WaitGR(n+1)+Sync. Keeps LR(n), MFMAs, WaitGR(n) with zeroed counts."""
+        if 'emit' not in self._completed:
+            self.emit()
+
+        nll = []
+        for partition_emitted in self._emitted:
+            part_nll = []
+            for emitted in partition_emitted:
+                new_emitted = copy.deepcopy(emitted)
+                removed = set()
+
+                for em in new_emitted:
+                    src = em.source
+                    if em.opType == 'gr':
+                        removed.add(em.moduleId)
+                    elif em.opType == 'lr' and isinstance(src, LRPlacement) \
+                            and src.mtIteration == 'n+1':
+                        removed.add(em.moduleId)
+                    elif em.opType in ('gr_inc', 'lr_inc', 'gr_scale'):
+                        removed.add(em.moduleId)
+
+                # Remove WaitGR(n+1) and its paired Sync.
+                # Also zero inflight counts on remaining WaitGR(n).
+                wait_gr_to_remove = set()
+                for em in new_emitted:
+                    if em.opType == 'wait_gr' and isinstance(em.source, DepOp):
+                        cnts = em.source.wait_gr_counts
+                        if cnts is not None and cnts.A == 0 and cnts.B == 0 \
+                                and cnts.SA == 0 and cnts.SB == 0:
+                            pass
+                        if em.moduleId not in removed:
+                            em.source.wait_gr_counts = WaitGRCounts()
+
+                # Find Sync modules paired with removed wait_gr
+                for em in new_emitted:
+                    if em.opType == 'sync' and em.before is not None \
+                            and em.before in removed:
+                        removed.add(em.moduleId)
+
+                # Remove WaitLR if no LR remains in this subIterK
+                has_lr = any(em.opType == 'lr' and em.moduleId not in removed
+                             for em in new_emitted)
+                if not has_lr:
+                    for em in new_emitted:
+                        if em.opType == 'wait_lr':
+                            removed.add(em.moduleId)
+
+                part_nll.append(self._rewire_before(new_emitted, removed))
+            nll.append(part_nll)
+
+        self._nll_emitted = nll
+        return nll
+
+    def build_preloop(self) -> List[List[List[EmittedModule]]]:
+        """Build preloop: pipeline initialization sequence before mainloop.
+
+        Sequence:
+          GR(MT 0)  — all tiles, all subIterK  (one GRPlacement per tensor per subIterK)
+          GRScale(MT 0) — if hasScale
+          GR_INC    — per tensor
+          WaitGR(MT 0) + Sync
+          LR        — first subIterK of first partition (prefetch)
+          WaitLR
+          skip(LE 1, NLL/NLLEarly)
+          GR(MT 1)  — first partition tiles, all subIterK
+          GRScale(MT 1) — if hasScale
+          GR_INC    — per tensor
+          skip(LE 2, NGLL)
+
+        Returns [1 partition][1 subIterK][EmittedModules] to match emit() shape.
+        """
+        if 'lr' not in self._completed:
+            self.place_LRs()
+
+        cfg = self.config
+        emitted: List[EmittedModule] = []
+
+        def add(opType: str, label: str, source: object = None) -> int:
+            mid = len(emitted)
+            emitted.append(EmittedModule(
+                moduleId=mid, opType=opType, label=label, source=source))
+            return mid
+
+        numK = cfg.numSubIterK
+        part0_range = self._partition_tile_range(0)
+
+        # GR(MT 0): load all tiles for all subIterK
+        for tensor, gran in [('A', cfg.grA), ('B', cfg.grB)]:
+            tile_end = cfg.numMFMATilesM if tensor == 'A' else cfg.numMFMATilesN
+            add('gr', f'GR {tensor} MT0',
+                source=GRPlacement(
+                    tensor=tensor, mtIteration='0',
+                    tiles=MFMATileRange(0, numK, 0, tile_end),
+                    subIterK_slot=0))
+        if cfg.hasScale:
+            for tensor, gran in [('SA', cfg.grSA), ('SB', cfg.grSB)]:
+                base = 'A' if tensor == 'SA' else 'B'
+                tile_end = cfg.numMFMATilesM if base == 'A' else cfg.numMFMATilesN
+                add('gr', f'GR {tensor} MT0',
+                    source=GRPlacement(
+                        tensor=tensor, mtIteration='0',
+                        tiles=MFMATileRange(0, numK, 0, tile_end),
+                        subIterK_slot=0))
+
+        # GR_INC per tensor
+        for tensor in ['A', 'B']:
+            add('gr_inc', f'GR_INC {tensor} MT0',
+                source=DepOp(kind='gr_inc', tensor=tensor))
+        if cfg.hasScale:
+            for tensor in ['SA', 'SB']:
+                add('gr_inc', f'GR_INC {tensor} MT0',
+                    source=DepOp(kind='gr_inc', tensor=tensor))
+
+        # WaitGR(MT 0) + Sync
+        add('wait_gr', 'WaitGR MT0',
+            source=DepOp(kind='wait_gr',
+                         wait_gr_counts=WaitGRCounts(A=0, B=0, SA=0, SB=0)))
+        add('sync', 'Sync MT0', source=DepOp(kind='sync'))
+
+        # LR: first partition, first subIterK only (half-prefetch).
+        # The preloop loads data consumed by the first MFMA (subIterK=0),
+        # so use the MFMA's vgpr tile maps (not the mainloop LR's, which prefetch
+        # for the *next* subIterK).
+        first_mfma = self._partitions[0][0].mfma
+        mfma_maps = {
+            'A': first_mfma.vgpr_tile_map_A,
+            'B': first_mfma.vgpr_tile_map_B,
+        }
+        if cfg.hasScale:
+            mfma_maps['SA'] = first_mfma.vgpr_tile_map_SA
+            mfma_maps['SB'] = first_mfma.vgpr_tile_map_SB
+
+        for tensor, lr_gran in [('A', cfg.lrA), ('B', cfg.lrB)]:
+            t_start, t_end = part0_range[tensor]
+            lr = LRPlacement(
+                tensor=tensor, mtIteration='0',
+                tiles=MFMATileRange(0, lr_gran.size.k, t_start, t_end),
+                subIterK_slot=0, partition=0)
+            if tensor in mfma_maps:
+                lr.vgpr_tile_map = copy.deepcopy(mfma_maps[tensor])
+            add('lr', f'LR {tensor} preloop', source=lr)
+        if cfg.hasScale:
+            for tensor, lr_gran in [('SA', cfg.lrSA), ('SB', cfg.lrSB)]:
+                base = 'A' if tensor == 'SA' else 'B'
+                t_start, t_end = part0_range[base]
+                lr = LRPlacement(
+                    tensor=tensor, mtIteration='0',
+                    tiles=MFMATileRange(0, lr_gran.size.k, t_start, t_end),
+                    subIterK_slot=0, partition=0)
+                if tensor in mfma_maps:
+                    lr.vgpr_tile_map = copy.deepcopy(mfma_maps[tensor])
+                add('lr', f'LR {tensor} preloop', source=lr)
+
+        # WaitLR
+        add('wait_lr', 'WaitLR preloop', source=DepOp(kind='wait_lr'))
+
+        # Skip(LE 1, NLLEarly/NLL)
+        nll_target = 'NLLEarly' if cfg.hasScale else 'NLL'
+        add('skip', f'skip LE 1 → {nll_target}',
+            source=DepOp(kind='skip', tensor=f'LE:1:{nll_target}'))
+
+        # GR(MT 1): first partition tiles
+        for tensor, gran in [('A', cfg.grA), ('B', cfg.grB)]:
+            t_start, t_end = part0_range[tensor]
+            add('gr', f'GR {tensor} MT1',
+                source=GRPlacement(
+                    tensor=tensor, mtIteration='1',
+                    tiles=MFMATileRange(0, numK, t_start, t_end),
+                    subIterK_slot=0, partition=0))
+        if cfg.hasScale:
+            for tensor, gran in [('SA', cfg.grSA), ('SB', cfg.grSB)]:
+                base = 'A' if tensor == 'SA' else 'B'
+                t_start, t_end = part0_range[base]
+                add('gr', f'GR {tensor} MT1',
+                    source=GRPlacement(
+                        tensor=tensor, mtIteration='1',
+                        tiles=MFMATileRange(0, numK, t_start, t_end),
+                        subIterK_slot=0, partition=0))
+
+        # GR_INC per tensor for MT 1
+        mt1_complete = (part0_range['A'] == (0, cfg.numMFMATilesM) and
+                        part0_range['B'] == (0, cfg.numMFMATilesN))
+        if mt1_complete:
+            for tensor in ['A', 'B']:
+                add('gr_inc', f'GR_INC {tensor} MT1',
+                    source=DepOp(kind='gr_inc', tensor=tensor))
+            if cfg.hasScale:
+                for tensor in ['SA', 'SB']:
+                    add('gr_inc', f'GR_INC {tensor} MT1',
+                        source=DepOp(kind='gr_inc', tensor=tensor))
+
+        # Skip(LE 2, NGLL)
+        add('skip', 'skip LE 2 → NGLL',
+            source=DepOp(kind='skip', tensor='LE:2:NGLL'))
+
+        self._preloop_emitted = [[emitted]]
+        return self._preloop_emitted
+
+    def _emitLoop(self, writer, kernel, label, emitted_3d, scaleSet=0, scaleLRSet=None):
+        """Emit a loop section from a 3D emitted structure.
+
+        emitted_3d: [partition][subIterK][EmittedModule]
+
+        For subIterKs with MFMAs: calls instructionSchedule for interleaving.
+        For subIterKs without MFMAs (preloop): emits instructions sequentially.
+        Handles scaleSet/scaleLRSet rotation at partition boundaries.
+        """
+        from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler
+        from rocisa.code import Module
+
+        if scaleLRSet is None:
+            scaleLRSet = 1 - scaleSet if self.config.hasScale else scaleSet
+
+        module = Module(label)
+        module.addComment0(f"{label} start")
+        for pi, partition_emitted in enumerate(emitted_3d):
+            for k, em_list in enumerate(partition_emitted):
+                hasMFMA = any(em.opType == 'mfma' for em in em_list)
+                if hasMFMA:
+                    scheduled = SubtileBasedScheduler.instructionSchedule(em_list)
+                    module.add(scheduled)
+                else:
+                    for em in em_list:
+                        for inst in em.instructions:
+                            module.add(inst)
+            if self.config.hasScale:
+                scaleSet, scaleLRSet = scaleLRSet, scaleSet
+        module.addComment0(f"{label} end")
+        return module
+
     # ── VGPR tile allocation ──────────────────────────────
 
     def allocVgprTiles(self, writer, tileInfoA, tileInfoB,
@@ -1795,8 +2093,9 @@ class MFMATileScheduler:
         Uses per-tensor VGPR tile lists (vgprTilesA/B/SA/SB) indexed by
         vgprTileId from placement tile maps.
         """
-        if 'emit' not in self._completed:
-            self.emit()
+        if self._preloop_emitted is None or self._ngll_emitted is None \
+                or self._nll_emitted is None:
+            self.build()
 
         from Tensile.Components.InstructionEmitter import InstructionEmitter
 
@@ -1808,6 +2107,9 @@ class MFMATileScheduler:
             self.vgprTilesSA, self.vgprTilesSB,
         )
         emitter.populate(self._emitted)
+        emitter.populate(self._preloop_emitted)
+        emitter.populate(self._ngll_emitted)
+        emitter.populate(self._nll_emitted)
 
         self._completed.add('populate')
 

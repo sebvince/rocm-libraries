@@ -2664,6 +2664,36 @@ if __name__ == "__main__":
         if interactive and i < len(steps) - 1:
             input("Press Enter for next step...")
 
+    # ── Preloop ──
+    sched.build_preloop()
+    preloop_output = sched.print_emit(sched._preloop_emitted)
+    print(f"{'=' * 60}")
+    print(f"  Step 10: Preloop")
+    print(f"{'=' * 60}")
+    print(preloop_output.replace("MAINLOOP:", "PRELOOP:"))
+    if interactive:
+        input("Press Enter for next step...")
+
+    # ── NGLL ──
+    sched.build_ngll()
+    ngll_output = sched.print_emit(sched._ngll_emitted)
+    print(f"{'=' * 60}")
+    print(f"  Step 11: NGLL")
+    print(f"{'=' * 60}")
+    print(ngll_output.replace("MAINLOOP:", "NGLL:"))
+    if interactive:
+        input("Press Enter for next step...")
+
+    # ── NLL ──
+    sched.build_nll()
+    nll_output = sched.print_emit(sched._nll_emitted)
+    print(f"{'=' * 60}")
+    print(f"  Step 12: NLL")
+    print(f"{'=' * 60}")
+    print(nll_output.replace("MAINLOOP:", "NLL:"))
+    if interactive:
+        input("Press Enter for next step...")
+
     # ── populate_instructions: fill GPU instructions ──
     from types import SimpleNamespace
     from rocisa import rocIsa
@@ -2707,6 +2737,31 @@ if __name__ == "__main__":
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
     )
 
+    # ── Preloop assembly ──
+    def _print_assembly(label, emitted_3d):
+        buf = io.StringIO()
+        buf.write(f"{label} (assembly):\n")
+        for pi, partition_emitted in enumerate(emitted_3d):
+            buf.write(f"  Partition {pi}:\n")
+            for k, emitted in enumerate(partition_emitted):
+                buf.write(f"    subIterK={k}:\n")
+                for em in emitted:
+                    buf.write(f"      [{em.moduleId:2d}] {em.opType:10s} {em.label}\n")
+                    for inst in em.instructions:
+                        if hasattr(inst, 'flatitems'):
+                            for line in inst.flatitems():
+                                buf.write(f"            {str(line).rstrip()}\n")
+                        else:
+                            buf.write(f"            {str(inst).rstrip()}\n")
+        return buf.getvalue()
+
+    print(f"{'=' * 60}")
+    print(f"  Step 13: Preloop assembly")
+    print(f"{'=' * 60}")
+    print(_print_assembly("PRELOOP", sched._preloop_emitted))
+    if interactive:
+        input("Press Enter for next step...")
+
     # ── instructionSchedule: extract paths and display instructions ──
     all_emitted = sched._emitted
     buf = io.StringIO()
@@ -2718,7 +2773,6 @@ if __name__ == "__main__":
 
             scheduled = SubtileBasedScheduler.instructionSchedule(emitted)
 
-            # Display paths that instructionSchedule extracts
             mfmaIdx, paths, preMfmaPaths = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted)
             mfma_em = emitted[mfmaIdx]
             buf.write(f"      MFMA [{mfma_em.moduleId}]: {mfma_em.label}\n")
@@ -2729,7 +2783,6 @@ if __name__ == "__main__":
                 labels = [f"[{emitted[mid].moduleId}] {emitted[mid].opType}" for mid in path]
                 buf.write(f"      Path {pi2}: {' -> '.join(labels)}\n")
 
-            # Display flattened instructions from instructionSchedule
             insts = list(scheduled.flatitems())
             if insts:
                 buf.write(f"      Instructions:\n")
@@ -2739,7 +2792,7 @@ if __name__ == "__main__":
                 buf.write(f"      Instructions: (empty — logical level, no GPU instructions)\n")
 
     print(f"{'=' * 60}")
-    print(f"  Step 10: instructionSchedule")
+    print(f"  Step 14: instructionSchedule")
     print(f"{'=' * 60}")
     print(buf.getvalue())
 

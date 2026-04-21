@@ -1791,61 +1791,63 @@ def mainLoop(writer, kernel):
   pgr = kernel["PrefetchGlobalRead"]
   assert pgr in (0, 2), "SubtileBasedKernel only supports PGR=0 and PGR=2, got PGR=%d" % pgr
 
-  # new path for PGR=2 pipelining with SubtileBasedScheduler
+  # PGR=2 pipelining with MFMATileScheduler
   if pgr == 2:
-    from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler, SchedulerConfig, PrefetchMode
+    from Tensile.Components.MFMATileScheduler import (
+        MFMATileScheduler, SchedulerConfig as MFMASchedulerConfig,
+        ReadGranularity, MFMATileSize)
     tiA = writer.states.a.tileInfo
     tiB = writer.states.b.tileInfo
     scaleTiA = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
     scaleTiB = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
-    # For 320x256, Use 5x1 parition grid.
-    # cfg = SchedulerConfig(tiA.localSubtileGrid[0]//5, tiB.localSubtileGrid[0],
-    # Use a single partition for now. TODO
-    cfg = SchedulerConfig(tiA.localSubtileGrid[0], tiB.localSubtileGrid[0],
-                          PrefetchMode.HALF_PREFETCH)
-    scheduler = SubtileBasedScheduler(tiA, tiB, cfg,
-                                      scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
-    # scheduler.printSchedule()
-    scheduler.allocVgprTiles(writer)
 
-    # Preloop (includes SKIP_IF_EQ(1,NLL) and SKIP_IF_LE(2,NGLL))
-    if scheduler.hasScale:
-      # Preloop LR writes directly to scale set 0 (no double-buffer flip).
-      # scaleSet=0 for MFMA (no MFMAs in preloop), scaleLRSet=0 for LR writes.
-      module.add(scheduler._emitLoop(writer, kernel, "PRELOOP", scheduler.preloopSteps,
-                                     scaleSet=0, scaleLRSet=0))
-    else:
-      module.add(scheduler._emitLoop(writer, kernel, "PRELOOP", scheduler.preloopSteps))
+    cfg = MFMASchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)) if scaleTiA else None,
+        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)) if scaleTiB else None,
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)) if scaleTiA else None,
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)) if scaleTiB else None,
+    )
+    scheduler = MFMATileScheduler(cfg)
+
+    # Run full scheduling pipeline
+    scheduler.build()
+    scheduler.allocVgprTiles(writer, tiA, tiB,
+                             scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+    dtileInfo = writer.states.d.tileInfo
+    scheduler.populate_instructions(
+        writer, kernel,
+        tileInfoA=tiA, tileInfoB=tiB, dtileInfo=dtileInfo,
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+
+    # Preloop
+    module.add(scheduler._emitLoop(writer, kernel, "PRELOOP",
+                                   scheduler._preloop_emitted, scaleSet=0, scaleLRSet=0))
 
     # Mainloop
     skipMainloop = Label("SkipMainloop", "")
     loopBegin = Label("LoopBeginL", "")
     module.addComment0("MAINLOOP")
-    numPartitions = len(scheduler.partitions)
+    needsUnroll = scheduler.needs_unrolling
 
-    # With scale double buffering, the scale set rotates inside _emitLoop:
-    # once per partition end + once per subtileK boundary = numSubtileK flips per partition.
-    # After one iteration (N partitions), total flips = N * numSubtileK.
-    # If odd → need 2x unrolling. If even → sets return to start, no unrolling needed.
-    scaleFlipsPerIter = numPartitions * scheduler.numSubtileK
-    needsScaleUnroll = scheduler.hasScale and (scaleFlipsPerIter % 2 == 1)
-
-    if needsScaleUnroll:
-      # 2x unrolled mainloop for odd partition count.
-      # Copy 1 starts at scaleSet=0, ends at scaleSet=1 (after odd number of flips).
-      # Copy 2 starts at scaleSet=1, ends at scaleSet=0.
+    if needsUnroll:
       ngllOddLabel = Label("NGLLOdd", "")
       module.add(loopBegin)
-      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP_C1", scheduler.mainloopSteps,
-                                     scaleSet=0))
+      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP_C1",
+                                     scheduler._emitted, scaleSet=0))
       module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
                          comment="dec counterL (copy 1)"))
       module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
                            comment="counterL == 2? (odd exit)"))
       module.add(SCBranchSCC1(labelName=ngllOddLabel.getLabelName(),
                               comment="odd counterL → NGLL with S1"))
-      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP_C2", scheduler.mainloopSteps,
-                                     scaleSet=1))
+      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP_C2",
+                                     scheduler._emitted, scaleSet=1))
       module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
                          comment="dec counterL (copy 2)"))
       module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
@@ -1853,10 +1855,9 @@ def mainLoop(writer, kernel):
       module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
                               comment="restart mainloop"))
     else:
-      # No unrolling needed: either no scales, or even partition count (sets return to start).
       module.add(loopBegin)
-      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP", scheduler.mainloopSteps,
-                                     scaleSet=0))
+      module.add(scheduler._emitLoop(writer, kernel, "MAINLOOP",
+                                     scheduler._emitted, scaleSet=0))
       module.add(SSubU32(dst=sgpr("LoopCounterL"), src0=sgpr("LoopCounterL"), src1=1,
                          comment="dec counterL"))
       module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=2,
@@ -1868,40 +1869,43 @@ def mainLoop(writer, kernel):
     module.add(skipMainloop)
     module.addComment0("NGLL")
     module.add(Label("SkipToNGLL", ""))
-    if scheduler.hasScale:
+    if cfg.hasScale:
       endLabel = Label("SkipToEnd", "")
+      numPartitions = cfg.numPartitions
+      scaleFlipsPerIter = numPartitions * cfg.numSubIterK
       nllSet = 1 if scaleFlipsPerIter % 2 == 1 else 0
 
-      # Even path (or only path when no unrolling): mainloop ended at scaleSet=0.
-      module.add(scheduler._emitLoop(writer, kernel, "NGLL", scheduler.ngllSteps,
-                                     scaleSet=0))
+      module.add(scheduler._emitLoop(writer, kernel, "NGLL",
+                                     scheduler._ngll_emitted, scaleSet=0))
       module.addComment0("NLL")
-      module.add(scheduler._emitLoop(writer, kernel, "NLL", scheduler.nllSteps, scaleSet=nllSet))
+      module.add(scheduler._emitLoop(writer, kernel, "NLL",
+                                     scheduler._nll_emitted, scaleSet=nllSet))
 
-      if needsScaleUnroll:
+      if needsUnroll:
         module.add(SBranch(labelName=endLabel.getLabelName(), comment="skip odd NGLL path"))
 
-        # Odd path: after Copy 1 (ended at scaleSet=1).
         module.addComment0("NGLL (odd)")
         module.add(ngllOddLabel)
-        module.add(scheduler._emitLoop(writer, kernel, "NGLL_odd", scheduler.ngllSteps,
-                                       scaleSet=1))
+        module.add(scheduler._emitLoop(writer, kernel, "NGLL_odd",
+                                       scheduler._ngll_emitted, scaleSet=1))
         module.addComment0("NLL (odd)")
         nllSetOdd = 0 if scaleFlipsPerIter % 2 == 1 else 1
-        module.add(scheduler._emitLoop(writer, kernel, "NLL_odd", scheduler.nllSteps, scaleSet=nllSetOdd))
+        module.add(scheduler._emitLoop(writer, kernel, "NLL_odd",
+                                       scheduler._nll_emitted, scaleSet=nllSetOdd))
 
-      # NLLEarly: reached when counterL<=1 (preloop skip, no NGLL).
-      # Preloop LR wrote scale set 0, so MFMA reads set 0.
       module.add(SBranch(labelName=endLabel.getLabelName(), comment="skip NLLEarly"))
       module.addComment0("NLLEarly")
       module.add(Label("SkipToNLLEarly", ""))
-      module.add(scheduler._emitLoop(writer, kernel, "NLLEarly", scheduler.nllSteps, scaleSet=0))
+      module.add(scheduler._emitLoop(writer, kernel, "NLLEarly",
+                                     scheduler._nll_emitted, scaleSet=0))
       module.add(endLabel)
     else:
-      module.add(scheduler._emitLoop(writer, kernel, "NGLL", scheduler.ngllSteps))
+      module.add(scheduler._emitLoop(writer, kernel, "NGLL",
+                                     scheduler._ngll_emitted))
       module.addComment0("NLL")
       module.add(Label("SkipToNLL", ""))
-      module.add(scheduler._emitLoop(writer, kernel, "NLL", scheduler.nllSteps))
+      module.add(scheduler._emitLoop(writer, kernel, "NLL",
+                                     scheduler._nll_emitted))
 
     scheduler.deallocVgprTiles(writer)
 
