@@ -310,6 +310,7 @@ class MFMATileScheduler:
 
     def __init__(self, config: SchedulerConfig):
         self.config = config
+        self.tensors: List[str] = ['A', 'B'] + (['SA', 'SB'] if config.hasScale else [])
         self._completed: set = set()   # tracks which passes have run: {'lr', 'vgpr_tiles', 'gr', 'deps', 'group', 'emit'}
         self._partitions: Optional[List[List[SubIterKSlot]]] = None  # shared mutable state across passes
         self._grouped: Optional[List[GroupedSubIterK]] = None
@@ -1837,13 +1838,6 @@ class MFMATileScheduler:
         self._nll_emitted = nll
         return nll
 
-    def _preloop_tensors(self) -> List[str]:
-        """Return tensor list for preloop: ['A', 'B'] + ['SA', 'SB'] if hasScale."""
-        tensors = ['A', 'B']
-        if self.config.hasScale:
-            tensors += ['SA', 'SB']
-        return tensors
-
     @staticmethod
     def _to_emitted(ops) -> List[EmittedModule]:
         """Wrap GRPlacement/LRPlacement/DepOp objects into EmittedModules."""
@@ -1880,7 +1874,7 @@ class MFMATileScheduler:
         return [GRPlacement(tensor=tensor, mtIteration=mt,
                             tiles=tiles['A' if tensor in ('A', 'SA') else 'B'],
                             subIterK_slot=0)
-                for tensor in self._preloop_tensors()]
+                for tensor in self.tensors]
 
     def _preloop_make_lr(self, tiles: dict) -> List[LRPlacement]:
         """Create LR placements for first partition.
@@ -1898,7 +1892,7 @@ class MFMATileScheduler:
             mfma_maps['SB'] = first_mfma.vgpr_tile_map_SB
 
         placements = []
-        for tensor in self._preloop_tensors():
+        for tensor in self.tensors:
             lr = LRPlacement(
                 tensor=tensor, mtIteration='0',
                 tiles=tiles[tensor],
@@ -1911,7 +1905,7 @@ class MFMATileScheduler:
     def _make_tensor_depops(self, kind: str) -> List[DepOp]:
         """Create a DepOp of the given kind for each tensor."""
         return [DepOp(kind=kind, tensor=tensor)
-                for tensor in self._preloop_tensors()]
+                for tensor in self.tensors]
 
     def build_preloop(self) -> List[List[List[EmittedModule]]]:
         """Build preloop: pipeline initialization sequence before mainloop.
