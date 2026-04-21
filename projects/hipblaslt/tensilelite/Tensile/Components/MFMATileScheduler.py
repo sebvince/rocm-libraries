@@ -1276,7 +1276,8 @@ class MFMATileScheduler:
         if 'remove_deps' not in self._completed:
             self.remove_cross_deps()
 
-        last_mt = {}  # tensor -> mtIteration string
+        last_mt = {}  # tensor -> mtIteration string (updated by both LR and GR)
+        last_lr_mt = {}  # tensor -> mtIteration for LR only
         last_gr_mt = {}  # tensor -> mtIteration for GR only (suppress duplicates)
         first_lr = {}  # tensor -> first LR placement seen
         lr_inc_tensors = set()  # tensors that already received lr_inc
@@ -1288,9 +1289,10 @@ class MFMATileScheduler:
                     mt = lr.mtIteration
                     if tensor not in first_lr:
                         first_lr[tensor] = lr
-                    if tensor in last_mt and last_mt[tensor] != mt:
+                    if tensor in last_lr_mt and last_lr_mt[tensor] != mt:
                         lr.preOps.append(DepOp(kind='lr_inc', tensor=tensor))
                         lr_inc_tensors.add(tensor)
+                    last_lr_mt[tensor] = mt
                     last_mt[tensor] = mt
                 for gr in slot.grs:
                     tensor = gr.tensor
