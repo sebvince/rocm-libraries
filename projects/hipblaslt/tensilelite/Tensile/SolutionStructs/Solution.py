@@ -4030,7 +4030,8 @@ class Solution(collections.abc.Mapping):
 
     state["LdsNumBytes"] = ldsNumBytes
     ldsSize = ldsNumBytes
-    if ldsSize > state["MaxLDS"]:
+    # UseSubtileImpl overwrite LDS size and has its own check.
+    if ldsSize > state["MaxLDS"] and not state["UseSubtileImpl"]:
       reject(state, printRejectionReason, "Kernel Uses %u > %u bytes of LDS" % ( ldsSize, state["MaxLDS"]))
       state["ValidDepthU"] = False
       return
