@@ -1837,12 +1837,12 @@ def test_annotate_deps_2x2_partition_DU512():
 
     p3 = parts[3]
 
-    # MFMA(k=0) @P3 A[4-7],B[4-7]: deps on LRs with matching tiles — from P0 and P1
+    # MFMA(k=0) @P3 A[4-7],B[4-7]: most recent LR per tensor before P3
     mfma_p3_s0 = _dep_refs(p3[0].mfma)
-    assert ('LR', 'A',  0, 3, -1) in mfma_p3_s0
-    assert ('LR', 'B',  1, 3, -1) in mfma_p3_s0
-    assert ('LR', 'SA', 0, 2, -1) in mfma_p3_s0
-    assert ('LR', 'SB', 1, 2, -1) in mfma_p3_s0
+    assert ('LR', 'A',  1, 2, 0) in mfma_p3_s0
+    assert ('LR', 'B',  2, 2, 0) in mfma_p3_s0
+    assert ('LR', 'SA', 1, 0, 0) in mfma_p3_s0
+    assert ('LR', 'SB', 2, 1, 0) in mfma_p3_s0
     assert len(mfma_p3_s0) == 4
 
     # GR SA(n+2) @P3:s0 k[0,4) ids[0,8): collision on LR SA(n) @P1:s0 k[2,4) ids[4,8) — MT 0
@@ -2834,10 +2834,11 @@ if __name__ == "__main__":
         ("Step 3: Place GRs",               lambda: (sched.place_GRs(), sched.print_gr())),
         ("Step 4: Annotate deps",           lambda: (sched.annotate_deps(), sched.print_deps())),
         ("Step 5: Remove unnecessary GR deps", lambda: (sched.remove_unnecessary_gr_deps(), sched.print_deps())),
-        ("Step 6: Remove cross deps",       lambda: (sched.remove_cross_deps(), sched.print_remove_deps())),
-        ("Step 7: Insert gr/lr inc",        lambda: (sched.insert_gr_lr_inc(), sched.print_group_lr_gr())),
-        ("Step 8: Group LR/GR",             lambda: (sched.group_lr_gr(), sched.print_group_lr_gr())),
-        ("Step 9: Emit",                    lambda: (sched.emit(), sched.print_emit())),
+        ("Step 6: Remove unnecessary LR deps", lambda: (sched.remove_unnecessary_lr_deps(), sched.print_deps())),
+        ("Step 7: Remove cross deps",       lambda: (sched.remove_cross_deps(), sched.print_remove_deps())),
+        ("Step 8: Insert gr/lr inc",        lambda: (sched.insert_gr_lr_inc(), sched.print_group_lr_gr())),
+        ("Step 9: Group LR/GR",             lambda: (sched.group_lr_gr(), sched.print_group_lr_gr())),
+        ("Step 10: Emit",                   lambda: (sched.emit(), sched.print_emit())),
     ]
 
     interactive = "--interactive" in sys.argv or "-i" in sys.argv
@@ -2855,7 +2856,7 @@ if __name__ == "__main__":
     sched.build_preloop()
     preloop_output = sched.print_emit(sched._preloop_emitted)
     print(f"{'=' * 60}")
-    print(f"  Step 10: Preloop")
+    print(f"  Step 11: Preloop")
     print(f"{'=' * 60}")
     print(preloop_output.replace("MAINLOOP:", "PRELOOP:"))
     if interactive:
@@ -2865,7 +2866,7 @@ if __name__ == "__main__":
     sched.build_ngll()
     ngll_output = sched.print_emit(sched._ngll_emitted)
     print(f"{'=' * 60}")
-    print(f"  Step 11: NGLL")
+    print(f"  Step 12: NGLL")
     print(f"{'=' * 60}")
     print(ngll_output.replace("MAINLOOP:", "NGLL:"))
     if interactive:
@@ -2875,7 +2876,7 @@ if __name__ == "__main__":
     sched.build_nll()
     nll_output = sched.print_emit(sched._nll_emitted)
     print(f"{'=' * 60}")
-    print(f"  Step 12: NLL")
+    print(f"  Step 13: NLL")
     print(f"{'=' * 60}")
     print(nll_output.replace("MAINLOOP:", "NLL:"))
     if interactive:
@@ -2941,7 +2942,7 @@ if __name__ == "__main__":
         ("NLL",      sched._nll_per_unroll[0]),
     ]:
         print(f"{'=' * 60}")
-        print(f"  Step 13: {label} (emitLoop)")
+        print(f"  Step 14: {label} (emitLoop)")
         print(f"{'=' * 60}")
         print(_print_emitLoop(label, emitted_3d))
         if interactive:

@@ -3,15 +3,17 @@
 Builds a logical schedule using MFMA tile indices as the core primitive,
 with explicit per-operation load granularity for GR/LR on A, B, SA, SB.
 
-The schedule is built in 7 passes:
-  place_LRs          — place LRs based on their granularities
-  assign_vgpr_tiles  — assign physical vgprTileIds with per-tensor free-lists
-  place_GRs          — place GRs
-  annotate_deps    — annotate raw per-op dependencies
-  remove_cross_deps— replace cross-subIterK deps with wait preOps
-  insert_gr_lr_inc    — insert lr_inc/gr_inc preOps at MT transitions
-  group            — serialize and group (produce paths for instructionSchedule)
-  emit             — produce List[EmittedModule] with before-link chains
+The schedule is built in 8 passes:
+  place_LRs                — place LRs based on their granularities
+  assign_vgpr_tiles        — assign physical vgprTileIds with per-tensor free-lists
+  place_GRs                — place GRs
+  annotate_deps            — annotate raw per-op dependencies
+  remove_unnecessary_gr_deps — remove redundant LR→GR deps
+  remove_unnecessary_lr_deps — remove redundant GR→LR deps covered by MFMA syncs
+  remove_cross_deps        — replace cross-subIterK deps with wait preOps
+  insert_gr_lr_inc         — insert lr_inc/gr_inc preOps at MT transitions
+  group                    — serialize and group (produce paths for instructionSchedule)
+  emit                     — produce List[EmittedModule] with before-link chains
 """
 
 from __future__ import annotations
@@ -1010,8 +1012,13 @@ class MFMATileScheduler:
             """'n' → 0, 'n+1' → 1, 'n+2' → 2."""
             return 0 if mt_str == "n" else int(mt_str.split('+')[1])
 
-        def _slot_offset(consumer_slot, consumer_type, producer):
-            """Offset from slot ordering alone: 0 if producer ran first, -1 otherwise."""
+        def _slot_offset(consumer_partition, consumer_slot, consumer_type, producer):
+            """Offset from partition+slot ordering: 0 if producer ran first, -1 otherwise."""
+            prod_partition = producer.partition
+            if prod_partition < consumer_partition:
+                return 0
+            if prod_partition > consumer_partition:
+                return -1
             prod_slot = producer.subIterK_slot
             if prod_slot < consumer_slot:
                 return 0
@@ -1020,7 +1027,7 @@ class MFMATileScheduler:
             prod_type = 'LR' if isinstance(producer, LRPlacement) else 'GR'
             return -1 if _order[prod_type] >= _order[consumer_type] else 0
 
-        def _mt_offset(consumer_slot, consumer_type, producer, consumer=None):
+        def _mt_offset(consumer_partition, consumer_slot, consumer_type, producer, consumer=None):
             # MFMA→LR: MFMA always consumes mt="n" (offset 0).
             if consumer_type == 'MFMA' and isinstance(producer, LRPlacement):
                 mt_off = _parse_mt(producer.mtIteration)
@@ -1031,8 +1038,8 @@ class MFMATileScheduler:
                 diff = _parse_mt(producer.mtIteration) - _parse_mt(consumer.mtIteration)
                 if diff != 0:
                     return -diff
-            # Same effective mt: slot ordering decides.
-            return _slot_offset(consumer_slot, consumer_type, producer)
+            # Same effective mt: partition+slot ordering decides.
+            return _slot_offset(consumer_partition, consumer_slot, consumer_type, producer)
 
         def _tiles_overlap(mfma, lr_tensor, lr_tiles):
             """Check if LR tile range overlaps with MFMA's tile range for that tensor."""
@@ -1051,17 +1058,28 @@ class MFMATileScheduler:
                     a.subIterK_start < b.subIterK_end and
                     a.subIterK_end > b.subIterK_start)
 
+        def _dedup_deps(deps):
+            if len(deps) <= 1:
+                return deps
+            def _exec_order(dep):
+                return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
+            return [max(deps, key=_exec_order)]
+
         for k, slot in enumerate(slots):
-            # MFMA: depends on LRs that loaded subIterK=k data with matching tiles
+            # MFMA: depends on the most recent LR per tensor (tile-overlapping).
+            # Uses lr_by_tensor (all LRs across partitions) so that a more recent
+            # LR loading a different subIterK still subsumes older data deps.
             if slot.mfma:
                 tensor_names = ['A', 'B']
                 if cfg.hasScale:
                     tensor_names += ['SA', 'SB']
                 for t in tensor_names:
-                    for lr in lr_by_data[slot.mfma.subIterK].get(t, []):
+                    deps_for_t = []
+                    for lr in lr_by_tensor.get(t, []):
                         if _tiles_overlap(slot.mfma, t, lr.tiles):
-                            slot.mfma.deps.append(DepRef(
-                                ref=lr, mt_offset=_mt_offset(k, 'MFMA', lr)))
+                            deps_for_t.append(DepRef(
+                                ref=lr, mt_offset=_mt_offset(pi, k, 'MFMA', lr)))
+                    slot.mfma.deps.extend(_dedup_deps(deps_for_t))
 
             # LR: depends on GR (data must be in LDS before reading)
             # Cross-partition: the GR that loaded the matching tiles may be
@@ -1070,7 +1088,7 @@ class MFMATileScheduler:
                 for gr in gr_by_tensor.get(lr.tensor, []):
                     if _range_overlaps(lr.tiles, gr.tiles):
                         lr.deps.append(DepRef(
-                            ref=gr, mt_offset=_mt_offset(k, 'LR', gr, consumer=lr)))
+                            ref=gr, mt_offset=_mt_offset(pi, k, 'LR', gr, consumer=lr)))
 
             # GR: depends on collision LR (LDS double-buffer)
             # GR(n+x) collides with LR(n+x-2) — same buffer, period 2.
@@ -1089,16 +1107,6 @@ class MFMATileScheduler:
                     raise ValueError(
                         f"GR {gr.tensor} mt={gr.mtIteration} at slot {k} "
                         f"has no overlapping LR(n) dependency")
-
-        # ── Dedup: keep only the single last dep ──
-        # Execution order is (MT offset, partition, subIterK). Waiting for the
-        # last one guarantees all earlier ones have completed.
-        def _dedup_deps(deps):
-            if len(deps) <= 1:
-                return deps
-            def _exec_order(dep):
-                return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
-            return [max(deps, key=_exec_order)]
 
         for slot in slots:
             for lr in slot.lrs:
@@ -1152,6 +1160,64 @@ class MFMATileScheduler:
                     max_guaranteed = eo
 
         self._completed.add('remove_gr_deps')
+
+    # ── Remove unnecessary LR deps ────────────────────────
+
+    def remove_unnecessary_lr_deps(self):
+        """Remove GR→LR deps that are already guaranteed by an MFMA's LR sync.
+
+        For each GR with an LR dep, finds the previous GR→LR sync point
+        (any tensor). Checks the MFMA at that previous GR's position: if it
+        depends on a same-tensor LR with a later exec order than the current
+        GR's LR dep, the dep is redundant and removed.
+        """
+        if 'remove_gr_deps' not in self._completed:
+            self.remove_unnecessary_gr_deps()
+
+        def _dep_exec_order(dep):
+            return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
+
+        gr_with_lr_deps = []
+        for pi, slots in enumerate(self._partitions):
+            for slot in slots:
+                for gr in slot.grs:
+                    if gr.deps:
+                        dep = gr.deps[0]
+                        if isinstance(dep.ref, LRPlacement):
+                            gr_with_lr_deps.append((pi, slot.subIterK, gr, dep))
+
+        if len(gr_with_lr_deps) <= 1:
+            self._completed.add('remove_lr_deps')
+            return
+
+        mfma_by_pos = {}
+        for pi, slots in enumerate(self._partitions):
+            for slot in slots:
+                if slot.mfma:
+                    mfma_by_pos[(pi, slot.subIterK)] = slot.mfma
+
+        gr_with_lr_deps.sort(key=lambda x: (x[0], x[1]))
+
+        prev_gr_pos = (gr_with_lr_deps[-1][0], gr_with_lr_deps[-1][1])
+
+        for pi, subIterK, gr, dep in gr_with_lr_deps:
+            eo = _dep_exec_order(dep)
+            mfma = mfma_by_pos.get(prev_gr_pos)
+            if mfma and mfma.deps:
+                tensor = dep.ref.tensor
+                same_tensor_deps = [d for d in mfma.deps
+                                    if isinstance(d.ref, LRPlacement)
+                                    and d.ref.tensor == tensor]
+                if same_tensor_deps:
+                    mfma_max_eo = max(_dep_exec_order(d)
+                                      for d in same_tensor_deps)
+                    if mfma_max_eo > eo:
+                        gr.deps.clear()
+                        prev_gr_pos = (pi, subIterK)
+                        continue
+            prev_gr_pos = (pi, subIterK)
+
+        self._completed.add('remove_lr_deps')
 
     # ── Remove cross-subIterK deps ─────────────────────────
 
@@ -1226,8 +1292,8 @@ class MFMATileScheduler:
           - GR depending on LRs   → single wait_lr_sync
           - LR depending on GRs   → single wait_gr_sync with per-tensor inflight counts
         """
-        if 'remove_gr_deps' not in self._completed:
-            self.remove_unnecessary_gr_deps()
+        if 'remove_lr_deps' not in self._completed:
+            self.remove_unnecessary_lr_deps()
 
         for pi, slots in enumerate(self._partitions):
             for slot in slots:
