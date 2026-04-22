@@ -1164,12 +1164,14 @@ class MFMATileScheduler:
     # ── Remove unnecessary LR deps ────────────────────────
 
     def remove_unnecessary_lr_deps(self):
-        """Remove GR→LR deps that are already guaranteed by an MFMA's LR sync.
+        """Remove GR→LR deps that are already covered by earlier sync points.
 
-        For each GR with an LR dep, finds the previous GR→LR sync point
-        (any tensor). Checks the MFMA at that previous GR's position: if it
-        depends on a same-tensor LR with a later exec order than the current
-        GR's LR dep, the dep is redundant and removed.
+        Two redundancy checks:
+        1. MFMA-based: if the MFMA at the previous GR's position depends on a
+           same-tensor LR with a later exec order, the dep is redundant.
+        2. GR-based: if a previous GR (in execution order) already had the same
+           LR dep (same tensor, same or later exec order), the current GR's dep
+           is redundant because the previous GR already created that sync point.
         """
         if 'remove_gr_deps' not in self._completed:
             self.remove_unnecessary_gr_deps()
@@ -1199,12 +1201,16 @@ class MFMATileScheduler:
         gr_with_lr_deps.sort(key=lambda x: (x[0], x[1]))
 
         prev_gr_pos = (gr_with_lr_deps[-1][0], gr_with_lr_deps[-1][1])
+        # Track the max LR exec order synced per tensor by previous GRs
+        prev_gr_lr_eo = {}
 
         for pi, subIterK, gr, dep in gr_with_lr_deps:
             eo = _dep_exec_order(dep)
+            tensor = dep.ref.tensor
+            removed = False
+            # Check 1: MFMA at previous GR position syncs on a later LR
             mfma = mfma_by_pos.get(prev_gr_pos)
             if mfma and mfma.deps:
-                tensor = dep.ref.tensor
                 same_tensor_deps = [d for d in mfma.deps
                                     if isinstance(d.ref, LRPlacement)
                                     and d.ref.tensor == tensor]
@@ -1213,8 +1219,15 @@ class MFMATileScheduler:
                                       for d in same_tensor_deps)
                     if mfma_max_eo > eo:
                         gr.deps.clear()
-                        prev_gr_pos = (pi, subIterK)
-                        continue
+                        removed = True
+            # Check 2: a previous GR already synced on same or later LR
+            if not removed and tensor in prev_gr_lr_eo:
+                if prev_gr_lr_eo[tensor] >= eo:
+                    gr.deps.clear()
+                    removed = True
+
+            if not removed:
+                prev_gr_lr_eo[tensor] = eo
             prev_gr_pos = (pi, subIterK)
 
         self._completed.add('remove_lr_deps')
