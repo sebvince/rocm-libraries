@@ -420,8 +420,7 @@ class MFMATileScheduler:
             for chunk_idx in range(num_chunks):
                 next_chunk = (chunk_idx + 1) % num_chunks
                 is_wrap = (next_chunk == 0)
-                lr_mt = ("n+1" if is_last else "n") if multi_part else \
-                         "n+1" if is_wrap else "n"
+                lr_mt = "n+1" if is_last and is_wrap else "n"
                 lr_k_start = next_chunk * k_gran
                 lr_k_end = lr_k_start + k_gran
                 base_slot = chunk_idx * k_gran

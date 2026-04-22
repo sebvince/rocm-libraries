@@ -995,7 +995,7 @@ def test_place_LRs_LR_1x1_partition_10x1():
     B never changes across partitions → only A wrapping LRs needed (P0-P8).
     Each partition's A tile is unique → always needs loading.
     B K-prefetch (subIterK=1) placed once in P0, then deduped for P1-P9.
-    P9 (last): loads both A and B for MT n+1.
+    P9 (last): A K-prefetch stays MT n; wrapping LRs (A+B) are MT n+1.
     """
     kernel = create_kernel(320, 320, fp4=False)
     tiA = TileInfo('A', kernel)
@@ -1090,7 +1090,7 @@ def test_place_LRs_LR_1x1_partition_10x1():
     assert lr_a_last.tiles.tileId_start == 9
     assert lr_a_last.tiles.tileId_end == 10
     assert lr_a_last.tiles.subIterK_start == 1
-    assert lr_a_last.mtIteration == "n+1"
+    assert lr_a_last.mtIteration == "n"
 
     # subIterK=1: LR A (wrapping → P0 tile [0]), LR B (wrapping → [0-9])
     assert [lr.tensor for lr in p9[1].lrs] == ['A', 'B']
@@ -2784,7 +2784,7 @@ if __name__ == "__main__":
 
     if use_bf16:
         # BF16: MT=128x128, DU=128, no scale
-        kernel = create_kernel(256, 256, fp4=False, depthU=64)
+        kernel = create_kernel(320, 320, fp4=False, depthU=64)
         tiA = TileInfo('A', kernel)
         tiB = TileInfo('B', kernel)
         scaleTiA = None
@@ -2796,8 +2796,8 @@ if __name__ == "__main__":
             lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
             grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
             grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-            numPartitionsM=2,
-            numPartitionsN=2
+            numPartitionsM=10,
+            numPartitionsN=1
         )
     else:
         # FP4: MT=256x256, DU=256, with scale
