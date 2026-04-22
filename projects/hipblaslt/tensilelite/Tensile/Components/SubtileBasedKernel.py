@@ -1809,7 +1809,7 @@ def mainLoop(writer, kernel):
     vgprBudget = writer.states.regCaps["MaxVgpr"]
     vgprUsed = writer.vgprPool.size() - writer.vgprPool.available()
 
-    print(MFMASchedulerConfig.get_partition_candidates(tiA, tiB))
+    print("[Partition candidates]", MFMASchedulerConfig.get_partition_candidates(tiA, tiB))
     for numPartM, numPartN in MFMASchedulerConfig.get_partition_candidates(tiA, tiB):
         cfg = MFMASchedulerConfig.from_tile_info(
             tiA, tiB,

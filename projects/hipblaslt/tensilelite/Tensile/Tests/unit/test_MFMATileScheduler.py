@@ -2226,17 +2226,26 @@ def test_compute_inflight_loads():
     lr_a0_final = _get_lr(sched3._partitions[0][0], 'A')
     assert _preop_kinds(lr_a0_final) == []
 
-    # LR B @s1 had wait_gr_sync B=1
+    # LR B @s1: total inflight counts for all tensors
     lr_b1_final = _get_lr(sched3._partitions[0][1], 'B')
-    assert lr_b1_final.preOps[0].wait_gr_counts.B == 1
+    assert lr_b1_final.preOps[0].wait_gr_counts.A == 8
+    assert lr_b1_final.preOps[0].wait_gr_counts.B == 8
+    assert lr_b1_final.preOps[0].wait_gr_counts.SA == 1
+    assert lr_b1_final.preOps[0].wait_gr_counts.SB == 1
 
-    # LR SA @s1 had wait_gr_sync SA=0 (same slot as GR SA)
+    # LR SA @s1: total inflight counts for all tensors
     lr_sa1_final = _get_lr(sched3._partitions[0][1], 'SA')
-    assert lr_sa1_final.preOps[0].wait_gr_counts.SA == 0
+    assert lr_sa1_final.preOps[0].wait_gr_counts.A == 8
+    assert lr_sa1_final.preOps[0].wait_gr_counts.B == 8
+    assert lr_sa1_final.preOps[0].wait_gr_counts.SA == 1
+    assert lr_sa1_final.preOps[0].wait_gr_counts.SB == 1
 
-    # LR A @s1 had wait_gr_sync A=8
+    # LR A @s1: total inflight counts for all tensors
     lr_a1_final = _get_lr(sched3._partitions[0][1], 'A')
     assert lr_a1_final.preOps[0].wait_gr_counts.A == 8
+    assert lr_a1_final.preOps[0].wait_gr_counts.B == 8
+    assert lr_a1_final.preOps[0].wait_gr_counts.SA == 1
+    assert lr_a1_final.preOps[0].wait_gr_counts.SB == 1
 
 
 # ── Step 5/6: Group and emit (commented out — will be reworked) ──

@@ -1318,6 +1318,22 @@ class MFMATileScheduler:
 
         return count
 
+    def _compute_total_inflight_loads(self, consumer_pi: int, consumer_slot: int,
+                                       tensor: str) -> int:
+        """Count total inflight GR atomic loads for a tensor across the entire loop."""
+        gr_gran = self._gr_granularity(tensor)
+        count = 0
+        for pi_slots in self._partitions:
+            for slot in pi_slots:
+                for gr in slot.grs:
+                    if gr.tensor != tensor:
+                        continue
+                    tiles = gr.tiles
+                    n_tile = (tiles.tileId_end - tiles.tileId_start) // gr_gran.size.mn
+                    n_k = (tiles.subIterK_end - tiles.subIterK_start) // gr_gran.size.k
+                    count += n_tile * n_k
+        return count
+
     def remove_cross_deps(self):
         """Replace cross-subIterK deps with wait preOps.
 
@@ -1347,10 +1363,9 @@ class MFMATileScheduler:
                     lr.preOps = []
                     if cross:
                         counts = WaitGRCounts()
-                        for dep in cross:
-                            t = dep.ref.tensor
-                            inflight = self._compute_inflight_loads(
-                                pi, lr.subIterK_slot, t, dep)
+                        for t in self.tensors:
+                            inflight = self._compute_total_inflight_loads(
+                                pi, lr.subIterK_slot, t)
                             setattr(counts, t, inflight)
                         lr.preOps.append(DepOp(kind='wait_gr_sync',
                                                wait_gr_counts=counts))
@@ -1439,7 +1454,9 @@ class MFMATileScheduler:
                     for t in ('A', 'B', 'SA', 'SB'):
                         v = getattr(op.wait_gr_counts, t)
                         if v:
-                            setattr(merged_counts, t, v)
+                            cur = getattr(merged_counts, t)
+                            setattr(merged_counts, t,
+                                    min(cur, v) if cur else v)
                 elif op.kind in ('wait_lr_sync', 'wait_lr'):
                     if op.kind not in seen_kinds:
                         seen_kinds.add(op.kind)
