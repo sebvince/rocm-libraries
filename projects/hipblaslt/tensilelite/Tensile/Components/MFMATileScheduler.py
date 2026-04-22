@@ -107,6 +107,28 @@ class SchedulerConfig:
         assert self.numMFMATilesN % self.numPartitionsN == 0
         return self.numMFMATilesN // self.numPartitionsN
 
+    @staticmethod
+    def get_partition_candidates(tileInfoA, tileInfoB) -> list:
+        """Return partition candidates as [(numPartitionsM, numPartitionsN), ...].
+
+        Enumerates all divisors of MAX(M, N) in ascending order and
+        partitions the larger dimension. Starts with (1, 1).
+        """
+        M = tileInfoA.localMMATileGrid[0]
+        N = tileInfoB.localMMATileGrid[0]
+        maxDim = max(M, N)
+
+        divisors = sorted(d for d in range(1, maxDim + 1) if maxDim % d == 0)
+
+        candidates = []
+        for d in divisors:
+            if N >= M:
+                candidates.append((1, d))
+            else:
+                candidates.append((d, 1))
+
+        return candidates
+
     @classmethod
     def from_tile_info(cls, tileInfoA, tileInfoB,
                        lrA: ReadGranularity, lrB: ReadGranularity,
@@ -2022,6 +2044,30 @@ class MFMATileScheduler:
         return module
 
     # ── VGPR tile allocation ──────────────────────────────
+
+    def getNumVgpr(self, tileInfoA, tileInfoB,
+                        scaleTileInfoA=None, scaleTileInfoB=None) -> int:
+        """Return the total number of VGPRs needed across all tensors (A, B, SA, SB)
+        without performing any allocation.
+
+        Must be called after scheduling is complete.
+        """
+        if 'vgpr_tiles' not in self._completed:
+            self.assign_vgpr_tiles()
+
+        cfg = self.config
+
+        def _tile_vgpr_count(tileInfo, lrGran):
+            return int(math.ceil(tileInfo.mmaTileRegCount * lrGran.size.k * lrGran.size.mn))
+
+        total = self.tile_peaks.get('A', 0) * _tile_vgpr_count(tileInfoA, cfg.lrA) \
+              + self.tile_peaks.get('B', 0) * _tile_vgpr_count(tileInfoB, cfg.lrB)
+
+        if cfg.hasScale and scaleTileInfoA and scaleTileInfoB:
+            total += self.tile_peaks.get('SA', 0) * _tile_vgpr_count(scaleTileInfoA, cfg.lrSA) \
+                   + self.tile_peaks.get('SB', 0) * _tile_vgpr_count(scaleTileInfoB, cfg.lrSB)
+
+        return total
 
     def allocVgprTiles(self, writer, tileInfoA, tileInfoB,
                        scaleTileInfoA=None, scaleTileInfoB=None):

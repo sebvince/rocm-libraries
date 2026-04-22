@@ -2796,8 +2796,8 @@ if __name__ == "__main__":
             lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
             grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
             grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-            numPartitionsM=10,
-            numPartitionsN=1
+            numPartitionsM=1,
+            numPartitionsN=5
         )
     else:
         # FP4: MT=256x256, DU=256, with scale
@@ -2949,3 +2949,162 @@ if __name__ == "__main__":
             input("Press Enter for next step...")
 
     sched.deallocVgprTiles(writer)
+
+
+# ── get_partition_candidates ──────────────────────────────
+
+def test_get_partition_candidates_square():
+    """Square tile (M==N): partitions N. 8 = 2*2*2 → 4 candidates."""
+    kernel = create_kernel(256, 256)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    # M=8, N=8 (256/16/2)
+    assert tiA.localMMATileGrid[0] == 8
+    assert tiB.localMMATileGrid[0] == 8
+
+    candidates = SchedulerConfig.get_partition_candidates(tiA, tiB)
+    # max=8, M==N → partition N: (1,1),(1,2),(1,4),(1,8)
+    assert candidates == [(1, 1), (1, 2), (1, 4), (1, 8)]
+
+
+def test_get_partition_candidates_n_larger():
+    """N > M: partitions N."""
+    kernel_a = create_kernel(64, 256)
+    tiA = TileInfo('A', kernel_a)
+    tiB = TileInfo('B', kernel_a)
+    M = tiA.localMMATileGrid[0]  # 64/16/2 = 2
+    N = tiB.localMMATileGrid[0]  # 256/16/2 = 8
+    assert M == 2
+    assert N == 8
+
+    candidates = SchedulerConfig.get_partition_candidates(tiA, tiB)
+    # max=8=2*2*2, N>M → partition N
+    assert candidates == [(1, 1), (1, 2), (1, 4), (1, 8)]
+
+
+def test_get_partition_candidates_m_larger():
+    """M > N: partitions M."""
+    kernel = create_kernel(256, 64)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    M = tiA.localMMATileGrid[0]  # 8
+    N = tiB.localMMATileGrid[0]  # 2
+    assert M == 8
+    assert N == 2
+
+    candidates = SchedulerConfig.get_partition_candidates(tiA, tiB)
+    # max=8=2*2*2, M>N → partition M
+    assert candidates == [(1, 1), (2, 1), (4, 1), (8, 1)]
+
+
+def test_get_partition_candidates_prime_dim():
+    """Prime-sized dimension: only two candidates (1 and the prime itself)."""
+    cfg_tiA = MagicMock()
+    cfg_tiB = MagicMock()
+    cfg_tiA.localMMATileGrid = [5, 2]
+    cfg_tiB.localMMATileGrid = [3, 2]
+    # max=5 (prime), M>N → partition M
+    candidates = SchedulerConfig.get_partition_candidates(cfg_tiA, cfg_tiB)
+    assert candidates == [(1, 1), (5, 1)]
+
+
+def test_get_partition_candidates_composite():
+    """Composite dimension with mixed prime factors."""
+    cfg_tiA = MagicMock()
+    cfg_tiB = MagicMock()
+    cfg_tiA.localMMATileGrid = [2, 2]
+    cfg_tiB.localMMATileGrid = [6, 2]
+    # max=6, divisors=[1,2,3,6], N>M → partition N
+    candidates = SchedulerConfig.get_partition_candidates(cfg_tiA, cfg_tiB)
+    assert candidates == [(1, 1), (1, 2), (1, 3), (1, 6)]
+
+
+# ── getNumVgpr ────────────────────────────────────────────
+
+def test_getNumVgpr_no_scale():
+    """getNumVgpr with no scale tensors returns A+B total."""
+    kernel = create_kernel(256, 256)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+
+    cfg = SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+    )
+    sched = MFMATileScheduler(cfg)
+    sched.build()
+
+    total = sched.getNumVgpr(tiA, tiB)
+    assert total > 0
+    # Verify it matches manual computation from tile_peaks
+    import math
+    vgpr_per_A = int(math.ceil(tiA.mmaTileRegCount * cfg.lrA.size.k * cfg.lrA.size.mn))
+    vgpr_per_B = int(math.ceil(tiB.mmaTileRegCount * cfg.lrB.size.k * cfg.lrB.size.mn))
+    expected = sched.tile_peaks['A'] * vgpr_per_A + sched.tile_peaks['B'] * vgpr_per_B
+    assert total == expected
+
+
+def test_getNumVgpr_with_scale():
+    """getNumVgpr with scale tensors includes SA+SB."""
+    kernel = create_kernel(256, 256, fp4=True)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+
+    cfg = SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
+    )
+    sched = MFMATileScheduler(cfg)
+    sched.build()
+
+    total = sched.getNumVgpr(tiA, tiB, scaleTiA, scaleTiB)
+    total_no_scale = sched.getNumVgpr(tiA, tiB)
+    assert total > total_no_scale
+
+
+def test_getNumVgpr_decreases_with_partitions():
+    """More partitions should reduce VGPR count."""
+    kernel = create_kernel(256, 256, fp4=True)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    scaleTiA = TileInfo('MXSA', kernel)
+    scaleTiB = TileInfo('MXSB', kernel)
+
+    def _build_and_count(numPartM, numPartN):
+        cfg = SchedulerConfig.from_tile_info(
+            tiA, tiB,
+            lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+            lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+            grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+            lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+            lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+            grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+            grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
+            numPartitionsM=numPartM,
+            numPartitionsN=numPartN,
+        )
+        sched = MFMATileScheduler(cfg)
+        sched.build()
+        return sched.getNumVgpr(tiA, tiB, scaleTiA, scaleTiB)
+
+    vgpr_1x1 = _build_and_count(1, 1)
+    vgpr_1x2 = _build_and_count(1, 2)
+    vgpr_1x4 = _build_and_count(1, 4)
+
+    assert vgpr_1x1 >= vgpr_1x2
+    assert vgpr_1x2 >= vgpr_1x4

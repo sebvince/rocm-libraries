@@ -1806,26 +1806,36 @@ def mainLoop(writer, kernel):
     grAGran = ReadGranularity(MFMATileSize(k=2, mn=1)) if tiA.loadRatioGR <= 1.0 else ReadGranularity(MFMATileSize(k=2, mn=2))
     grBGran = ReadGranularity(MFMATileSize(k=2, mn=1)) if tiB.loadRatioGR <= 1.0 else ReadGranularity(MFMATileSize(k=2, mn=2))
 
-    cfg = MFMASchedulerConfig.from_tile_info(
-        tiA, tiB,
-        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        grA=grAGran,
-        grB=grBGran,
-        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)) if scaleTiA else None,
-        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)) if scaleTiB else None,
-        grSA=ReadGranularity(MFMATileSize(k=scaleTiA.localMMATileGrid[1], mn=scaleTiA.localMMATileGrid[0])) if scaleTiA else None,
-        grSB=ReadGranularity(MFMATileSize(k=scaleTiB.localMMATileGrid[1], mn=scaleTiB.localMMATileGrid[0])) if scaleTiB else None,
-        numPartitionsM=1,
-        numPartitionsN=1
-    )
-    scheduler = MFMATileScheduler(cfg)
+    vgprBudget = writer.states.regCaps["MaxVgpr"]
+    vgprUsed = writer.vgprPool.size() - writer.vgprPool.available()
 
-    # Build logical schedule
-    scheduler.build()
+    print(MFMASchedulerConfig.get_partition_candidates(tiA, tiB))
+    for numPartM, numPartN in MFMASchedulerConfig.get_partition_candidates(tiA, tiB):
+        cfg = MFMASchedulerConfig.from_tile_info(
+            tiA, tiB,
+            lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+            lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+            grA=grAGran,
+            grB=grBGran,
+            scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+            lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)) if scaleTiA else None,
+            lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)) if scaleTiB else None,
+            grSA=ReadGranularity(MFMATileSize(k=scaleTiA.localMMATileGrid[1], mn=scaleTiA.localMMATileGrid[0])) if scaleTiA else None,
+            grSB=ReadGranularity(MFMATileSize(k=scaleTiB.localMMATileGrid[1], mn=scaleTiB.localMMATileGrid[0])) if scaleTiB else None,
+            numPartitionsM=1,
+            numPartitionsN=1,
+        )
+        scheduler = MFMATileScheduler(cfg)
+        scheduler.build()
 
-    # Allocation and instruction emit 
+        numVgpr = scheduler.getNumVgpr(tiA, tiB, scaleTiA, scaleTiB)
+        if vgprUsed + numVgpr <= vgprBudget:
+            break
+
+    
+    print(f"[Partition] selected ({numPartM}, {numPartN}), vgprUsed={vgprUsed}, vgprNeeded={numVgpr}, total={vgprUsed + numVgpr}/{vgprBudget}")
+
+    # Allocation and instruction emit
     scheduler.allocVgprTiles(writer, tiA, tiB,
                              scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
     dtileInfo = writer.states.d.tileInfo
