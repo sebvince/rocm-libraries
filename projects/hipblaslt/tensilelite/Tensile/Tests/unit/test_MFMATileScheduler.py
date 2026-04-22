@@ -1933,24 +1933,24 @@ def test_remove_cross_deps_1x1_partition_DU256():
     assert _preop_kinds(s1.mfma) == [('wait_lr', None)]
     assert len(s1.mfma.deps) == 0
 
-    # LR A @s1: dep on GR A @s0 (MT-1) → cross, wait_gr_sync with A=8
+    # LR A @s1: dep on GR A @s0 (MT-1), walk counts all tensors
     lr_a1 = _get_lr(s1, 'A')
-    assert _preop_kinds(lr_a1) == [('wait_gr_sync', {'A': 8, 'B': 0, 'SA': 0, 'SB': 0})]
+    assert _preop_kinds(lr_a1) == [('wait_gr_sync', {'A': 8, 'B': 8, 'SA': 1, 'SB': 1})]
     assert len(lr_a1.deps) == 0
 
-    # LR B @s1: dep on GR B @s1 (MT-1) → cross, wait_gr_sync with B=1
+    # LR B @s1: dep on GR B @s1 (MT-1), walk counts all tensors
     lr_b1 = _get_lr(s1, 'B')
-    assert _preop_kinds(lr_b1) == [('wait_gr_sync', {'A': 0, 'B': 1, 'SA': 0, 'SB': 0})]
+    assert _preop_kinds(lr_b1) == [('wait_gr_sync', {'A': 8, 'B': 1, 'SA': 0, 'SB': 0})]
     assert len(lr_b1.deps) == 0
 
-    # LR SA @s1: dep on GR SA @s1 (MT-1) → cross, wait_gr_sync with SA=0 (same slot)
+    # LR SA @s1: dep on GR SA @s1 (MT-1), walk counts all tensors
     lr_sa1 = _get_lr(s1, 'SA')
-    assert _preop_kinds(lr_sa1) == [('wait_gr_sync', {'A': 0, 'B': 0, 'SA': 0, 'SB': 0})]
+    assert _preop_kinds(lr_sa1) == [('wait_gr_sync', {'A': 8, 'B': 8, 'SA': 0, 'SB': 0})]
     assert len(lr_sa1.deps) == 0
 
-    # LR SB @s1: dep on GR SB @s1 (MT-1) → cross, wait_gr_sync with SB=0
+    # LR SB @s1: dep on GR SB @s1 (MT-1), walk counts all tensors
     lr_sb1 = _get_lr(s1, 'SB')
-    assert _preop_kinds(lr_sb1) == [('wait_gr_sync', {'A': 0, 'B': 0, 'SA': 0, 'SB': 0})]
+    assert _preop_kinds(lr_sb1) == [('wait_gr_sync', {'A': 8, 'B': 8, 'SA': 1, 'SB': 0})]
     assert len(lr_sb1.deps) == 0
 
     # GR B @s1: dep on LR B @s0 (MT-2) → cross, wait_lr_sync
@@ -2212,10 +2212,10 @@ def test_compute_inflight_loads():
     sched2.annotate_deps()
     lr_a0_fresh = _get_lr(sched2._partitions[0][0], 'A')
     dep_a0 = lr_a0_fresh.deps[0]
-    count_a = sched2._compute_inflight_loads(0, 0, 'A', dep_a0)
+    counts_a = sched2._compute_inflight_loads(0, 0, 'A', dep_a0)
     # GR A is at s0 with 8 loads. mt_offset=-2 means 2 wraps needed.
     # Walk: s1→s0 (wrap1, count GR A=8 since it's dep but wraps<2), s1→s0 (wrap2, dep found) → 8
-    assert count_a == 16  # Wait, let me verify with actual output
+    assert counts_a.A == 16  # Wait, let me verify with actual output
 
     # Verify against actual remove_cross_deps output
     # Note: LR A @s0 and LR B @s0 deps are removed by remove_unnecessary_gr_deps
@@ -2226,21 +2226,21 @@ def test_compute_inflight_loads():
     lr_a0_final = _get_lr(sched3._partitions[0][0], 'A')
     assert _preop_kinds(lr_a0_final) == []
 
-    # LR B @s1: total inflight counts for all tensors
+    # LR B @s1: dep on GR B @s1 (MT-1), walk counts all tensors to that point
     lr_b1_final = _get_lr(sched3._partitions[0][1], 'B')
     assert lr_b1_final.preOps[0].wait_gr_counts.A == 8
-    assert lr_b1_final.preOps[0].wait_gr_counts.B == 8
-    assert lr_b1_final.preOps[0].wait_gr_counts.SA == 1
-    assert lr_b1_final.preOps[0].wait_gr_counts.SB == 1
+    assert lr_b1_final.preOps[0].wait_gr_counts.B == 1
+    assert lr_b1_final.preOps[0].wait_gr_counts.SA == 0
+    assert lr_b1_final.preOps[0].wait_gr_counts.SB == 0
 
-    # LR SA @s1: total inflight counts for all tensors
+    # LR SA @s1: dep on GR SA @s1 (MT-1), walk counts all tensors to that point
     lr_sa1_final = _get_lr(sched3._partitions[0][1], 'SA')
     assert lr_sa1_final.preOps[0].wait_gr_counts.A == 8
     assert lr_sa1_final.preOps[0].wait_gr_counts.B == 8
-    assert lr_sa1_final.preOps[0].wait_gr_counts.SA == 1
-    assert lr_sa1_final.preOps[0].wait_gr_counts.SB == 1
+    assert lr_sa1_final.preOps[0].wait_gr_counts.SA == 0
+    assert lr_sa1_final.preOps[0].wait_gr_counts.SB == 0
 
-    # LR A @s1: total inflight counts for all tensors
+    # LR A @s1: dep on GR A @s0 (MT-1), walk counts all tensors to that point
     lr_a1_final = _get_lr(sched3._partitions[0][1], 'A')
     assert lr_a1_final.preOps[0].wait_gr_counts.A == 8
     assert lr_a1_final.preOps[0].wait_gr_counts.B == 8
@@ -2793,7 +2793,7 @@ if __name__ == "__main__":
 
     if use_bf16:
         # BF16: MT=128x128, DU=128, no scale
-        kernel = create_kernel(320, 320, fp4=False, depthU=64)
+        kernel = create_kernel(256, 256, fp4=False, depthU=64)
         tiA = TileInfo('A', kernel)
         tiB = TileInfo('B', kernel)
         scaleTiA = None
@@ -2806,7 +2806,7 @@ if __name__ == "__main__":
             grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
             grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
             numPartitionsM=1,
-            numPartitionsN=5
+            numPartitionsN=1
         )
     else:
         # FP4: MT=256x256, DU=256, with scale

@@ -1262,42 +1262,32 @@ class MFMATileScheduler:
                 'SA': self.config.grSA, 'SB': self.config.grSB}[tensor]
 
     def _compute_inflight_loads(self, consumer_pi: int, consumer_slot: int,
-                                tensor: str, dep_ref: DepRef) -> int:
+                                tensor: str, dep_ref: DepRef) -> WaitGRCounts:
         """Count inflight GR atomic loads between a dep GR and the consumer.
 
         Walks backward through the flattened schedule (all partitions x subIterK)
-        from the consumer position, counting atomic GR loads for `tensor`.
+        from the consumer position, counting atomic GR loads for all tensors.
         Stops when reaching the dependency GR (dep_ref.ref) after accounting
         for mt_offset wraps.
 
-        Returns the number of inflight atomic loads.
+        Returns per-tensor inflight load counts.
         """
-        gr_gran = self._gr_granularity(tensor)
         numP = len(self._partitions)
         numK = len(self._partitions[0])
         flat_len = numP * numK
 
-        # Flatten: flat_idx = pi * numK + slot_k
         consumer_flat = consumer_pi * numK + consumer_slot
 
-        # How many full wraps we need before stopping at the dep.
-        # mt_offset is negative (e.g., -1 = previous MT, -2 = two MTs back).
         wraps_needed = abs(dep_ref.mt_offset)
-        # If the dep is in the same MT (mt_offset == 0) we still walk backward
-        # up to the dep within the current "unwrapped" iteration.
-        # wraps_completed tracks how many full-loop wraps we've done.
 
-        count = 0
+        counts = WaitGRCounts()
         wraps_completed = 0
         pos = consumer_flat
 
-        # Walk backward; maximum steps = wraps_needed * flat_len + flat_len
-        # (at most wraps_needed full loops + the partial first loop).
         max_steps = (wraps_needed + 1) * flat_len
         for _ in range(max_steps):
             pos = (pos - 1) % flat_len
             if pos == flat_len - 1 and _ > 0:
-                # We just wrapped around the loop boundary
                 wraps_completed += 1
 
             pi = pos // numK
@@ -1305,34 +1295,16 @@ class MFMATileScheduler:
             slot = self._partitions[pi][slot_k]
 
             for gr in slot.grs:
-                if gr.tensor != tensor:
-                    continue
-                # Check if this is the dependency GR
-                if gr is dep_ref.ref and wraps_completed >= wraps_needed:
-                    return count
-                # Count atomic loads for this GR
+                if gr.tensor == tensor and gr is dep_ref.ref and wraps_completed >= wraps_needed:
+                    return counts
+                gr_gran = self._gr_granularity(gr.tensor)
                 tiles = gr.tiles
                 n_tile = (tiles.tileId_end - tiles.tileId_start) // gr_gran.size.mn
                 n_k = (tiles.subIterK_end - tiles.subIterK_start) // gr_gran.size.k
-                count += n_tile * n_k
+                cur = getattr(counts, gr.tensor)
+                setattr(counts, gr.tensor, cur + n_tile * n_k)
 
-        return count
-
-    def _compute_total_inflight_loads(self, consumer_pi: int, consumer_slot: int,
-                                       tensor: str) -> int:
-        """Count total inflight GR atomic loads for a tensor across the entire loop."""
-        gr_gran = self._gr_granularity(tensor)
-        count = 0
-        for pi_slots in self._partitions:
-            for slot in pi_slots:
-                for gr in slot.grs:
-                    if gr.tensor != tensor:
-                        continue
-                    tiles = gr.tiles
-                    n_tile = (tiles.tileId_end - tiles.tileId_start) // gr_gran.size.mn
-                    n_k = (tiles.subIterK_end - tiles.subIterK_start) // gr_gran.size.k
-                    count += n_tile * n_k
-        return count
+        return counts
 
     def remove_cross_deps(self):
         """Replace cross-subIterK deps with wait preOps.
@@ -1362,11 +1334,9 @@ class MFMATileScheduler:
                     lr.deps = same
                     lr.preOps = []
                     if cross:
-                        counts = WaitGRCounts()
-                        for t in self.tensors:
-                            inflight = self._compute_total_inflight_loads(
-                                pi, lr.subIterK_slot, t)
-                            setattr(counts, t, inflight)
+                        dep = cross[0]
+                        counts = self._compute_inflight_loads(
+                            pi, lr.subIterK_slot, dep.ref.tensor, dep)
                         lr.preOps.append(DepOp(kind='wait_gr_sync',
                                                wait_gr_counts=counts))
 
@@ -1374,9 +1344,7 @@ class MFMATileScheduler:
                 for gr in slot.grs:
                     same, cross = self._split_deps(gr.deps, pi, gr.subIterK_slot)
                     gr.deps = same
-                    gr.preOps = []
-                    if cross:
-                        gr.preOps.append(DepOp(kind='wait_lr_sync'))
+                    gr.preOps = [DepOp(kind='wait_lr_sync')]
 
         self._completed.add('remove_deps')
 
