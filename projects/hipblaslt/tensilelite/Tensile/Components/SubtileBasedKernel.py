@@ -1822,8 +1822,8 @@ def mainLoop(writer, kernel):
             lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)) if scaleTiB else None,
             grSA=ReadGranularity(MFMATileSize(k=scaleTiA.localMMATileGrid[1], mn=scaleTiA.localMMATileGrid[0])) if scaleTiA else None,
             grSB=ReadGranularity(MFMATileSize(k=scaleTiB.localMMATileGrid[1], mn=scaleTiB.localMMATileGrid[0])) if scaleTiB else None,
-            numPartitionsM=1,
-            numPartitionsN=1,
+            numPartitionsM=numPartM,
+            numPartitionsN=numPartN,
         )
         scheduler = MFMATileScheduler(cfg)
         scheduler.build()
