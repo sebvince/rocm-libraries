@@ -1505,3 +1505,143 @@ class TestIntegration:
 
         finally:
             sched.deallocVgprTiles(writer)
+
+# Tool to visualize the scheduling steps on a real kernel configuration. Run with --interactive to step through each phase.
+# Also calls the instruction scheduler to verify the emitted modules are valid input and to show the final instruction counts.
+
+if __name__ == "__main__":
+    import sys
+    import io
+
+    use_bf16 = "--bf16" in sys.argv
+
+    if use_bf16:
+        kernel = create_kernel(384, 256, fp4=False, depthU=64)
+        tiA = TileInfo('A', kernel)
+        tiB = TileInfo('B', kernel)
+        scaleTiA = None
+        scaleTiB = None
+
+        cfg = SchedulerConfig.from_tile_info(
+            tiA, tiB,
+            lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+            lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+            grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            numPartitionsM=2,
+            numPartitionsN=1,
+        )
+    else:
+        kernel = create_kernel(256, 256, fp4=True)
+        tiA = TileInfo('A', kernel)
+        tiB = TileInfo('B', kernel)
+        scaleTiA = TileInfo('MXSA', kernel)
+        scaleTiB = TileInfo('MXSB', kernel)
+
+        cfg = SchedulerConfig.from_tile_info(
+            tiA, tiB,
+            lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+            lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+            grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+            lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
+            lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+            grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
+            grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
+        )
+
+    print(f"Config: numMFMATilesM={cfg.numMFMATilesM}, "
+          f"numMFMATilesN={cfg.numMFMATilesN}, "
+          f"numSubIterK={cfg.numSubIterK}, "
+          f"hasScale={cfg.hasScale}")
+    print()
+
+    sched = SubtileBasedLogicalScheduler(cfg)
+
+    steps = [
+        ("Place LRs",                     lambda: (sched.place_LRs(), sched.print_lr())),
+        ("Assign VGPR tiles",             lambda: (sched.assign_vgpr_tiles(), sched.print_vgpr())),
+        ("Place GRs",                     lambda: (sched.place_GRs(), sched.print_gr())),
+        ("Annotate deps",                 lambda: (sched.annotate_deps(), sched.print_deps())),
+        ("Remove unnecessary GR deps",    lambda: (sched.remove_unnecessary_gr_deps(), sched.print_deps())),
+        ("Remove unnecessary LR deps",    lambda: (sched.remove_unnecessary_lr_deps(), sched.print_deps())),
+        ("Remove cross deps",             lambda: (sched.remove_cross_deps(), sched.print_remove_deps())),
+        ("Insert gr/lr inc",              lambda: (sched.insert_gr_lr_inc(), sched.print_group_lr_gr())),
+        ("Group LR/GR",                   lambda: (sched.group_lr_gr(), sched.print_group_lr_gr())),
+        ("Remove unnecessary wait_lr_sync", lambda: (sched.remove_unnecessary_wait_lr_sync(), sched.print_group_lr_gr())),
+        ("Emit",                          lambda: (sched.emit(), sched.print_emit())),
+        ("Emit (dependency order)",       lambda: (None, sched.print_emit_dep_order())),
+    ]
+
+    interactive = "--interactive" in sys.argv or "-i" in sys.argv
+
+    for i, (title, run) in enumerate(steps):
+        _, output = run()
+        print(f"{'=' * 60}")
+        print(f"  {title}")
+        print(f"{'=' * 60}")
+        print(output)
+        if interactive and i < len(steps) - 1:
+            input("Press Enter for next step...")
+
+    sched.build_preloop()
+    preloop_output = sched.print_emit(sched._preloop_emitted)
+    print(f"{'=' * 60}")
+    print(f"  Preloop")
+    print(f"{'=' * 60}")
+    print(preloop_output.replace("MAINLOOP:", "PRELOOP:"))
+    if interactive:
+        input("Press Enter for next step...")
+
+    sched.build_ngll()
+    ngll_output = sched.print_emit(sched._ngll_emitted)
+    print(f"{'=' * 60}")
+    print(f"  NGLL")
+    print(f"{'=' * 60}")
+    print(ngll_output.replace("MAINLOOP:", "NGLL:"))
+    if interactive:
+        input("Press Enter for next step...")
+
+    sched.build_nll()
+    nll_output = sched.print_emit(sched._nll_emitted)
+    print(f"{'=' * 60}")
+    print(f"  NLL")
+    print(f"{'=' * 60}")
+    print(nll_output.replace("MAINLOOP:", "NLL:"))
+    if interactive:
+        input("Press Enter for next step...")
+
+    writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = make_writer_and_tileinfos(kernel, fp4=not use_bf16)
+
+    sched.allocVgprTiles(writer, tiA, tiB,
+                         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+
+    sched.populate_instructions(
+        writer, kernel,
+        tileInfoA=tiA, tileInfoB=tiB,
+        dtileInfo=dTileInfo,
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+    )
+
+    def _print_emitLoop(label, emitted_3d):
+        module = sched._emitLoop(writer, kernel, label, emitted_3d)
+        buf = io.StringIO()
+        for inst in module.flatitems():
+            buf.write(f"  {str(inst).rstrip()}\n")
+        return buf.getvalue()
+
+    for label, emitted_3d in [
+        ("PRELOOP",  sched._preloop_emitted),
+        ("MAINLOOP", sched._emitted_per_unroll[0]),
+        ("NGLL",     sched._ngll_per_unroll[0]),
+        ("NLL",      sched._nll_per_unroll[0]),
+    ]:
+        print(f"{'=' * 60}")
+        print(f"  {label} (emitLoop)")
+        print(f"{'=' * 60}")
+        print(_print_emitLoop(label, emitted_3d))
+        if interactive:
+            input("Press Enter for next step...")
+
+    sched.deallocVgprTiles(writer)
