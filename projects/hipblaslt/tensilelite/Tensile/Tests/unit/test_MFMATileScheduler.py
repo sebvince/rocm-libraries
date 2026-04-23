@@ -1953,9 +1953,9 @@ def test_remove_cross_deps_1x1_partition_DU256():
     assert _preop_kinds(lr_sb1) == [('wait_gr_sync', {'A': 8, 'B': 8, 'SA': 1, 'SB': 0})]
     assert len(lr_sb1.deps) == 0
 
-    # GR B @s1: dep on LR B @s0 (MT-2) → cross, wait_lr_sync
+    # GR B @s1: LR dep was removed by remove_unnecessary_lr_deps → no preOps
     gr_b1 = [gr for gr in s1.grs if gr.tensor == 'B'][0]
-    assert _preop_kinds(gr_b1) == [('wait_lr_sync', None)]
+    assert _preop_kinds(gr_b1) == []
     assert len(gr_b1.deps) == 0
 
 
@@ -2007,22 +2007,22 @@ def test_remove_cross_deps_2x2_partition_DU512():
     assert _preop_kinds(lr_sa_p0_s0) == []
     assert len(lr_sa_p0_s0.deps) == 0
 
-    # GR A @P0:s0: dep on LR A @P0:s3 (MT-1) → wait_lr_sync
+    # GR A @P0:s0: LR dep was removed by remove_unnecessary_lr_deps → no preOps
     gr_a_p0_s0 = [gr for gr in p0[0].grs if gr.tensor == 'A'][0]
-    assert _preop_kinds(gr_a_p0_s0) == [('wait_lr_sync', None)]
+    assert _preop_kinds(gr_a_p0_s0) == []
 
     # ── P2 spot checks ──
 
     p2 = parts[2]
 
-    # GR A(n+2) @P2:s0: dep on LR A(n) @P0:s0 (MT 0, cross-partition) → wait_lr_sync
+    # GR A(n+2) @P2:s0: LR dep was removed by remove_unnecessary_lr_deps → no preOps
     gr_a_p2_s0 = [gr for gr in p2[0].grs if gr.tensor == 'A'][0]
-    assert _preop_kinds(gr_a_p2_s0) == [('wait_lr_sync', None)]
+    assert _preop_kinds(gr_a_p2_s0) == []
     assert len(gr_a_p2_s0.deps) == 0
 
-    # GR B @P2:s2: dep on LR B @P2:s2 (MT-2) → cross, wait_lr_sync
+    # GR B @P2:s2: LR dep was removed by remove_unnecessary_lr_deps → no preOps
     gr_b_p2_s2 = [gr for gr in p2[2].grs if gr.tensor == 'B'][0]
-    assert _preop_kinds(gr_b_p2_s2) == [('wait_lr_sync', None)]
+    assert _preop_kinds(gr_b_p2_s2) == []
 
     # ── P3 spot checks ──
 
@@ -2436,17 +2436,17 @@ def test_group_lr_gr_1x1_partition_DU256():
     gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
     gr_b0 = [gr for gr in s0.grs if gr.tensor == 'B'][0]
 
-    # First GR (A) has merged preOps: wait_lr_sync, gr_inc(A), gr_inc(B)
-    assert len(gr_a0.preOps) == 3
+    # First GR (A) has preOps: wait_lr_sync, gr_inc(A)
+    assert len(gr_a0.preOps) == 2
     assert gr_a0.preOps[0].kind == 'wait_lr_sync'
     assert gr_a0.preOps[1].kind == 'gr_inc' and gr_a0.preOps[1].tensor == 'A'
-    assert gr_a0.preOps[2].kind == 'gr_inc' and gr_a0.preOps[2].tensor == 'B'
     # First GR dep points to last LR (B now)
     assert len(gr_a0.deps) == 1
     assert gr_a0.deps[0].ref is lr_b0
 
-    # GR B chains to GR A
-    assert gr_b0.preOps == []
+    # GR B chains to GR A, keeps its own gr_inc
+    assert len(gr_b0.preOps) == 1
+    assert gr_b0.preOps[0].kind == 'gr_inc' and gr_b0.preOps[0].tensor == 'B'
     assert len(gr_b0.deps) == 1
     assert gr_b0.deps[0].ref is gr_a0
 
@@ -2488,22 +2488,20 @@ def test_group_lr_gr_1x1_partition_DU256():
     gr_sa1 = [gr for gr in s1.grs if gr.tensor == 'SA'][0]
     gr_sb1 = [gr for gr in s1.grs if gr.tensor == 'SB'][0]
 
-    # First GR (B) has merged preOps: wait_lr_sync + gr_inc(SA,SB)
-    # No gr_inc(B) here — GR B[0] @s0 already advanced B's SRD to mt n+2
-    assert gr_b1.preOps[0].kind == 'wait_lr_sync'
-    assert gr_b1.preOps[1].kind == 'gr_inc' and gr_b1.preOps[1].tensor == 'SA'
-    assert gr_b1.preOps[2].kind == 'gr_inc' and gr_b1.preOps[2].tensor == 'SB'
-    assert len(gr_b1.preOps) == 3
-    # No deps (none originally)
+    # GR B has no LR dep (removed by remove_unnecessary_lr_deps) → no preOps, no deps
+    assert gr_b1.preOps == []
     assert gr_b1.deps == []
 
-    # GR SA chains to GR B
-    assert gr_sa1.preOps == []
+    # GR SA is first GR with deps, has wait_lr_sync + gr_inc(SA)
+    assert len(gr_sa1.preOps) == 2
+    assert gr_sa1.preOps[0].kind == 'wait_lr_sync'
+    assert gr_sa1.preOps[1].kind == 'gr_inc' and gr_sa1.preOps[1].tensor == 'SA'
     assert len(gr_sa1.deps) == 1
     assert gr_sa1.deps[0].ref is gr_b1
 
-    # GR SB chains to GR SA
-    assert gr_sb1.preOps == []
+    # GR SB chains to GR SA, keeps its own gr_inc
+    assert len(gr_sb1.preOps) == 1
+    assert gr_sb1.preOps[0].kind == 'gr_inc' and gr_sb1.preOps[0].tensor == 'SB'
     assert len(gr_sb1.deps) == 1
     assert gr_sb1.deps[0].ref is gr_sa1
 
@@ -2793,7 +2791,7 @@ if __name__ == "__main__":
 
     if use_bf16:
         # BF16: MT=128x128, DU=128, no scale
-        kernel = create_kernel(256, 256, fp4=False, depthU=64)
+        kernel = create_kernel(384, 256, fp4=False, depthU=64)
         tiA = TileInfo('A', kernel)
         tiB = TileInfo('B', kernel)
         scaleTiA = None
@@ -2805,7 +2803,7 @@ if __name__ == "__main__":
             lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
             grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
             grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-            numPartitionsM=1,
+            numPartitionsM=2,
             numPartitionsN=1
         )
     else:

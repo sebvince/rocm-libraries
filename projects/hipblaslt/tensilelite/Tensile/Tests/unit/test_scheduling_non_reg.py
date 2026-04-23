@@ -105,6 +105,87 @@ MAINLOOP (dependency paths):
 """
 
 
+def make_384x256_bf16():
+    kernel = create_kernel(384, 256, fp4=False, depthU=64)
+    tiA = TileInfo('A', kernel)
+    tiB = TileInfo('B', kernel)
+    return SchedulerConfig.from_tile_info(
+        tiA, tiB,
+        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        numPartitionsM=2,
+        numPartitionsN=1,
+    )
+
+
+EXPECTED_EMIT_DEP_ORDER_384x256_BF16_2x1 = """\
+MAINLOOP (dependency paths):
+  Partition 0:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [0-5] , B : [0-7] <- [4]
+      preMFMA path 0:
+        [ 4] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR A  (MT n, subIterK [1]) [0-5]
+        [ 2] lr         LR B  (MT n, subIterK [1]) [0-7]
+      path 1:
+        [ 3] gr         GR A (MT n+1, subIterK [0,1]) ids [6-10]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [0-5] , B : [0-7] <- [4]
+      preMFMA path 0:
+        [ 4] wait_lr    wait_lr
+      path 0:
+        [ 5] wait_gr    wait_gr_sync(A=7,B=8)
+        [ 6] sync       sync
+        [ 1] lr         LR A  (MT n, subIterK [0]) [6-11]
+      path 1:
+        [ 2] gr         GR A (MT n+1, subIterK [0,1]) ids [11-11]
+        [ 7] sync       sync
+        [ 8] gr_inc     gr_inc(A)
+        [ 3] gr         GR A (MT n+2, subIterK [0,1]) ids [0-3]
+  Partition 1:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [6-11] , B : [0-7] <- [4]
+      preMFMA path 0:
+        [ 4] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR A  (MT n, subIterK [1]) [6-11]
+      path 1:
+        [ 2] gr         GR A (MT n+2, subIterK [0,1]) ids [4-5]
+        [ 5] sync       sync
+        [ 6] gr_inc     gr_inc(B)
+        [ 3] gr         GR B (MT n+2, subIterK [0,1]) ids [0-2]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [6-11] , B : [0-7] <- [4]
+      preMFMA path 0:
+        [ 4] wait_lr    wait_lr
+      path 0:
+        [ 5] wait_gr    wait_gr_sync(A=12,B=3)
+        [ 6] sync       sync
+        [ 7] lr_inc     lr_inc(A)
+        [ 8] lr_inc     lr_inc(B)
+        [ 1] lr         LR A  (MT n+1, subIterK [0]) [0-5]
+        [ 2] lr         LR B  (MT n+1, subIterK [0]) [0-7]
+      path 1:
+        [ 3] gr         GR B (MT n+2, subIterK [0,1]) ids [3-7]
+"""
+
+
+def test_384x256_bf16_partition_2x1():
+    """Exact check of step 11b (emit dependency order) for 384x256 BF16, 2x1 partition."""
+    cfg = make_384x256_bf16()
+    sched = MFMATileScheduler(cfg)
+    sched.emit()
+    actual = sched.print_emit_dep_order()
+    assert actual == EXPECTED_EMIT_DEP_ORDER_384x256_BF16_2x1, (
+        f"Step 11b output mismatch.\n"
+        f"--- Expected ---\n{EXPECTED_EMIT_DEP_ORDER_384x256_BF16_2x1}\n"
+        f"--- Actual ---\n{actual}"
+    )
+
+
 def test_256x256_bf16_partition_1x1():
     """Exact check of step 11b (emit dependency order) for 256x256 BF16, 1x1 partition."""
     cfg = make_256x256_bf16()

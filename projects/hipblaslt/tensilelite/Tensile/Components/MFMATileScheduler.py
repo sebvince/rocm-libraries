@@ -1532,6 +1532,10 @@ class MFMATileScheduler:
         In that case, all prior LR reads were already synced by the previous
         subIterK's barrier, and the current GR doesn't conflict with any LRs
         in its own subIterK, so the second wait_lr_sync is redundant.
+
+        Finally, any remaining wait_lr_sync on a GR with no deps is downgraded
+        to just sync — the wait_lr is already guaranteed by the MFMA op in the
+        same subIterK.
         """
         if 'group_lr_gr' not in self._completed:
             self.group_lr_gr()
@@ -1562,6 +1566,27 @@ class MFMATileScheduler:
                     first_gr.preOps = [
                         op for op in first_gr.preOps
                         if op.kind != 'wait_lr_sync']
+
+        # Downgrade remaining wait_lr_sync → sync on GRs with no LR deps.
+        # The MFMA in the same subIterK already ensures wait_lr.
+        for pi, slots in enumerate(self._partitions):
+            for slot in slots:
+                for gr in slot.grs:
+                    if not any(op.kind == 'wait_lr_sync' for op in gr.preOps):
+                        continue
+                    has_lr_dep = False
+                    node = gr
+                    while node and node.deps:
+                        ref = node.deps[0].ref
+                        if isinstance(ref, LRPlacement):
+                            has_lr_dep = True
+                            break
+                        node = ref
+                    if has_lr_dep:
+                        continue
+                    gr.preOps = [
+                        DepOp(kind='sync') if op.kind == 'wait_lr_sync' else op
+                        for op in gr.preOps]
 
         self._completed.add('remove_wait_lr_sync')
 
