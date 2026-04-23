@@ -1408,7 +1408,7 @@ class MFMATileScheduler:
         Combines wait_gr/wait_gr_sync counts into a single DepOp, deduplicates barrier ops
         (wait_lr_sync, wait_lr), and collects the rest.
         """
-        merged_counts = None
+        wait_gr_ops = []
         has_wait_gr_sync = False
         seen_kinds = set()
         others = []
@@ -1417,14 +1417,7 @@ class MFMATileScheduler:
                 if op.kind in ('wait_gr', 'wait_gr_sync') and op.wait_gr_counts:
                     if op.kind == 'wait_gr_sync':
                         has_wait_gr_sync = True
-                    if merged_counts is None:
-                        merged_counts = WaitGRCounts()
-                    for t in ('A', 'B', 'SA', 'SB'):
-                        v = getattr(op.wait_gr_counts, t)
-                        if v:
-                            cur = getattr(merged_counts, t)
-                            setattr(merged_counts, t,
-                                    min(cur, v) if cur else v)
+                    wait_gr_ops.append(op.wait_gr_counts)
                 elif op.kind in ('wait_lr_sync', 'wait_lr'):
                     if op.kind not in seen_kinds:
                         seen_kinds.add(op.kind)
@@ -1432,7 +1425,10 @@ class MFMATileScheduler:
                 else:
                     others.append(op)
         result = []
-        if merged_counts is not None:
+        if wait_gr_ops:
+            merged_counts = WaitGRCounts()
+            for t in ('A', 'B', 'SA', 'SB'):
+                setattr(merged_counts, t, min(getattr(c, t) for c in wait_gr_ops))
             merged_kind = 'wait_gr_sync' if has_wait_gr_sync else 'wait_gr'
             result.append(DepOp(kind=merged_kind, wait_gr_counts=merged_counts))
         result.extend(others)
@@ -2391,4 +2387,37 @@ class MFMATileScheduler:
                 for em in emitted:
                     before_str = f" <- [{em.before}]" if em.before is not None else ""
                     buf.write(f"      [{em.moduleId:2d}] {em.opType:10s} {em.label}{before_str}\n")
+        return buf.getvalue()
+
+    def print_emit_dep_order(self, all_partitions: List[List[List[EmittedModule]]] = None) -> str:
+        """Print emit output sorted by dependency order (topological sort on before-links)."""
+        if all_partitions is None:
+            all_partitions = self._emitted
+        buf = io.StringIO()
+        buf.write("MAINLOOP (dependency order):\n")
+        for pi, partition_emitted in enumerate(all_partitions):
+            buf.write(f"  Partition {pi}:\n")
+            for k, emitted in enumerate(partition_emitted):
+                buf.write(f"    subIterK={k}:\n")
+                by_id = {em.moduleId: em for em in emitted}
+                placed = set()
+                ordered = []
+                remaining = list(emitted)
+                while remaining:
+                    progress = False
+                    next_remaining = []
+                    for em in remaining:
+                        if em.before is None or em.before in placed:
+                            ordered.append(em)
+                            placed.add(em.moduleId)
+                            progress = True
+                        else:
+                            next_remaining.append(em)
+                    remaining = next_remaining
+                    if not progress:
+                        ordered.extend(remaining)
+                        break
+                for i, em in enumerate(ordered):
+                    before_str = f" <- [{em.before}]" if em.before is not None else ""
+                    buf.write(f"      [{i:2d}] [{em.moduleId:2d}] {em.opType:10s} {em.label}{before_str}\n")
         return buf.getvalue()

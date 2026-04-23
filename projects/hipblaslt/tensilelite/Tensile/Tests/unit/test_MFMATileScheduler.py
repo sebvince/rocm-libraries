@@ -2848,6 +2848,7 @@ if __name__ == "__main__":
         ("Step 8: Insert gr/lr inc",        lambda: (sched.insert_gr_lr_inc(), sched.print_group_lr_gr())),
         ("Step 9: Group LR/GR",             lambda: (sched.group_lr_gr(), sched.print_group_lr_gr())),
         ("Step 10: Emit",                   lambda: (sched.emit(), sched.print_emit())),
+        ("Step 10b: Emit (dependency order)", lambda: (None, sched.print_emit_dep_order())),
     ]
 
     interactive = "--interactive" in sys.argv or "-i" in sys.argv
