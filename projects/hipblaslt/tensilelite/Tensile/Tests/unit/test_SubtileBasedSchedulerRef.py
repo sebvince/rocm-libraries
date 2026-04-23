@@ -1,8 +1,7 @@
 """Non-regression tests for SubtileBasedLogicalScheduler — exact output checks.
 
 These tests capture the expected scheduling output at specific pipeline steps
-to detect unintended regressions. They are intended to be temporary and will
-be removed once the refactoring stabilizes.
+to detect unintended regressions. 
 """
 
 from Tensile.Components.SubtileBasedKernel import TileInfo
@@ -174,26 +173,26 @@ MAINLOOP (dependency paths):
 
 
 def test_384x256_bf16_partition_2x1():
-    """Exact check of step 11b (emit dependency order) for 384x256 BF16, 2x1 partition."""
+    """Exact check of emit dependency order for 384x256 BF16, 2x1 partition."""
     cfg = make_384x256_bf16()
     sched = SubtileBasedLogicalScheduler(cfg)
     sched.emit()
     actual = sched.print_emit_dep_order()
     assert actual == EXPECTED_EMIT_DEP_ORDER_384x256_BF16_2x1, (
-        f"Step 11b output mismatch.\n"
+        f"Emit dependency order mismatch.\n"
         f"--- Expected ---\n{EXPECTED_EMIT_DEP_ORDER_384x256_BF16_2x1}\n"
         f"--- Actual ---\n{actual}"
     )
 
 
 def test_256x256_bf16_partition_1x1():
-    """Exact check of step 11b (emit dependency order) for 256x256 BF16, 1x1 partition."""
+    """Exact check of emit dependency order for 256x256 BF16, 1x1 partition."""
     cfg = make_256x256_bf16()
     sched = SubtileBasedLogicalScheduler(cfg)
     sched.emit()
     actual = sched.print_emit_dep_order()
     assert actual == EXPECTED_EMIT_DEP_ORDER_256x256_BF16_1x1, (
-        f"Step 11b output mismatch.\n"
+        f"Emit dependency order mismatch.\n"
         f"--- Expected ---\n{EXPECTED_EMIT_DEP_ORDER_256x256_BF16_1x1}\n"
         f"--- Actual ---\n{actual}"
     )
@@ -322,13 +321,13 @@ MAINLOOP (dependency paths):
 
 
 def test_320x320_bf16_partition_1x5():
-    """Exact check of step 11b (emit dependency order) for 320x320 BF16, 1x5 partition."""
+    """Exact check of emit dependency order for 320x320 BF16, 1x5 partition."""
     cfg = make_320x320_bf16()
     sched = SubtileBasedLogicalScheduler(cfg)
     sched.emit()
     actual = sched.print_emit_dep_order()
     assert actual == EXPECTED_EMIT_DEP_ORDER_320x320_BF16_1x5, (
-        f"Step 11b output mismatch.\n"
+        f"Emit dependency order mismatch.\n"
         f"--- Expected ---\n{EXPECTED_EMIT_DEP_ORDER_320x320_BF16_1x5}\n"
         f"--- Actual ---\n{actual}"
     )
@@ -398,13 +397,13 @@ MAINLOOP (dependency paths):
 
 
 def test_256x256_fp4_partition_1x1():
-    """Exact check of step 11b (emit dependency order) for 256x256 FP4, 1x1 partition."""
+    """Exact check of emit dependency order for 256x256 FP4, 1x1 partition."""
     cfg = make_256x256_fp4()
     sched = SubtileBasedLogicalScheduler(cfg)
     sched.emit()
     actual = sched.print_emit_dep_order()
     assert actual == EXPECTED_EMIT_DEP_ORDER_256x256_FP4_1x1, (
-        f"Step 11b output mismatch.\n"
+        f"Emit dependency order mismatch.\n"
         f"--- Expected ---\n{EXPECTED_EMIT_DEP_ORDER_256x256_FP4_1x1}\n"
         f"--- Actual ---\n{actual}"
     )
