@@ -2790,7 +2790,6 @@ if __name__ == "__main__":
     use_bf16 = "--bf16" in sys.argv
 
     if use_bf16:
-        # BF16: MT=128x128, DU=128, no scale
         kernel = create_kernel(320, 320, fp4=False, depthU=64)
         tiA = TileInfo('A', kernel)
         tiB = TileInfo('B', kernel)
