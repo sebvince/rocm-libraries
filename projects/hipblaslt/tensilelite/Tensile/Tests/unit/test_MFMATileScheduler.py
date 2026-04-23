@@ -2576,7 +2576,7 @@ def test_populate_instructions_256x256_fp4():
     from rocisa import rocIsa
     from rocisa.register import RegisterPool
     from rocisa.enum import RegisterType
-    from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler
+    from Tensile.Components.SubtileBasedInstructionScheduler import instructionSchedule
 
     # Initialize rocIsa
     ri = rocIsa.getInstance()
@@ -2660,7 +2660,7 @@ def test_populate_instructions_256x256_fp4():
         # Call instructionSchedule on each subIterK and verify no crash
         for pi, partition_emitted in enumerate(sched._emitted_per_unroll[0]):
             for k, emitted in enumerate(partition_emitted):
-                scheduled = SubtileBasedScheduler.instructionSchedule(emitted)
+                scheduled = instructionSchedule(emitted)
                 insts = list(scheduled.flatitems())
                 assert len(insts) > 0, \
                     f"P{pi} subIterK={k}: instructionSchedule returned empty"
@@ -2669,7 +2669,7 @@ def test_populate_instructions_256x256_fp4():
         for pi, partition_emitted in enumerate(sched._emitted_per_unroll[0]):
             print(f"Partition {pi}:")
             for k, emitted in enumerate(partition_emitted):
-                scheduled = SubtileBasedScheduler.instructionSchedule(emitted)
+                scheduled = instructionSchedule(emitted)
                 insts = list(scheduled.flatitems())
                 print(f"  subIterK={k}: {len(insts)} instructions")
                 for inst in insts:
@@ -2895,7 +2895,6 @@ if __name__ == "__main__":
     from rocisa import rocIsa
     from rocisa.register import RegisterPool
     from rocisa.enum import RegisterType
-    from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler
 
     ri = rocIsa.getInstance()
     if not ri.isInit():

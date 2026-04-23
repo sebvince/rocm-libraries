@@ -7,6 +7,7 @@ from Tensile.Components.SubtileBasedScheduler import (
     SubtileBasedScheduler, SchedulerConfig, PrefetchMode,
     MFMAOp, GROp, LROp, WaitGROp, WaitLROp, SyncOp, GR_INCOp, LR_INCOp,
 )
+from Tensile.Components.SubtileBasedInstructionScheduler import instructionSchedule, extractPathsFromBeforeDeps
 from rocisa.code import Module, Label
 from rocisa import rocIsa
 from rocisa.register import RegisterPool
@@ -537,8 +538,8 @@ def test_PGR2_256_256_1x1_extract_paths_from_before_deps():
         (7, "gr_inc", 8, 2),
     ]
 
-    mfmaIdx0, pathOrders0, preMfma0 = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted0)
-    mfmaIdx1, pathOrders1, preMfma1 = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted1)
+    mfmaIdx0, pathOrders0, preMfma0 = extractPathsFromBeforeDeps(emitted0)
+    mfmaIdx1, pathOrders1, preMfma1 = extractPathsFromBeforeDeps(emitted1)
 
     assert mfmaIdx0 == 0
     assert pathOrders0 == [[1, 3, 4, 2]]
@@ -567,7 +568,7 @@ def _get_scheduled_instructions(scheduler, writer, kernel, subIterK):
     pss = scheduler.mainloopSteps[0]
     dus = pss.subIterKSteps[subIterK]
     emitted = scheduler._buildEmittedModules(writer, kernel, dus.modules, dtileInfo)
-    scheduled = SubtileBasedScheduler.instructionSchedule(emitted)
+    scheduled = instructionSchedule(emitted)
     return scheduled.flatitems()
 
 

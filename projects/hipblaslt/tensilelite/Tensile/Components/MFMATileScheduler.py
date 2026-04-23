@@ -315,7 +315,7 @@ class GroupedSubIterK:
 class EmittedModule:
     """One emitted module with before-link for instruction scheduling.
 
-    Compatible with SubtileBasedScheduler.instructionSchedule().
+    Compatible with SubtileBasedInstructionScheduler.instructionSchedule().
     Instructions are left empty at the logical level — filled during emission.
     """
     moduleId: int = -1
@@ -1982,7 +1982,7 @@ class MFMATileScheduler:
         For subIterKs with MFMAs: calls instructionSchedule for interleaving.
         For subIterKs without MFMAs (preloop): emits instructions sequentially.
         """
-        from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler
+        from Tensile.Components.SubtileBasedInstructionScheduler import instructionSchedule
         from rocisa.code import Module
 
         module = Module(label)
@@ -1992,7 +1992,7 @@ class MFMATileScheduler:
                 module.addComment0(f"partition={pi} subIterK={k}")
                 hasMFMA = any(em.opType == 'mfma' for em in em_list)
                 if hasMFMA:
-                    scheduled = SubtileBasedScheduler.instructionSchedule(em_list)
+                    scheduled = instructionSchedule(em_list)
                     module.add(scheduled)
                 else:
                     for em in em_list:
@@ -2473,7 +2473,7 @@ class MFMATileScheduler:
 
     def print_emit_dep_order(self, all_partitions: List[List[List[EmittedModule]]] = None) -> str:
         """Print emit output as dependency paths (same decomposition as _extractPathsFromBeforeDeps)."""
-        from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler
+        from Tensile.Components.SubtileBasedInstructionScheduler import extractPathsFromBeforeDeps
         if all_partitions is None:
             all_partitions = self._emitted
         buf = io.StringIO()
@@ -2482,7 +2482,7 @@ class MFMATileScheduler:
             buf.write(f"  Partition {pi}:\n")
             for k, emitted in enumerate(partition_emitted):
                 buf.write(f"    subIterK={k}:\n")
-                mfmaIdx, paths, preMfmaPaths = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted)
+                mfmaIdx, paths, preMfmaPaths = extractPathsFromBeforeDeps(emitted)
                 em = emitted[mfmaIdx]
                 buf.write(f"      MFMA: [{em.moduleId:2d}] {em.label}")
                 if em.before is not None:
