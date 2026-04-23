@@ -2390,34 +2390,28 @@ class MFMATileScheduler:
         return buf.getvalue()
 
     def print_emit_dep_order(self, all_partitions: List[List[List[EmittedModule]]] = None) -> str:
-        """Print emit output sorted by dependency order (topological sort on before-links)."""
+        """Print emit output as dependency paths (same decomposition as _extractPathsFromBeforeDeps)."""
+        from Tensile.Components.SubtileBasedScheduler import SubtileBasedScheduler
         if all_partitions is None:
             all_partitions = self._emitted
         buf = io.StringIO()
-        buf.write("MAINLOOP (dependency order):\n")
+        buf.write("MAINLOOP (dependency paths):\n")
         for pi, partition_emitted in enumerate(all_partitions):
             buf.write(f"  Partition {pi}:\n")
             for k, emitted in enumerate(partition_emitted):
                 buf.write(f"    subIterK={k}:\n")
-                by_id = {em.moduleId: em for em in emitted}
-                placed = set()
-                ordered = []
-                remaining = list(emitted)
-                while remaining:
-                    progress = False
-                    next_remaining = []
-                    for em in remaining:
-                        if em.before is None or em.before in placed:
-                            ordered.append(em)
-                            placed.add(em.moduleId)
-                            progress = True
-                        else:
-                            next_remaining.append(em)
-                    remaining = next_remaining
-                    if not progress:
-                        ordered.extend(remaining)
-                        break
-                for i, em in enumerate(ordered):
-                    before_str = f" <- [{em.before}]" if em.before is not None else ""
-                    buf.write(f"      [{i:2d}] [{em.moduleId:2d}] {em.opType:10s} {em.label}{before_str}\n")
+                mfmaIdx, paths, preMfmaPaths = SubtileBasedScheduler._extractPathsFromBeforeDeps(emitted)
+                em = emitted[mfmaIdx]
+                buf.write(f"      MFMA: [{em.moduleId:2d}] {em.label}")
+                if em.before is not None:
+                    buf.write(f" <- [{em.before}]")
+                buf.write("\n")
+                for i, path in enumerate(preMfmaPaths):
+                    buf.write(f"      preMFMA path {i}:\n")
+                    for idx in path:
+                        buf.write(f"        [{emitted[idx].moduleId:2d}] {emitted[idx].opType:10s} {emitted[idx].label}\n")
+                for i, path in enumerate(paths):
+                    buf.write(f"      path {i}:\n")
+                    for idx in path:
+                        buf.write(f"        [{emitted[idx].moduleId:2d}] {emitted[idx].opType:10s} {emitted[idx].label}\n")
         return buf.getvalue()
