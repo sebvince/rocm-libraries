@@ -67,6 +67,9 @@ BenchmarkProblems:
           - [16, 16, 32, 1,  1, 1, 1,  2, 2]  # MT 32x32
           - [16, 16, 32, 1,  1, 4, 4,  2, 2]  # MT 128x128
           - [16, 16, 32, 1,  1, 8, 8,  2, 2]  # MT 256x256
+          - [16, 16, 32, 1,  1, 12, 8, 2, 2]  # MT 384x256 (large asymmetric)
+          - [16, 16, 32, 1,  1, 10, 10, 2, 2] # MT 320x320 (large symmetric)
+          - [16, 16, 32, 1,  1, 8, 12, 2, 2]  # MT 256x384 (large asymmetric)
           # 2x2 wave group — asymmetric
           - [16, 16, 32, 1,  1, 3, 4,  2, 2]  # MT 96x128  (odd M wavetile)
           - [16, 16, 32, 1,  1, 8, 6,  2, 2]  # MT 256x192 (odd N wavetile)
@@ -105,6 +108,12 @@ BenchmarkProblems:
           - Exact: [96,  96,  1, 128]   # 3*32, edge for MT >= 128
           - Exact: [160, 160, 1, 128]   # 5*32, edge for MT >= 192
           - Exact: [224, 224, 1, 128]   # 7*32, edge for MT >= 256
+          - Exact: [288, 288, 1, 128]   # 9*32, edge for MT >= 320
+          - Exact: [352, 352, 1, 128]   # 11*32, edge for MT >= 384
+          # Full-tile sizes for large macro tiles (320, 384)
+          - Exact: [384, 256, 1, 128]   # full tile for MT 384x256
+          - Exact: [320, 320, 1, 128]   # full tile for MT 320x320
+          - Exact: [256, 384, 1, 128]   # full tile for MT 256x384
           # Asymmetric M vs N
           - Exact: [96,  256, 1, 128]   # M edge, N full tile
           - Exact: [256,  96, 1, 128]   # M full tile, N edge
