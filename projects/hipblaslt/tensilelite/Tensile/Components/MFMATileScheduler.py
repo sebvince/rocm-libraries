@@ -1446,8 +1446,9 @@ class MFMATileScheduler:
         Phase 2 — GR chain:
           Sort GRs by tensor order (A, B, SA, SB).  Build a dep chain.  If any
           GR originally had same-subIterK deps, replace the first GR's deps with
-          a single dep on the last LR of the phase-1 chain.  Merge all preOps
-          onto the first GR.
+          a single dep on the last LR of the phase-1 chain.  Each GR keeps its
+          own preOps; only redundant wait_lr_sync ops are removed (keep the
+          first occurrence only).
         """
         if 'gr_inc' not in self._completed:
             self.insert_gr_lr_inc()
@@ -1485,12 +1486,16 @@ class MFMATileScheduler:
                     # Check if any GR has same-subIterK deps
                     any_deps = any(gr.deps for gr in ordered_grs)
 
-                    # Merge preOps onto first GR
-                    merged = self._merge_preops(
-                        [gr.preOps for gr in ordered_grs])
-                    ordered_grs[0].preOps = merged
-                    for gr in ordered_grs[1:]:
-                        gr.preOps = []
+                    # Remove redundant wait_lr_sync (keep only the first)
+                    seen_wait_lr_sync = False
+                    for gr in ordered_grs:
+                        if seen_wait_lr_sync:
+                            gr.preOps = [
+                                op for op in gr.preOps
+                                if op.kind != 'wait_lr_sync']
+                        elif any(op.kind == 'wait_lr_sync'
+                                 for op in gr.preOps):
+                            seen_wait_lr_sync = True
 
                     # First GR: if any GR had deps, point to last LR
                     if any_deps and last_lr is not None:
