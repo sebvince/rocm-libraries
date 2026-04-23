@@ -2847,8 +2847,9 @@ if __name__ == "__main__":
         ("Step 7: Remove cross deps",       lambda: (sched.remove_cross_deps(), sched.print_remove_deps())),
         ("Step 8: Insert gr/lr inc",        lambda: (sched.insert_gr_lr_inc(), sched.print_group_lr_gr())),
         ("Step 9: Group LR/GR",             lambda: (sched.group_lr_gr(), sched.print_group_lr_gr())),
-        ("Step 10: Emit",                   lambda: (sched.emit(), sched.print_emit())),
-        ("Step 10b: Emit (dependency order)", lambda: (None, sched.print_emit_dep_order())),
+        ("Step 10: Remove unnecessary wait_lr_sync", lambda: (sched.remove_unnecessary_wait_lr_sync(), sched.print_group_lr_gr())),
+        ("Step 11: Emit",                   lambda: (sched.emit(), sched.print_emit())),
+        ("Step 11b: Emit (dependency order)", lambda: (None, sched.print_emit_dep_order())),
     ]
 
     interactive = "--interactive" in sys.argv or "-i" in sys.argv
@@ -2866,7 +2867,7 @@ if __name__ == "__main__":
     sched.build_preloop()
     preloop_output = sched.print_emit(sched._preloop_emitted)
     print(f"{'=' * 60}")
-    print(f"  Step 11: Preloop")
+    print(f"  Step 12: Preloop")
     print(f"{'=' * 60}")
     print(preloop_output.replace("MAINLOOP:", "PRELOOP:"))
     if interactive:
@@ -2876,7 +2877,7 @@ if __name__ == "__main__":
     sched.build_ngll()
     ngll_output = sched.print_emit(sched._ngll_emitted)
     print(f"{'=' * 60}")
-    print(f"  Step 12: NGLL")
+    print(f"  Step 13: NGLL")
     print(f"{'=' * 60}")
     print(ngll_output.replace("MAINLOOP:", "NGLL:"))
     if interactive:
@@ -2886,7 +2887,7 @@ if __name__ == "__main__":
     sched.build_nll()
     nll_output = sched.print_emit(sched._nll_emitted)
     print(f"{'=' * 60}")
-    print(f"  Step 13: NLL")
+    print(f"  Step 14: NLL")
     print(f"{'=' * 60}")
     print(nll_output.replace("MAINLOOP:", "NLL:"))
     if interactive:

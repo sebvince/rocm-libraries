@@ -13,6 +13,7 @@ The schedule is built in 8 passes:
   remove_cross_deps        — replace cross-subIterK deps with wait preOps
   insert_gr_lr_inc         — insert lr_inc/gr_inc preOps at MT transitions
   group                    — serialize and group (produce paths for instructionSchedule)
+  remove_wait_lr_sync      — remove redundant wait_lr_sync after grouping
   emit                     — produce List[EmittedModule] with before-link chains
 """
 
@@ -1510,6 +1511,52 @@ class MFMATileScheduler:
 
         self._completed.add('group_lr_gr')
 
+    def remove_unnecessary_wait_lr_sync(self):
+        """Remove redundant wait_lr_sync from GRs after grouping.
+        Given that we always use wait_lr cnt=0, grouping can guarantee future wait_lr_sync.
+
+        A GR's wait_lr_sync is unnecessary when:
+          1. The GR has no same-subIterK deps (deps is empty after grouping)
+          2. The previous subIterK's GRs already have a wait_lr_sync
+          3. That previous wait_lr_sync is ordered after all LRs in the
+             previous subIterK (the GR has deps on the LR chain)
+
+        In that case, all prior LR reads were already synced by the previous
+        subIterK's barrier, and the current GR doesn't conflict with any LRs
+        in its own subIterK, so the second wait_lr_sync is redundant.
+        """
+        if 'group_lr_gr' not in self._completed:
+            self.group_lr_gr()
+
+        for pi, slots in enumerate(self._partitions):
+            for si, slot in enumerate(slots):
+                if not slot.grs:
+                    continue
+                first_gr = slot.grs[0]
+                has_wait_lr_sync = any(
+                    op.kind == 'wait_lr_sync' for op in first_gr.preOps)
+                if not has_wait_lr_sync:
+                    continue
+                has_deps = bool(first_gr.deps)
+                if has_deps:
+                    continue
+                # Check previous subIterK in the same partition
+                if si == 0:
+                    continue
+                prev_slot = slots[si - 1]
+                if not prev_slot.grs:
+                    continue
+                prev_first_gr = prev_slot.grs[0]
+                prev_has_wait_lr_sync = any(
+                    op.kind == 'wait_lr_sync' for op in prev_first_gr.preOps)
+                prev_deps_on_lrs = bool(prev_first_gr.deps)
+                if prev_has_wait_lr_sync and prev_deps_on_lrs:
+                    first_gr.preOps = [
+                        op for op in first_gr.preOps
+                        if op.kind != 'wait_lr_sync']
+
+        self._completed.add('remove_wait_lr_sync')
+
     def _split_deps(self, deps: List[DepRef], consumer_pi: int,
                     consumer_slot: int) -> Tuple[List[DepRef], List[DepRef]]:
         """Split deps into same-subIterK and cross-subIterK lists.
@@ -1543,8 +1590,8 @@ class MFMATileScheduler:
           - wait_lr_sync expands to two modules: wait_lr then sync
           - Same-subIterK DepRef deps become ordering constraints (no new module)
         """
-        if 'group_lr_gr' not in self._completed:
-            self.group_lr_gr()
+        if 'remove_wait_lr_sync' not in self._completed:
+            self.remove_unnecessary_wait_lr_sync()
 
         all_partitions = []
         for pi, slots in enumerate(self._partitions):
