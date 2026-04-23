@@ -2791,7 +2791,7 @@ if __name__ == "__main__":
 
     if use_bf16:
         # BF16: MT=128x128, DU=128, no scale
-        kernel = create_kernel(384, 256, fp4=False, depthU=64)
+        kernel = create_kernel(320, 320, fp4=False, depthU=64)
         tiA = TileInfo('A', kernel)
         tiB = TileInfo('B', kernel)
         scaleTiA = None
@@ -2803,8 +2803,8 @@ if __name__ == "__main__":
             lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
             grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
             grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-            numPartitionsM=2,
-            numPartitionsN=1
+            numPartitionsM=1,
+            numPartitionsN=5
         )
     else:
         # FP4: MT=256x256, DU=256, with scale

@@ -3,7 +3,7 @@
 Builds a logical schedule using MFMA tile indices as the core primitive,
 with explicit per-operation load granularity for GR/LR on A, B, SA, SB.
 
-The schedule is built in 8 passes:
+The schedule is built in these passes:
   place_LRs                — place LRs based on their granularities
   assign_vgpr_tiles        — assign physical vgprTileIds with per-tensor free-lists
   place_GRs                — place GRs
@@ -15,6 +15,8 @@ The schedule is built in 8 passes:
   group                    — serialize and group (produce paths for instructionSchedule)
   remove_wait_lr_sync      — remove redundant wait_lr_sync after grouping
   emit                     — produce List[EmittedModule] with before-link chains
+
+  TODO: add a pass to remove redundant wait_gr_sync on multi-partition configs
 """
 
 from __future__ import annotations
