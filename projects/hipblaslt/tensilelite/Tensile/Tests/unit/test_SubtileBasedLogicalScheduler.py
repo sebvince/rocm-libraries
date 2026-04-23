@@ -1,4 +1,4 @@
-"""Tests for MFMATileScheduler — validates each step against the design doc examples.
+"""Tests for SubtileBasedLogicalScheduler — validates each step against the design doc examples.
 
 Example Granularities 1 from newDesign.md:
   - LR A, B : 1x1  (k=1, mn=1)
@@ -9,8 +9,8 @@ Example Granularities 1 from newDesign.md:
 """
 
 from Tensile.Components.SubtileBasedKernel import TileInfo
-from Tensile.Components.MFMATileScheduler import (
-    MFMATileScheduler,
+from Tensile.Components.SubtileBasedLogicalScheduler import (
+    SubtileBasedLogicalScheduler,
     MFMATileSize,
     MFMATileRange,
     ReadGranularity,
@@ -131,7 +131,7 @@ def test_place_LRs_LR_1x1_partition_1x1():
     assert cfg.numSubIterK == 2
     assert cfg.hasScale
 
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     partitions = sched.place_LRs()
     slots = partitions[0]
     print(sched.print_lr())
@@ -224,7 +224,7 @@ def test_place_LRs_LR_1x2_partition_1x1():
     assert cfg.numMFMATilesN == 8
     assert cfg.numSubIterK == 2
 
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     partitions = sched.place_LRs()
     slots = partitions[0]
     print(sched.print_lr())
@@ -294,7 +294,7 @@ def test_place_LRs_LR_1x1_partition_1x1_DU512():
     assert cfg.numSubIterK == 4
     assert cfg.hasScale
 
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     partitions = sched.place_LRs()
     slots = partitions[0]
     print(sched.print_lr())
@@ -391,7 +391,7 @@ def test_place_LRs_LR_1x2_partition_1x1_DU512():
     assert cfg.numMFMATilesN == 8
     assert cfg.numSubIterK == 4
 
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     partitions = sched.place_LRs()
     slots = partitions[0]
     print(sched.print_lr())
@@ -508,7 +508,7 @@ def test_place_LRs_LR_1x1_partition_2x2():
     assert cfg.partitionSizeM == 4
     assert cfg.partitionSizeN == 4
 
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     partitions = sched.place_LRs()
     print(sched.print_lr())
 
@@ -688,7 +688,7 @@ def test_place_LRs_LR_1x1_partition_2x2_DU512():
     assert cfg.partitionSizeM == 4
     assert cfg.partitionSizeN == 4
 
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     partitions = sched.place_LRs()
     print(sched.print_lr())
 
@@ -908,7 +908,7 @@ def test_place_LRs_LR_1x2_partition_2x2():
     assert cfg.partitionSizeM == 4
     assert cfg.partitionSizeN == 4
 
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     partitions = sched.place_LRs()
     print(sched.print_lr())
 
@@ -1019,7 +1019,7 @@ def test_place_LRs_LR_1x1_partition_10x1():
     assert cfg.partitionSizeM == 1
     assert cfg.partitionSizeN == 10
 
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     partitions = sched.place_LRs()
     print(sched.print_lr())
 
@@ -1171,7 +1171,7 @@ def assert_vgpr_no_conflict_and_unrolling(sched):
 def test_assign_vgpr_tiles_basic():
     """Validate Step 2: vgprTile allocation with scale tensors."""
     cfg = make_example_granularities_1()
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.assign_vgpr_tiles()
 
     output = sched.print_vgpr()
@@ -1220,7 +1220,7 @@ def test_assign_vgpr_tiles_no_scale_k_gran_1():
     )
     assert not cfg.hasScale
 
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.assign_vgpr_tiles()
     print(sched.print_vgpr())
 
@@ -1267,7 +1267,7 @@ def test_assign_vgpr_tiles_DU512():
     assert cfg.numSubIterK == 4
     assert cfg.hasScale
 
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.assign_vgpr_tiles()
     print(sched.print_vgpr())
 
@@ -1310,7 +1310,7 @@ def test_assign_vgpr_tiles_DU512_partition_2x2():
     assert cfg.numSubIterK == 4
     assert cfg.hasScale
 
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.assign_vgpr_tiles()
     print(sched.print_vgpr())
     parts = sched._partitions
@@ -1366,7 +1366,7 @@ def test_place_GRs_LR_1x1_partition_1x1():
     s1: B[1-7](7) + SA[0-7](1) + SB[0-7](1) = 9
     """
     cfg = make_256x256_fp4()
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     slots = sched.place_GRs()
     print(sched.print_gr())
 
@@ -1426,7 +1426,7 @@ def test_place_GRs_LR_1x1_partition_1x1_DU512():
         grSA=ReadGranularity(MFMATileSize(k=4, mn=8)),
         grSB=ReadGranularity(MFMATileSize(k=4, mn=8)),
     )
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     slots = sched.place_GRs()
     print(sched.print_gr())
 
@@ -1489,7 +1489,7 @@ def test_place_GRs_LR_1x1_partition_2x2():
         numPartitionsM=2,
         numPartitionsN=2,
     )
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     slots = sched.place_GRs()
     print(sched.print_gr())
     parts = sched._partitions
@@ -1566,7 +1566,7 @@ def test_place_GRs_LR_1x1_partition_2x2_DU512():
         numPartitionsM=2,
         numPartitionsN=2,
     )
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     slots = sched.place_GRs()
     print(sched.print_gr())
     parts = sched._partitions
@@ -1647,7 +1647,7 @@ def test_place_GRs_LR_1x1_partition_10x1():
         numPartitionsM=10,
         numPartitionsN=1,
     )
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     slots = sched.place_GRs()
     print(sched.print_gr())
     parts = sched._partitions
@@ -1702,7 +1702,7 @@ def test_annotate_deps_1x1_partition_DU256():
     Within one iteration, slot order is 0→1, and within a slot: MFMA→LR→GR.
     """
     cfg = make_256x256_fp4()
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.annotate_deps()
     parts = sched._partitions
     print(sched.print_deps())
@@ -1801,7 +1801,7 @@ def test_annotate_deps_2x2_partition_DU512():
         numPartitionsM=2,
         numPartitionsN=2,
     )
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.annotate_deps()
     parts = sched._partitions
     print(sched.print_deps())
@@ -1888,7 +1888,7 @@ def test_remove_cross_deps_1x1_partition_DU256():
     - Same-subIterK deps (MFMA(k=1) → LR A/B at s0) are preserved.
     """
     cfg = make_256x256_fp4()
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.remove_cross_deps()
     parts = sched._partitions
     print(sched.print_remove_deps())
@@ -1984,7 +1984,7 @@ def test_remove_cross_deps_2x2_partition_DU512():
         numPartitionsM=2,
         numPartitionsN=2,
     )
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.remove_cross_deps()
     parts = sched._partitions
     print(sched.print_remove_deps())
@@ -2062,7 +2062,7 @@ def test_insert_gr_lr_inc_1x1_partition_DU256():
       SB: LR SB s1 (n+1) → GR SB s1 (n+2)
     """
     cfg = make_256x256_fp4()
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.insert_gr_lr_inc()
     parts = sched._partitions
     print(sched.print_remove_deps())
@@ -2150,7 +2150,7 @@ def test_insert_gr_lr_inc_multipartition_bf16():
     )
     assert cfg.numPartitions == 4
 
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.insert_gr_lr_inc()
     parts = sched._partitions
 
@@ -2192,7 +2192,7 @@ def test_compute_inflight_loads():
       s1: GR SB tiles[0-7] k[0-1] → 1 atomic load
     """
     cfg = make_256x256_fp4()
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.annotate_deps()
 
     s0 = sched._partitions[0][0]
@@ -2208,7 +2208,7 @@ def test_compute_inflight_loads():
     lr_a0 = _get_lr(s0, 'A')
     dep_a0 = lr_a0.deps[0] if lr_a0.deps else lr_a0.preOps  # deps already moved to preOps
     # Use raw annotate_deps state — re-run to get fresh deps
-    sched2 = MFMATileScheduler(cfg)
+    sched2 = SubtileBasedLogicalScheduler(cfg)
     sched2.annotate_deps()
     lr_a0_fresh = _get_lr(sched2._partitions[0][0], 'A')
     dep_a0 = lr_a0_fresh.deps[0]
@@ -2219,7 +2219,7 @@ def test_compute_inflight_loads():
 
     # Verify against actual remove_cross_deps output
     # Note: LR A @s0 and LR B @s0 deps are removed by remove_unnecessary_gr_deps
-    sched3 = MFMATileScheduler(cfg)
+    sched3 = SubtileBasedLogicalScheduler(cfg)
     sched3.remove_cross_deps()
 
     # LR A @s0: dep removed (guaranteed by prev MT) → no preOps
@@ -2253,7 +2253,7 @@ def test_compute_inflight_loads():
 # def test_group():
 #     """Validate Step 5: grouped output matches design doc."""
 #     cfg = make_example_granularities_1()
-#     sched = MFMATileScheduler(cfg)
+#     sched = SubtileBasedLogicalScheduler(cfg)
 #     grouped = sched.group()
 #
 #     output = sched.print_group()
@@ -2277,7 +2277,7 @@ def test_compute_inflight_loads():
 # def test_emit():
 #     """Validate Step 6: EmittedModule list with correct before-links."""
 #     cfg = make_example_granularities_1()
-#     sched = MFMATileScheduler(cfg)
+#     sched = SubtileBasedLogicalScheduler(cfg)
 #     all_emitted = sched.emit()
 #
 #     output = sched.print_emit()
@@ -2364,7 +2364,7 @@ def test_from_tile_info_64x64_fp4():
     assert cfg.hasScale
 
     # Should produce same schedule as manual config
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     partitions = sched.place_LRs()
     print(sched.print_lr())
     output = partitions[0]
@@ -2408,7 +2408,7 @@ def test_group_lr_gr_1x1_partition_DU256():
         GRs: B, SA, SB → chain B←SA←SB, no deps (none originally), merged preOps on B
     """
     cfg = make_256x256_fp4()
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.group_lr_gr()
     parts = sched._partitions
     print(sched.print_group_lr_gr())
@@ -2512,7 +2512,7 @@ def test_emit_1x1_partition_DU256():
     Visualize EmittedModule chains produced from group_lr_gr output.
     """
     cfg = make_256x256_fp4()
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     result = sched.emit()
     print(sched.print_emit())
 
@@ -2569,7 +2569,7 @@ def test_populate_instructions_256x256_fp4():
     """Integration test: populate_instructions with real writer/kernel/VGPR state.
 
     Sets up the full kernel infrastructure (TileInfo, VGPR allocation, writer)
-    and runs MFMATileScheduler through emit → populate_instructions → instructionSchedule.
+    and runs SubtileBasedLogicalScheduler through emit → populate_instructions → instructionSchedule.
     Uses the scheduler's own allocVgprTiles for self-contained VGPR management.
     """
     from types import SimpleNamespace
@@ -2613,9 +2613,9 @@ def test_populate_instructions_256x256_fp4():
     scaleTiA.allocOffsetRegisters(writer, kernel)
     scaleTiB.allocOffsetRegisters(writer, kernel)
 
-    # Build MFMATileScheduler logical schedule
+    # Build SubtileBasedLogicalScheduler logical schedule
     cfg = make_256x256_fp4()
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.emit()
 
     # Allocate VGPR tiles using scheduler's own method
@@ -2719,7 +2719,7 @@ def test_emitAllLoops_256x256_fp4():
     scaleTiB.allocOffsetRegisters(writer, kernel)
 
     cfg = make_256x256_fp4()
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.build()
     sched.allocVgprTiles(writer, tiA, tiB,
                          scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
@@ -2832,7 +2832,7 @@ if __name__ == "__main__":
           f"hasScale={cfg.hasScale}")
     print()
 
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
 
     steps = [
         ("Step 1: Place LRs",              lambda: (sched.place_LRs(), sched.print_lr())),
@@ -3041,7 +3041,7 @@ def test_getNumVgpr_no_scale():
         grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
         grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
     )
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.build()
 
     total = sched.getNumVgpr(tiA, tiB)
@@ -3074,7 +3074,7 @@ def test_getNumVgpr_with_scale():
         grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
         grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
     )
-    sched = MFMATileScheduler(cfg)
+    sched = SubtileBasedLogicalScheduler(cfg)
     sched.build()
 
     total = sched.getNumVgpr(tiA, tiB, scaleTiA, scaleTiB)
@@ -3105,7 +3105,7 @@ def test_getNumVgpr_decreases_with_partitions():
             numPartitionsM=numPartM,
             numPartitionsN=numPartN,
         )
-        sched = MFMATileScheduler(cfg)
+        sched = SubtileBasedLogicalScheduler(cfg)
         sched.build()
         return sched.getNumVgpr(tiA, tiB, scaleTiA, scaleTiB)
 

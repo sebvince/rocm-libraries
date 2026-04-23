@@ -1792,10 +1792,10 @@ def mainLoop(writer, kernel):
   pgr = kernel["PrefetchGlobalRead"]
   assert pgr in (0, 2), "SubtileBasedKernel only supports PGR=0 and PGR=2, got PGR=%d" % pgr
 
-  # PGR=2 pipelining with MFMATileScheduler
+  # PGR=2 pipelining with SubtileBasedLogicalScheduler
   if pgr == 2:
-    from Tensile.Components.MFMATileScheduler import (
-        MFMATileScheduler, SchedulerConfig as MFMASchedulerConfig,
+    from Tensile.Components.SubtileBasedLogicalScheduler import (
+        SubtileBasedLogicalScheduler, SchedulerConfig as MFMASchedulerConfig,
         ReadGranularity, MFMATileSize)
     tiA = writer.states.a.tileInfo
     tiB = writer.states.b.tileInfo
@@ -1825,7 +1825,7 @@ def mainLoop(writer, kernel):
             numPartitionsM=numPartM,
             numPartitionsN=numPartN,
         )
-        scheduler = MFMATileScheduler(cfg)
+        scheduler = SubtileBasedLogicalScheduler(cfg)
         scheduler.build()
 
         numVgpr = scheduler.getNumVgpr(tiA, tiB, scaleTiA, scaleTiB)

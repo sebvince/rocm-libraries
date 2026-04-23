@@ -3868,7 +3868,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # Allocate registers for VGPR tiles
     pgr = kernel["PrefetchGlobalRead"]
     if pgr != 2:
-      # PGR=2: A/B vgprTiles are allocated by SubtileBasedScheduler in mainLoop
+      # PGR=2: A/B vgprTiles are allocated by SubtileBasedLogicalScheduler in mainLoop
       # TMP HACK to still use legacy path for PGR=0
       for tileInfo in [atileInfo, btileInfo]:
         tileInfo.allocVgprTileRegisters(self, kernel)

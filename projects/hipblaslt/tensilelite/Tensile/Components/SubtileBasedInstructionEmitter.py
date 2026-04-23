@@ -1,4 +1,4 @@
-"""Instruction emitter for MFMATileScheduler.
+"""Instruction emitter for SubtileBasedLogicalScheduler.
 
 Converts the logical schedule (EmittedModule chains) into concrete GPU
 instructions by dispatching each opType to its emit method.
@@ -19,7 +19,7 @@ from rocisa.code import Label
 
 
 class InstructionEmitter:
-    """Emits GPU instructions for each opType in the MFMATileScheduler output.
+    """Emits GPU instructions for each opType in the SubtileBasedLogicalScheduler output.
 
     VGPR tile indexing uses placement-level tile maps (tileId → vgprTileId)
     set by assign_vgpr_tiles(). Per-tensor VGPR tile lists are indexed by

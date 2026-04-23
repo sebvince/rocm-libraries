@@ -328,8 +328,8 @@ class EmittedModule:
 
 # ── Main scheduler class ───────────────────────────────────
 
-class MFMATileScheduler:
-    """MFMATile-based logical scheduler.
+class SubtileBasedLogicalScheduler:
+    """Subtile-based logical scheduler.
 
     Builds the schedule in 6 passes, each producing testable intermediate output.
     Each pass auto-runs its prerequisites if needed (tracked via self._completed).
@@ -1619,7 +1619,7 @@ class MFMATileScheduler:
           - Dependency modules (wait_gr, wait_lr, sync, lr_inc, gr_inc, gr_scale)
             emitted from preOps, chained via before-links
 
-        The before-link topology matches SubtileBasedScheduler._buildEmittedModules:
+        The before-link topology matches the original _buildEmittedModules:
           - wait_gr is standalone (no incoming before-link), but later deps chain from it
           - wait_gr_sync expands to two modules: wait_gr then sync
           - wait_lr_sync expands to two modules: wait_lr then sync
@@ -2213,7 +2213,7 @@ class MFMATileScheduler:
                 or self._nll_emitted is None:
             self.build()
 
-        from Tensile.Components.InstructionEmitter import InstructionEmitter
+        from Tensile.Components.SubtileBasedInstructionEmitter import InstructionEmitter
 
         emitter = InstructionEmitter(
             writer, kernel, self.config,
