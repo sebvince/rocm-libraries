@@ -30,17 +30,6 @@ import math
 # ── Core primitives ─────────────────────────────────────────
 
 @dataclass
-class MFMATileSize:
-    """Granularity of a single read operation, measured in MFMA tiles.
-
-    k:  how many subIterK steps one read covers
-    mn: how many MFMA tiles in the M (for A/SA) or N (for B/SB) dimension
-    """
-    k: int
-    mn: int
-
-
-@dataclass
 class MFMATileRange:
     """A rectangular range of MFMA tile coordinates for one read."""
     subIterK_start: int
@@ -70,8 +59,13 @@ class MFMATileRange:
 
 @dataclass
 class ReadGranularity:
-    """Load granularity for one operation on one tensor."""
-    size: MFMATileSize
+    """Load granularity for one operation on one tensor, measured in MFMA tiles.
+
+    mn: how many MFMA tiles in the M (for A/SA) or N (for B/SB) dimension
+    k:  how many subIterK steps one read covers
+    """
+    mn: int
+    k: int
 
 
 @dataclass
@@ -471,8 +465,8 @@ class SubtileBasedLogicalScheduler:
         # Place LRs grouped by k_gran.
         # - Non-wrapping (K-prefetch): all tensors, deduped by placed set.
         # - Wrapping (cross-partition): only tensors whose side needs loading.
-        for k_gran in sorted(set(g.size.k for _, g in all_tensors)):
-            group_all = [(t, g) for t, g in all_tensors if g.size.k == k_gran]
+        for k_gran in sorted(set(g.k for _, g in all_tensors)):
+            group_all = [(t, g) for t, g in all_tensors if g.k == k_gran]
             num_chunks = numK // k_gran
             for chunk_idx in range(num_chunks):
                 next_chunk = (chunk_idx + 1) % num_chunks
@@ -567,8 +561,8 @@ class SubtileBasedLogicalScheduler:
         # Build k_gran lookup for scale tensors
         scale_k_gran = {}
         if cfg.hasScale:
-            scale_k_gran['SA'] = cfg.lrSA.size.k
-            scale_k_gran['SB'] = cfg.lrSB.size.k
+            scale_k_gran['SA'] = cfg.lrSA.k
+            scale_k_gran['SB'] = cfg.lrSB.k
 
         # ── Phase 1: find last MFMA read for each key ──
         last_read = {}  # key -> flat position
@@ -803,8 +797,8 @@ class SubtileBasedLogicalScheduler:
                     items.append(('SB', target_range['B'], cfg.grSB))
 
                 for tensor, (t_start, t_end), gr_gran in items:
-                    mn = gr_gran.size.mn
-                    k_gran = gr_gran.size.k
+                    mn = gr_gran.mn
+                    k_gran = gr_gran.k
 
                     gr_tile_start = (t_start // mn) * mn
                     gr_tile_end = ((t_end + mn - 1) // mn) * mn
@@ -836,9 +830,9 @@ class SubtileBasedLogicalScheduler:
         if debug:
             print(f"Phase 1: {len(gr_list)} GR entries")
             for i, (t, mt, ts, te, ks, ke, g) in enumerate(gr_list):
-                loads = ((te - ts) // g.size.mn) * ((ke - ks) // g.size.k)
+                loads = ((te - ts) // g.mn) * ((ke - ks) // g.k)
                 print(f"  [{i}] {t:2s} {mt} tiles[{ts},{te - 1}] k[{ks},{ke - 1}] "
-                      f"gr_gran(mn={g.size.mn},k={g.size.k}) loads={loads}")
+                      f"gr_gran(mn={g.mn},k={g.k}) loads={loads}")
 
         return gr_list
 
@@ -890,7 +884,7 @@ class SubtileBasedLogicalScheduler:
         # 2a. Explode GR entries into atomic loads (1 load each)
         atoms = []
         for tensor, mt_str, t_start, t_end, k_start, k_end, gr_gran in gr_list:
-            mn = gr_gran.size.mn
+            mn = gr_gran.mn
             for pos in range(t_start, t_end, mn):
                 atoms.append((tensor, mt_str, pos, pos + mn, k_start, k_end))
 
@@ -1332,8 +1326,8 @@ class SubtileBasedLogicalScheduler:
                     return counts
                 gr_gran = self._gr_granularity(gr.tensor)
                 tiles = gr.tiles
-                n_tile = (tiles.tileId_end - tiles.tileId_start) // gr_gran.size.mn
-                n_k = (tiles.subIterK_end - tiles.subIterK_start) // gr_gran.size.k
+                n_tile = (tiles.tileId_end - tiles.tileId_start) // gr_gran.mn
+                n_k = (tiles.subIterK_end - tiles.subIterK_start) // gr_gran.k
                 cur = getattr(counts, gr.tensor)
                 setattr(counts, gr.tensor, cur + n_tile * n_k)
 
@@ -1969,12 +1963,12 @@ class SubtileBasedLogicalScheduler:
             'B': MFMATileRange(0, numK, *part0['B']),
         }
         lr_tiles = {
-            'A':  MFMATileRange(0, cfg.lrA.size.k, *part0['A']),
-            'B':  MFMATileRange(0, cfg.lrB.size.k, *part0['B']),
+            'A':  MFMATileRange(0, cfg.lrA.k, *part0['A']),
+            'B':  MFMATileRange(0, cfg.lrB.k, *part0['B']),
         }
         if cfg.hasScale:
-            lr_tiles['SA'] = MFMATileRange(0, cfg.lrSA.size.k, *part0['A'])
-            lr_tiles['SB'] = MFMATileRange(0, cfg.lrSB.size.k, *part0['B'])
+            lr_tiles['SA'] = MFMATileRange(0, cfg.lrSA.k, *part0['A'])
+            lr_tiles['SB'] = MFMATileRange(0, cfg.lrSB.k, *part0['B'])
 
         emitted = self._to_emitted([
             *self._preloop_make_gr('0', all_tiles),
@@ -2139,7 +2133,7 @@ class SubtileBasedLogicalScheduler:
         cfg = self.config
 
         def _tile_vgpr_count(tileInfo, lrGran):
-            return int(math.ceil(tileInfo.mmaTileRegCount * lrGran.size.k * lrGran.size.mn))
+            return int(math.ceil(tileInfo.mmaTileRegCount * lrGran.k * lrGran.mn))
 
         total = self.tile_peaks.get('A', 0) * _tile_vgpr_count(tileInfoA, cfg.lrA) \
               + self.tile_peaks.get('B', 0) * _tile_vgpr_count(tileInfoB, cfg.lrB)
@@ -2171,7 +2165,7 @@ class SubtileBasedLogicalScheduler:
         cfg = self.config
 
         def _tile_vgpr_count(tileInfo, lrGran):
-            return int(math.ceil(tileInfo.mmaTileRegCount * lrGran.size.k * lrGran.size.mn))
+            return int(math.ceil(tileInfo.mmaTileRegCount * lrGran.k * lrGran.mn))
 
         def _alloc_tiles(count, numRegs):
             tiles = []

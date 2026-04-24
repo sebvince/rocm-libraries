@@ -109,8 +109,8 @@ class InstructionEmitter:
             ti = self.tileInfoMap[tensor]
             vgprTiles = self.vgprTilesA if tensor == 'A' else self.vgprTilesB
             lrGran = self.config.lrA if tensor == 'A' else self.config.lrB
-            for tileId in range(placement.tiles.tileId_start, placement.tiles.tileId_end, lrGran.size.mn):
-                for k in range(placement.tiles.subIterK_start, placement.tiles.subIterK_end, lrGran.size.k):
+            for tileId in range(placement.tiles.tileId_start, placement.tiles.tileId_end, lrGran.mn):
+                for k in range(placement.tiles.subIterK_start, placement.tiles.subIterK_end, lrGran.k):
                     subtileK = k // self.subtileShapeK
                     subIterK_within = k % self.subtileShapeK
                     dstTile = vgprTiles[tile_map[tileId]]
@@ -121,10 +121,10 @@ class InstructionEmitter:
             ti = self.tileInfoMap[tensor]
             lrGran = self.config.lrSA if tensor == 'SA' else self.config.lrSB
             vgprTilesScale = self.vgprTilesSA if tensor == 'SA' else self.vgprTilesSB
-            groupStride = lrGran.size.mn * ti.subtileSize
+            groupStride = lrGran.mn * ti.subtileSize
             subtileK = placement.tiles.subIterK_start // self.subtileShapeK
-            for tileId in range(placement.tiles.tileId_start, placement.tiles.tileId_end, lrGran.size.mn):
-                scaleGroupIdx = tileId // lrGran.size.mn
+            for tileId in range(placement.tiles.tileId_start, placement.tiles.tileId_end, lrGran.mn):
+                scaleGroupIdx = tileId // lrGran.mn
                 dsOffset = groupStride * (scaleGroupIdx * (self.config.numSubIterK // self.subtileShapeK) + subtileK)
                 vdst = next(iter(vgprTilesScale[tile_map[scaleGroupIdx]]))
                 module.add(DSLoadB32(
@@ -141,8 +141,8 @@ class InstructionEmitter:
         if tensor in ('A', 'B'):
             ti = self.tileInfoMap[tensor]
             grGran = self.config.grA if tensor == 'A' else self.config.grB
-            for tileId in range(placement.tiles.tileId_start, placement.tiles.tileId_end, grGran.size.mn):
-                for k in range(placement.tiles.subIterK_start, placement.tiles.subIterK_end, grGran.size.k):
+            for tileId in range(placement.tiles.tileId_start, placement.tiles.tileId_end, grGran.mn):
+                for k in range(placement.tiles.subIterK_start, placement.tiles.subIterK_end, grGran.k):
                     subtileK = k // self.subtileShapeK
                     module.add(emitSingleBufferLoad(ti, self.kernel, tileId, subtileK))
         elif tensor in ('SA', 'SB'):

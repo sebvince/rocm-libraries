@@ -1796,15 +1796,15 @@ def mainLoop(writer, kernel):
   if pgr == 2:
     from Tensile.Components.SubtileBasedLogicalScheduler import (
         SubtileBasedLogicalScheduler, SchedulerConfig as MFMASchedulerConfig,
-        ReadGranularity, MFMATileSize)
+        ReadGranularity)
     tiA = writer.states.a.tileInfo
     tiB = writer.states.b.tileInfo
     scaleTiA = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
     scaleTiB = writer.states.mxsb.tileInfo if kernel["ProblemType"].get("MXBlockB", 0) else None
 
     # Based on current subtile shape. loadRatioGR == 2.0 has 2x2 granularity.
-    grAGran = ReadGranularity(MFMATileSize(k=2, mn=1)) if tiA.loadRatioGR <= 1.0 else ReadGranularity(MFMATileSize(k=2, mn=2))
-    grBGran = ReadGranularity(MFMATileSize(k=2, mn=1)) if tiB.loadRatioGR <= 1.0 else ReadGranularity(MFMATileSize(k=2, mn=2))
+    grAGran = ReadGranularity(mn=1, k=2) if tiA.loadRatioGR <= 1.0 else ReadGranularity(mn=2, k=2)
+    grBGran = ReadGranularity(mn=1, k=2) if tiB.loadRatioGR <= 1.0 else ReadGranularity(mn=2, k=2)
 
     vgprBudget = writer.states.regCaps["MaxVgpr"]
     vgprUsed = writer.vgprPool.size() - writer.vgprPool.available()
@@ -1813,15 +1813,15 @@ def mainLoop(writer, kernel):
     for numPartM, numPartN in MFMASchedulerConfig.get_partition_candidates(tiA, tiB):
         cfg = MFMASchedulerConfig.from_tile_info(
             tiA, tiB,
-            lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-            lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
+            lrA=ReadGranularity(mn=1, k=1),
+            lrB=ReadGranularity(mn=1, k=1),
             grA=grAGran,
             grB=grBGran,
             scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-            lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)) if scaleTiA else None,
-            lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)) if scaleTiB else None,
-            grSA=ReadGranularity(MFMATileSize(k=scaleTiA.localMMATileGrid[1], mn=scaleTiA.localMMATileGrid[0])) if scaleTiA else None,
-            grSB=ReadGranularity(MFMATileSize(k=scaleTiB.localMMATileGrid[1], mn=scaleTiB.localMMATileGrid[0])) if scaleTiB else None,
+            lrSA=ReadGranularity(mn=2, k=2) if scaleTiA else None,
+            lrSB=ReadGranularity(mn=2, k=2) if scaleTiB else None,
+            grSA=ReadGranularity(mn=scaleTiA.localMMATileGrid[0], k=scaleTiA.localMMATileGrid[1]) if scaleTiA else None,
+            grSB=ReadGranularity(mn=scaleTiB.localMMATileGrid[0], k=scaleTiB.localMMATileGrid[1]) if scaleTiB else None,
             numPartitionsM=numPartM,
             numPartitionsN=numPartN,
         )

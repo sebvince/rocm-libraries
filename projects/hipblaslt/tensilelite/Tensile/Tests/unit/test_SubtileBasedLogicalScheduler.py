@@ -18,7 +18,6 @@ Organized by pass:
 from Tensile.Components.SubtileBasedKernel import TileInfo
 from Tensile.Components.SubtileBasedLogicalScheduler import (
     SubtileBasedLogicalScheduler,
-    MFMATileSize,
     MFMATileRange,
     ReadGranularity,
     SchedulerConfig,
@@ -91,15 +90,15 @@ def make_cfg_256x256_fp4(depthU=256, k_gran=1, numPartM=1, numPartN=1,
     scaleTiB = TileInfo('MXSB', kernel)
     return SchedulerConfig.from_tile_info(
         tiA, tiB,
-        lrA=ReadGranularity(MFMATileSize(k=k_gran, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=k_gran, mn=1)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        lrA=ReadGranularity(mn=1, k=k_gran),
+        lrB=ReadGranularity(mn=1, k=k_gran),
+        grA=ReadGranularity(mn=1, k=2),
+        grB=ReadGranularity(mn=1, k=2),
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=grSA_k, mn=grSA_mn)),
-        grSB=ReadGranularity(MFMATileSize(k=grSB_k, mn=grSB_mn)),
+        lrSA=ReadGranularity(mn=2, k=2),
+        lrSB=ReadGranularity(mn=2, k=2),
+        grSA=ReadGranularity(mn=grSA_mn, k=grSA_k),
+        grSB=ReadGranularity(mn=grSB_mn, k=grSB_k),
         numPartitionsM=numPartM,
         numPartitionsN=numPartN,
     )
@@ -112,10 +111,10 @@ def make_cfg_bf16(MT0=256, MT1=256, depthU=64, numPartM=1, numPartN=1):
     tiB = TileInfo('B', kernel)
     return SchedulerConfig.from_tile_info(
         tiA, tiB,
-        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        lrA=ReadGranularity(mn=1, k=1),
+        lrB=ReadGranularity(mn=1, k=1),
+        grA=ReadGranularity(mn=1, k=2),
+        grB=ReadGranularity(mn=1, k=2),
         numPartitionsM=numPartM,
         numPartitionsN=numPartN,
     )
@@ -127,14 +126,14 @@ def make_example_granularities_1():
         numMFMATilesM=2,
         numMFMATilesN=2,
         numSubIterK=2,
-        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
+        lrA=ReadGranularity(mn=1, k=1),
+        lrB=ReadGranularity(mn=1, k=1),
+        lrSA=ReadGranularity(mn=2, k=2),
+        lrSB=ReadGranularity(mn=2, k=2),
+        grA=ReadGranularity(mn=1, k=2),
+        grB=ReadGranularity(mn=1, k=2),
+        grSA=ReadGranularity(mn=2, k=2),
+        grSB=ReadGranularity(mn=2, k=2),
     )
 
 
@@ -629,10 +628,10 @@ class TestAssignVgprTiles:
         """No scales, A/B k_gran=1 → tiles alternate every subIterK."""
         cfg = SchedulerConfig(
             numMFMATilesM=2, numMFMATilesN=2, numSubIterK=2,
-            lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-            lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-            grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-            grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            lrA=ReadGranularity(mn=1, k=1),
+            lrB=ReadGranularity(mn=1, k=1),
+            grA=ReadGranularity(mn=1, k=2),
+            grB=ReadGranularity(mn=1, k=2),
         )
         assert not cfg.hasScale
 
@@ -1252,15 +1251,15 @@ class TestFromTileInfo:
 
         cfg = SchedulerConfig.from_tile_info(
             tiA, tiB,
-            lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-            lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-            grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-            grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            lrA=ReadGranularity(mn=1, k=1),
+            lrB=ReadGranularity(mn=1, k=1),
+            grA=ReadGranularity(mn=1, k=2),
+            grB=ReadGranularity(mn=1, k=2),
             scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-            lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-            lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-            grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
-            grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
+            lrSA=ReadGranularity(mn=2, k=2),
+            lrSB=ReadGranularity(mn=2, k=2),
+            grSA=ReadGranularity(mn=8, k=2),
+            grSB=ReadGranularity(mn=8, k=2),
         )
 
         assert cfg.numMFMATilesM == 2  # 64/16/2
@@ -1350,8 +1349,8 @@ class TestGetNumVgpr:
         assert total > 0
 
         import math
-        vgpr_per_A = int(math.ceil(tiA.mmaTileRegCount * cfg.lrA.size.k * cfg.lrA.size.mn))
-        vgpr_per_B = int(math.ceil(tiB.mmaTileRegCount * cfg.lrB.size.k * cfg.lrB.size.mn))
+        vgpr_per_A = int(math.ceil(tiA.mmaTileRegCount * cfg.lrA.k * cfg.lrA.mn))
+        vgpr_per_B = int(math.ceil(tiB.mmaTileRegCount * cfg.lrB.k * cfg.lrB.mn))
         expected = sched.tile_peaks['A'] * vgpr_per_A + sched.tile_peaks['B'] * vgpr_per_B
         assert total == expected
 
@@ -1525,10 +1524,10 @@ if __name__ == "__main__":
 
         cfg = SchedulerConfig.from_tile_info(
             tiA, tiB,
-            lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-            lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-            grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-            grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            lrA=ReadGranularity(mn=1, k=1),
+            lrB=ReadGranularity(mn=1, k=1),
+            grA=ReadGranularity(mn=1, k=2),
+            grB=ReadGranularity(mn=1, k=2),
             numPartitionsM=2,
             numPartitionsN=1,
         )
@@ -1541,15 +1540,15 @@ if __name__ == "__main__":
 
         cfg = SchedulerConfig.from_tile_info(
             tiA, tiB,
-            lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-            lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-            grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-            grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+            lrA=ReadGranularity(mn=1, k=1),
+            lrB=ReadGranularity(mn=1, k=1),
+            grA=ReadGranularity(mn=1, k=2),
+            grB=ReadGranularity(mn=1, k=2),
             scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-            lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-            lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-            grSA=ReadGranularity(MFMATileSize(k=2, mn=8)),
-            grSB=ReadGranularity(MFMATileSize(k=2, mn=8)),
+            lrSA=ReadGranularity(mn=2, k=2),
+            lrSB=ReadGranularity(mn=2, k=2),
+            grSA=ReadGranularity(mn=8, k=2),
+            grSB=ReadGranularity(mn=8, k=2),
         )
 
     print(f"Config: numMFMATilesM={cfg.numMFMATilesM}, "

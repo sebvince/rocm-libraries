@@ -7,7 +7,6 @@ to detect unintended regressions.
 from Tensile.Components.SubtileBasedKernel import TileInfo
 from Tensile.Components.SubtileBasedLogicalScheduler import (
     SubtileBasedLogicalScheduler,
-    MFMATileSize,
     ReadGranularity,
     SchedulerConfig,
 )
@@ -64,10 +63,10 @@ def make_256x256_bf16():
     tiB = TileInfo('B', kernel)
     return SchedulerConfig.from_tile_info(
         tiA, tiB,
-        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        lrA=ReadGranularity(mn=1, k=1),
+        lrB=ReadGranularity(mn=1, k=1),
+        grA=ReadGranularity(mn=1, k=2),
+        grB=ReadGranularity(mn=1, k=2),
         numPartitionsM=1,
         numPartitionsN=1,
     )
@@ -110,10 +109,10 @@ def make_384x256_bf16():
     tiB = TileInfo('B', kernel)
     return SchedulerConfig.from_tile_info(
         tiA, tiB,
-        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        lrA=ReadGranularity(mn=1, k=1),
+        lrB=ReadGranularity(mn=1, k=1),
+        grA=ReadGranularity(mn=1, k=2),
+        grB=ReadGranularity(mn=1, k=2),
         numPartitionsM=2,
         numPartitionsN=1,
     )
@@ -204,10 +203,10 @@ def make_320x320_bf16():
     tiB = TileInfo('B', kernel)
     return SchedulerConfig.from_tile_info(
         tiA, tiB,
-        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        lrA=ReadGranularity(mn=1, k=1),
+        lrB=ReadGranularity(mn=1, k=1),
+        grA=ReadGranularity(mn=1, k=2),
+        grB=ReadGranularity(mn=1, k=2),
         numPartitionsM=1,
         numPartitionsN=5,
     )
@@ -341,15 +340,15 @@ def make_256x256_fp4():
     scaleTiB = TileInfo('MXSB', kernel)
     return SchedulerConfig.from_tile_info(
         tiA, tiB,
-        lrA=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        lrB=ReadGranularity(MFMATileSize(k=1, mn=1)),
-        grA=ReadGranularity(MFMATileSize(k=2, mn=1)),
-        grB=ReadGranularity(MFMATileSize(k=2, mn=1)),
+        lrA=ReadGranularity(mn=1, k=1),
+        lrB=ReadGranularity(mn=1, k=1),
+        grA=ReadGranularity(mn=1, k=2),
+        grB=ReadGranularity(mn=1, k=2),
         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-        lrSA=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        lrSB=ReadGranularity(MFMATileSize(k=2, mn=2)),
-        grSA=ReadGranularity(MFMATileSize(k=scaleTiA.localMMATileGrid[1], mn=scaleTiA.localMMATileGrid[0])),
-        grSB=ReadGranularity(MFMATileSize(k=scaleTiB.localMMATileGrid[1], mn=scaleTiB.localMMATileGrid[0])),
+        lrSA=ReadGranularity(mn=2, k=2),
+        lrSB=ReadGranularity(mn=2, k=2),
+        grSA=ReadGranularity(mn=scaleTiA.localMMATileGrid[0], k=scaleTiA.localMMATileGrid[1]),
+        grSB=ReadGranularity(mn=scaleTiB.localMMATileGrid[0], k=scaleTiB.localMMATileGrid[1]),
         numPartitionsM=1,
         numPartitionsN=1,
     )
