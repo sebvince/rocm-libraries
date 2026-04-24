@@ -263,15 +263,6 @@ class GRIncOp(BaseOp):
 
 
 @dataclass
-class GRScaleOp(BaseOp):
-    """Scale global reads. Carries mtIteration for NGLL filtering."""
-    mtIteration: Optional[str] = None
-
-    def __post_init__(self):
-        self.kind = 'gr_scale'
-
-
-@dataclass
 class SkipOp(BaseOp):
     """Skip guard: compare LoopCounter and branch."""
     compare: str = ""
@@ -1556,7 +1547,7 @@ class SubtileBasedLogicalScheduler:
 
         Each subIterK list contains:
           - Primary modules (MFMA, LRs, GRs) with opType and label
-          - Dependency modules (wait_gr, wait_lr, sync, lr_inc, gr_inc, gr_scale)
+          - Dependency modules (wait_gr, wait_lr, sync, lr_inc, gr_inc)
             emitted from preOps, chained via before-links
 
         The before-link topology matches the original _buildEmittedModules:
@@ -1698,7 +1689,7 @@ class SubtileBasedLogicalScheduler:
         return [em for em in emitted if em.moduleId not in removed_ids]
 
     def build_ngll(self) -> List[List[List[EmittedModule]]]:
-        """NGLL (No Global Load Loop): mainloop without GR(n+2), GR_INC, GRScale(n+2).
+        """NGLL (No Global Load Loop): mainloop without GR(n+2), GR_INC.
 
         WaitGR inflight counts are zeroed since no new GRs are in flight.
         """
@@ -1718,8 +1709,6 @@ class SubtileBasedLogicalScheduler:
                         removed.add(em.moduleId)
                     elif em.opType == 'gr_inc':
                         removed.add(em.moduleId)
-                    elif isinstance(src, GRScaleOp) and src.mtIteration == 'n+2':
-                        removed.add(em.moduleId)
                     elif em.opType == 'wait_gr':
                         if isinstance(src, WaitGROp) and src.wait_gr_counts is not None:
                             src.wait_gr_counts = WaitGRCounts()
@@ -1731,7 +1720,7 @@ class SubtileBasedLogicalScheduler:
 
     def build_nll(self) -> List[List[List[EmittedModule]]]:
         """NLL (No Load Loop): mainloop without GR, LR(n+1), GR_INC, LR_INC,
-        GRScale, WaitGR(n+1)+Sync. Keeps LR(n), MFMAs, WaitGR(n) with zeroed counts."""
+        WaitGR(n+1)+Sync. Keeps LR(n), MFMAs, WaitGR(n) with zeroed counts."""
         if 'emit' not in self._completed:
             self.emit()
 
@@ -1749,7 +1738,7 @@ class SubtileBasedLogicalScheduler:
                     elif em.opType == 'lr' and isinstance(src, LRPlacement) \
                             and src.mtIteration == 'n+1':
                         removed.add(em.moduleId)
-                    elif em.opType in ('gr_inc', 'lr_inc', 'gr_scale'):
+                    elif em.opType in ('gr_inc', 'lr_inc'):
                         removed.add(em.moduleId)
 
                 # Remove WaitGR(n+1) and its paired Sync.

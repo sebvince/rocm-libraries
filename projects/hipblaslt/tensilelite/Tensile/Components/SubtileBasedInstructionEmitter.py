@@ -60,7 +60,6 @@ class InstructionEmitter:
             'sync':     lambda em, ui: self.emit_sync(),
             'lr_inc':   lambda em, ui: self.emit_lr_inc(em.source),
             'gr_inc':   lambda em, ui: self.emit_gr_inc(em.source),
-            'gr_scale': lambda em, ui: self.emit_gr_scale(em.source),
             'skip':     lambda em, ui: self.emit_skip(em.source),
         }
 
@@ -194,13 +193,6 @@ class InstructionEmitter:
         else:
             module.add(globalReadPtrUpdates(tc, self.writer, self.kernel))
         module.add(globalReadLDSBufferSwap(tc, self.writer, self.kernel))
-        return list(module.flatitems())
-
-    def emit_gr_scale(self, source):
-        """Emit scale global reads."""
-        module = Module()
-        module.add(globalReadDoScaleSubtile('MXSA', self.writer, self.kernel))
-        module.add(globalReadDoScaleSubtile('MXSB', self.writer, self.kernel))
         return list(module.flatitems())
 
     def emit_skip(self, source):
