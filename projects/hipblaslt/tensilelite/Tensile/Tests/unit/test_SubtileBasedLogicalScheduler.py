@@ -238,15 +238,16 @@ def _dep_refs(placement):
 
 
 def _preop_kinds(placement):
-    """Return list of (kind, wait_gr_counts_dict_or_None) for preOps."""
+    """Return list of (kind, has_sync, wait_gr_counts_dict_or_None) for preOps."""
     result = []
     for op in placement.preOps:
+        has_sync = getattr(op, 'has_sync', False)
         counts = getattr(op, 'wait_gr_counts', None)
         if counts:
-            result.append((op.kind, {'A': counts.A, 'B': counts.B,
-                                      'SA': counts.SA, 'SB': counts.SB}))
+            result.append((op.kind, has_sync, {'A': counts.A, 'B': counts.B,
+                                                'SA': counts.SA, 'SB': counts.SB}))
         else:
-            result.append((op.kind, None))
+            result.append((op.kind, has_sync, None))
     return result
 
 
@@ -890,7 +891,7 @@ class TestRemoveCrossDeps:
         s0, s1 = parts[0][0], parts[0][1]
 
         # MFMA(k=0): all cross → wait_lr
-        assert _preop_kinds(s0.mfma) == [('wait_lr', None)]
+        assert _preop_kinds(s0.mfma) == [('wait_lr', False, None)]
         assert len(s0.mfma.deps) == 0
 
         # LR A @s0: dep removed (guaranteed by prev MT)
@@ -899,28 +900,28 @@ class TestRemoveCrossDeps:
 
         # GR A @s0: same-subIterK dep preserved
         gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
-        assert _preop_kinds(gr_a0) == [('wait_lr_sync', None)]
+        assert _preop_kinds(gr_a0) == [('wait_lr', True, None)]
         assert len(gr_a0.deps) == 1
 
         # MFMA(k=1): all cross → wait_lr
-        assert _preop_kinds(s1.mfma) == [('wait_lr', None)]
+        assert _preop_kinds(s1.mfma) == [('wait_lr', False, None)]
         assert len(s1.mfma.deps) == 0
 
         # LR A @s1: wait_gr_sync with counts
         lr_a1 = _get_lr(s1, 'A')
-        assert _preop_kinds(lr_a1) == [('wait_gr_sync', {'A': 8, 'B': 8, 'SA': 1, 'SB': 1})]
+        assert _preop_kinds(lr_a1) == [('wait_gr', True, {'A': 8, 'B': 8, 'SA': 1, 'SB': 1})]
 
-        # LR B @s1: wait_gr_sync
+        # LR B @s1: wait_gr with has_sync
         lr_b1 = _get_lr(s1, 'B')
-        assert _preop_kinds(lr_b1) == [('wait_gr_sync', {'A': 8, 'B': 1, 'SA': 0, 'SB': 0})]
+        assert _preop_kinds(lr_b1) == [('wait_gr', True, {'A': 8, 'B': 1, 'SA': 0, 'SB': 0})]
 
         # LR SA @s1
         lr_sa1 = _get_lr(s1, 'SA')
-        assert _preop_kinds(lr_sa1) == [('wait_gr_sync', {'A': 8, 'B': 8, 'SA': 0, 'SB': 0})]
+        assert _preop_kinds(lr_sa1) == [('wait_gr', True, {'A': 8, 'B': 8, 'SA': 0, 'SB': 0})]
 
         # LR SB @s1
         lr_sb1 = _get_lr(s1, 'SB')
-        assert _preop_kinds(lr_sb1) == [('wait_gr_sync', {'A': 8, 'B': 8, 'SA': 1, 'SB': 0})]
+        assert _preop_kinds(lr_sb1) == [('wait_gr', True, {'A': 8, 'B': 8, 'SA': 1, 'SB': 0})]
 
         # GR B @s1: dep removed
         gr_b1 = [gr for gr in s1.grs if gr.tensor == 'B'][0]
@@ -936,11 +937,11 @@ class TestRemoveCrossDeps:
         parts = sched._partitions
 
         # All P0 MFMAs have wait_lr
-        assert _preop_kinds(parts[0][0].mfma) == [('wait_lr', None)]
+        assert _preop_kinds(parts[0][0].mfma) == [('wait_lr', False, None)]
 
         # All P3 MFMAs have wait_lr
         for slot in parts[3]:
-            assert _preop_kinds(slot.mfma) == [('wait_lr', None)]
+            assert _preop_kinds(slot.mfma) == [('wait_lr', False, None)]
 
         # LR A @P3:s3: wait_gr_sync with A=20
         lr_a_p3_s3 = _get_lr(parts[3][3], 'A')
@@ -989,7 +990,7 @@ class TestInsertGrLrInc:
 
         # Ordering: wait_gr_sync before lr_inc
         lr_a1 = _get_lr(s1, 'A')
-        assert lr_a1.preOps[0].kind == 'wait_gr_sync'
+        assert lr_a1.preOps[0].kind == 'wait_gr'
         assert lr_a1.preOps[1].kind == 'lr_inc'
 
     def test_multipartition_bf16_gr_inc_only_at_base_id_0(self):
@@ -1077,7 +1078,7 @@ class TestGroupLrGr:
         # s0: GR chain A←B, first GR dep→last LR
         gr_a0 = [gr for gr in s0.grs if gr.tensor == 'A'][0]
         gr_b0 = [gr for gr in s0.grs if gr.tensor == 'B'][0]
-        assert gr_a0.preOps[0].kind == 'wait_lr_sync'
+        assert gr_a0.preOps[0].kind == 'wait_lr'
         assert gr_a0.preOps[1].kind == 'gr_inc'
         assert gr_a0.deps[0].ref is lr_b0
         assert gr_b0.deps[0].ref is gr_a0
@@ -1087,7 +1088,7 @@ class TestGroupLrGr:
         lr_b1 = _get_lr(s1, 'B')
         lr_sa1 = _get_lr(s1, 'SA')
         lr_sb1 = _get_lr(s1, 'SB')
-        assert lr_a1.preOps[0].kind == 'wait_gr_sync'
+        assert lr_a1.preOps[0].kind == 'wait_gr'
         assert lr_a1.preOps[0].wait_gr_counts.A == 8
         assert len(lr_a1.preOps) == 5  # wait_gr_sync + 4 lr_inc
         assert lr_b1.deps[0].ref is lr_a1
@@ -1099,7 +1100,7 @@ class TestGroupLrGr:
         gr_sa1 = [gr for gr in s1.grs if gr.tensor == 'SA'][0]
         gr_sb1 = [gr for gr in s1.grs if gr.tensor == 'SB'][0]
         assert gr_b1.preOps == []
-        assert gr_sa1.preOps[0].kind == 'wait_lr_sync'
+        assert gr_sa1.preOps[0].kind == 'wait_lr'
         assert gr_sb1.deps[0].ref is gr_sa1
 
 
@@ -1122,8 +1123,8 @@ class TestRemoveUnnecessaryWaitLrSync:
         for slot in parts[0]:
             for gr in slot.grs:
                 for op in gr.preOps:
-                    assert op.kind in ('wait_lr_sync', 'sync', 'gr_inc', 'lr_inc',
-                                        'wait_gr', 'wait_gr_sync', 'wait_lr', 'skip')
+                    assert op.kind in ('wait_lr', 'sync', 'gr_inc', 'lr_inc',
+                                        'wait_gr', 'wait_gr', 'wait_lr', 'skip')
 
 
 # ══════════════════════════════════════════════════════════════

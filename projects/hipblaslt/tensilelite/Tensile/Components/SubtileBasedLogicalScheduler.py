@@ -137,7 +137,13 @@ class SchedulerConfig:
 # ── Schedule operation types ────────────────────────────────
 
 @dataclass
-class MFMAPlacement:
+class Emittable:
+    """Base for anything placed in an EmittedModule."""
+    kind: str = field(init=False, default="")
+
+
+@dataclass
+class MFMAPlacement(Emittable):
     """MFMA operation consuming data for one subIterK."""
     subIterK: int
     tileA: MFMATileRange       # A tiles consumed
@@ -146,9 +152,16 @@ class MFMAPlacement:
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     vgpr_tile_maps: Dict[str, List[dict]] = field(default_factory=dict)  # {tensor: [{groupIdx: vgprTileId}]} per unroll iter
 
+    def __post_init__(self):
+        self.kind = 'mfma'
+
+    def __str__(self):
+        return (f"MFMAs (MT n, subIterK {self.subIterK}  ) "
+                f"A : {self.tileA.fmt_tiles()} , B : {self.tileB.fmt_tiles()}")
+
 
 @dataclass
-class LRPlacement:
+class LRPlacement(Emittable):
     """Local Read placement for one tensor in one subIterK slot."""
     tensor: str                # 'A', 'B', 'SA', 'SB'
     mtIteration: int           # 0 = current MT, 1 = next MT
@@ -159,9 +172,16 @@ class LRPlacement:
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     vgpr_tile_map: List[dict] = field(default_factory=list)  # [{tileId: vgprTileId}] per unroll iter
 
+    def __post_init__(self):
+        self.kind = 'lr'
+
+    def __str__(self):
+        return (f"LR {self.tensor.ljust(2)} (MT {fmt_mt(self.mtIteration)}, "
+                f"subIterK {self.tiles.fmt_k()}) {self.tiles.fmt_tiles()}")
+
 
 @dataclass
-class GRPlacement:
+class GRPlacement(Emittable):
     """Global Read placement for one tensor in one subIterK slot."""
     tensor: str                # 'A', 'B', 'SA', 'SB'
     mtIteration: int           # 1 = next MT, 2 = two MTs ahead
@@ -170,6 +190,13 @@ class GRPlacement:
     partition: int = 0         # which partition this GR belongs to
     deps: List['Dep'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
+
+    def __post_init__(self):
+        self.kind = 'gr'
+
+    def __str__(self):
+        return (f"GR {self.tensor} (MT {fmt_mt(self.mtIteration)}, "
+                f"subIterK {self.tiles.fmt_k()}) ids {self.tiles.fmt_tiles()}")
 
 
 # ── Per-subIterK container ──────────────────────────────────
@@ -203,9 +230,8 @@ class WaitGRCounts:
 
 
 @dataclass
-class BaseOp:
+class BaseOp(Emittable):
     """Base class for typed dependency operations in a before-chain."""
-    kind: str = ""
 
     def __str__(self):
         return self.kind
@@ -218,7 +244,7 @@ class WaitGROp(BaseOp):
     has_sync: bool = False
 
     def __post_init__(self):
-        self.kind = 'wait_gr_sync' if self.has_sync else 'wait_gr'
+        self.kind = 'wait_gr'
 
     def __str__(self):
         if self.wait_gr_counts:
@@ -232,7 +258,7 @@ class WaitLROp(BaseOp):
     has_sync: bool = False
 
     def __post_init__(self):
-        self.kind = 'wait_lr_sync' if self.has_sync else 'wait_lr'
+        self.kind = 'wait_lr'
 
 
 @dataclass
@@ -305,9 +331,11 @@ class EmittedModule:
     moduleId: int = -1
     instructions: list = field(default_factory=list)
     before: Optional[int] = None   # moduleId that must complete before this module
-    opType: str = ""
-    label: str = ""                # human-readable label for debugging
-    source: object = None          # original placement or BaseOp, for populate_instructions
+    source: Optional[Emittable] = None
+
+    @property
+    def opType(self) -> str:
+        return self.source.kind if self.source else ""
 
 
 # ── Main scheduler class ───────────────────────────────────
@@ -1542,14 +1570,14 @@ class SubtileBasedLogicalScheduler:
         Returns [partition][subIterK][EmittedModule].
 
         Each subIterK list contains:
-          - Primary modules (MFMA, LRs, GRs) with opType and label
+          - Primary modules (MFMA, LRs, GRs)
           - Dependency modules (wait_gr, wait_lr, sync, lr_inc, gr_inc)
             emitted from preOps, chained via before-links
 
-        The before-link topology matches the original _buildEmittedModules:
+        The before-link topology:
           - wait_gr is standalone (no incoming before-link), but later deps chain from it
-          - wait_gr_sync expands to two modules: wait_gr then sync
-          - wait_lr_sync expands to two modules: wait_lr then sync
+          - WaitGROp with has_sync expands to two modules: wait_gr then sync
+          - WaitLROp with has_sync expands to two modules: wait_lr then sync
           - Same-subIterK Dep deps become ordering constraints (no new module)
         """
         if 'remove_wait_lr_sync' not in self._completed:
@@ -1562,10 +1590,9 @@ class SubtileBasedLogicalScheduler:
                 emitted: List[EmittedModule] = []
                 placement_to_id = {}
 
-                def add(opType: str, label: str, source: object = None) -> int:
+                def add(source: Emittable) -> int:
                     mid = len(emitted)
-                    emitted.append(EmittedModule(
-                        moduleId=mid, opType=opType, label=label, source=source))
+                    emitted.append(EmittedModule(moduleId=mid, source=source))
                     return mid
 
                 def setBefore(moduleId: int, beforeId: int) -> None:
@@ -1581,19 +1608,18 @@ class SubtileBasedLogicalScheduler:
                 # Step 1: emit primary modules
                 placements = []
                 if slot.mfma:
-                    placements.append(('mfma', slot.mfma))
+                    placements.append(slot.mfma)
                 for lr in slot.lrs:
-                    placements.append(('lr', lr))
+                    placements.append(lr)
                 for gr in slot.grs:
-                    placements.append(('gr', gr))
+                    placements.append(gr)
 
-                for opType, placement in placements:
-                    label = self._format_placement_label(placement, slot)
-                    mid = add(opType, label, source=placement)
+                for placement in placements:
+                    mid = add(placement)
                     placement_to_id[id(placement)] = mid
 
                 # Step 2: wire before-chains from preOps + deps
-                for opType, placement in placements:
+                for placement in placements:
                     curId = placement_to_id[id(placement)]
                     prevId = None
                     lastDepId = None
@@ -1602,33 +1628,30 @@ class SubtileBasedLogicalScheduler:
                     # preOps
                     for preOp in placement.preOps:
                         if isinstance(preOp, WaitGROp):
-                            depId = add('wait_gr', str(preOp), source=preOp)
+                            depId = add(preOp)
                             prevId = depId
                             if firstPreOpId is None:
                                 firstPreOpId = depId
                             if preOp.has_sync:
-                                depId = add('sync', 'sync',
-                                            source=SyncOp())
+                                depId = add(SyncOp())
                                 setBefore(depId, prevId)
                                 prevId = depId
                                 lastDepId = depId
                             continue
                         elif isinstance(preOp, WaitLROp) and preOp.has_sync:
-                            depId = add('wait_lr', 'wait_lr',
-                                        source=WaitLROp())
+                            depId = add(WaitLROp())
                             setBefore(depId, prevId)
                             prevId = depId
                             lastDepId = depId
                             if firstPreOpId is None:
                                 firstPreOpId = depId
-                            depId = add('sync', 'sync',
-                                        source=SyncOp())
+                            depId = add(SyncOp())
                             setBefore(depId, prevId)
                             prevId = depId
                             lastDepId = depId
                             continue
                         else:
-                            depId = add(preOp.kind, str(preOp), source=preOp)
+                            depId = add(preOp)
                             setBefore(depId, prevId)
                             prevId = depId
                             lastDepId = depId
@@ -1700,13 +1723,12 @@ class SubtileBasedLogicalScheduler:
                 removed = set()
                 for em in new_emitted:
                     src = em.source
-                    if em.opType == 'gr' and isinstance(src, GRPlacement) \
-                            and src.mtIteration == 2:
+                    if em.opType == 'gr' and src.mtIteration == 2:
                         removed.add(em.moduleId)
                     elif em.opType == 'gr_inc':
                         removed.add(em.moduleId)
                     elif em.opType == 'wait_gr':
-                        if isinstance(src, WaitGROp) and src.wait_gr_counts is not None:
+                        if src.wait_gr_counts is not None:
                             src.wait_gr_counts = WaitGRCounts()
                 part_ngll.append(self._rewire_before(new_emitted, removed))
             ngll.append(part_ngll)
@@ -1731,17 +1753,15 @@ class SubtileBasedLogicalScheduler:
                     src = em.source
                     if em.opType == 'gr':
                         removed.add(em.moduleId)
-                    elif em.opType == 'lr' and isinstance(src, LRPlacement) \
-                            and src.mtIteration == 1:
+                    elif em.opType == 'lr' and src.mtIteration == 1:
                         removed.add(em.moduleId)
                     elif em.opType in ('gr_inc', 'lr_inc'):
                         removed.add(em.moduleId)
 
                 # Zero inflight counts on remaining WaitGR.
                 for em in new_emitted:
-                    if em.opType == 'wait_gr' and isinstance(em.source, WaitGROp):
-                        if em.moduleId not in removed:
-                            em.source.wait_gr_counts = WaitGRCounts()
+                    if em.opType == 'wait_gr' and em.moduleId not in removed:
+                        em.source.wait_gr_counts = WaitGRCounts()
 
                 # Find Sync modules paired with removed wait_gr
                 for em in new_emitted:
@@ -1765,31 +1785,8 @@ class SubtileBasedLogicalScheduler:
 
     @staticmethod
     def _to_emitted(ops) -> List[EmittedModule]:
-        """Wrap GRPlacement/LRPlacement/BaseOp objects into EmittedModules."""
-        result = []
-        for mid, op in enumerate(ops):
-            if isinstance(op, GRPlacement):
-                t = op.tiles
-                em = EmittedModule(moduleId=mid, opType='gr',
-                                   label=f'GR {op.tensor} (MT {fmt_mt(op.mtIteration)}, subIterK {t.fmt_k()}) ids {t.fmt_tiles()}',
-                                   source=op)
-            elif isinstance(op, LRPlacement):
-                t = op.tiles
-                em = EmittedModule(moduleId=mid, opType='lr',
-                                   label=f'LR {op.tensor} (MT {fmt_mt(op.mtIteration)}, subIterK {t.fmt_k()}) ids {t.fmt_tiles()}',
-                                   source=op)
-            elif isinstance(op, BaseOp):
-                if isinstance(op, SkipOp):
-                    label = f'skip {op.compare} {op.value} → {op.target}'
-                else:
-                    tensor = getattr(op, 'tensor', '')
-                    label = f'{op.kind.upper()} {tensor}'.strip()
-                em = EmittedModule(moduleId=mid, opType=op.kind,
-                                   label=label, source=op)
-            else:
-                raise ValueError(f"Unknown op type: {type(op)}")
-            result.append(em)
-        return result
+        """Wrap Emittable objects (Placements / BaseOps) into EmittedModules."""
+        return [EmittedModule(moduleId=mid, source=op) for mid, op in enumerate(ops)]
 
     def _preloop_make_gr(self, mt: str, tiles: dict) -> List[GRPlacement]:
         """Create GR placements for all tensors at the given MT iteration.
@@ -2270,32 +2267,12 @@ class SubtileBasedLogicalScheduler:
 
     def _print_placement_with_deps(self, buf, placement, slot: SubIterKSlot):
         """Print a placement label followed by its deps."""
-        label = self._format_placement_label(placement, slot)
-        buf.write(f"      {label}\n")
+        buf.write(f"      {placement}\n")
         if placement.deps:
             buf.write("        deps:\n")
             for dep in placement.deps:
                 dep_str = self._format_dep_ref(dep)
                 buf.write(f"            - {dep_str}\n")
-
-    def _format_placement_label(self, placement, slot: SubIterKSlot) -> str:
-        """Format a placement (MFMA/LR/GR) into a human-readable label."""
-        if isinstance(placement, MFMAPlacement):
-            m = placement
-            label = (f"MFMAs (MT n, subIterK {m.subIterK}  ) "
-                     f"A : {m.tileA.fmt_tiles()} , B : {m.tileB.fmt_tiles()}")
-            return label
-        elif isinstance(placement, LRPlacement):
-            t = self._fmt_tensor(placement.tensor)
-            label = (f"LR {t} (MT {fmt_mt(placement.mtIteration)}, "
-                     f"subIterK {placement.tiles.fmt_k()}) "
-                     f"{placement.tiles.fmt_tiles()}")
-            return label
-        elif isinstance(placement, GRPlacement):
-            return (f"GR {placement.tensor} (MT {fmt_mt(placement.mtIteration)}, "
-                    f"subIterK {placement.tiles.fmt_k()}) "
-                    f"ids {placement.tiles.fmt_tiles()}")
-        return str(placement)
 
     def print_remove_deps(self) -> str:
         """Print remove_cross_deps output: placements with preOps and remaining deps."""
@@ -2331,8 +2308,7 @@ class SubtileBasedLogicalScheduler:
 
     def _print_placement_with_preops(self, buf, placement, slot: SubIterKSlot):
         """Print a placement label followed by its preOps and remaining deps."""
-        label = self._format_placement_label(placement, slot)
-        buf.write(f"      {label}\n")
+        buf.write(f"      {placement}\n")
         if placement.preOps:
             buf.write("        preOps:\n")
             for op in placement.preOps:
@@ -2366,7 +2342,7 @@ class SubtileBasedLogicalScheduler:
                 buf.write(f"    subIterK={k}:\n")
                 for em in emitted:
                     before_str = f" <- [{em.before}]" if em.before is not None else ""
-                    buf.write(f"      [{em.moduleId:2d}] {em.opType:10s} {em.label}{before_str}\n")
+                    buf.write(f"      [{em.moduleId:2d}] {em.opType:10s} {em.source}{before_str}\n")
         return buf.getvalue()
 
     def print_emit_dep_order(self, all_partitions: List[List[List[EmittedModule]]] = None) -> str:
@@ -2382,16 +2358,16 @@ class SubtileBasedLogicalScheduler:
                 buf.write(f"    subIterK={k}:\n")
                 mfmaIdx, paths, preMfmaPaths = extractPathsFromBeforeDeps(emitted)
                 em = emitted[mfmaIdx]
-                buf.write(f"      MFMA: [{em.moduleId:2d}] {em.label}")
+                buf.write(f"      MFMA: [{em.moduleId:2d}] {em.source}")
                 if em.before is not None:
                     buf.write(f" <- [{em.before}]")
                 buf.write("\n")
                 for i, path in enumerate(preMfmaPaths):
                     buf.write(f"      preMFMA path {i}:\n")
                     for idx in path:
-                        buf.write(f"        [{emitted[idx].moduleId:2d}] {emitted[idx].opType:10s} {emitted[idx].label}\n")
+                        buf.write(f"        [{emitted[idx].moduleId:2d}] {emitted[idx].opType:10s} {emitted[idx].source}\n")
                 for i, path in enumerate(paths):
                     buf.write(f"      path {i}:\n")
                     for idx in path:
-                        buf.write(f"        [{emitted[idx].moduleId:2d}] {emitted[idx].opType:10s} {emitted[idx].label}\n")
+                        buf.write(f"        [{emitted[idx].moduleId:2d}] {emitted[idx].opType:10s} {emitted[idx].source}\n")
         return buf.getvalue()
