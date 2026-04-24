@@ -380,7 +380,7 @@ class EmittedModule:
 
 # ── Main scheduler class ───────────────────────────────────
 
-class SubtileBasedLogicalScheduler:
+class LogicalScheduler:
     """Subtile-based logical scheduler.
 
     Builds the schedule in 6 passes, each producing testable intermediate output.

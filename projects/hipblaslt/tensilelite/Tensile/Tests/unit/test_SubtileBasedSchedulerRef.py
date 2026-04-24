@@ -1,4 +1,4 @@
-"""Non-regression tests for SubtileBasedLogicalScheduler — exact output checks.
+"""Non-regression tests for LogicalScheduler — exact output checks.
 
 These tests capture the expected scheduling output at specific pipeline steps
 to detect unintended regressions. 
@@ -6,7 +6,7 @@ to detect unintended regressions.
 
 from Tensile.Components.SubtileBasedKernel import TileInfo
 from Tensile.Components.SubtileBasedLogicalScheduler import (
-    SubtileBasedLogicalScheduler,
+    LogicalScheduler,
     ReadGranularity,
     SchedulerConfig,
 )
@@ -178,7 +178,7 @@ MAINLOOP (dependency paths):
 def test_384x256_bf16_partition_2x1():
     """Exact check of emit dependency order for 384x256 BF16, 2x1 partition."""
     cfg = make_384x256_bf16()
-    sched = SubtileBasedLogicalScheduler(cfg)
+    sched = LogicalScheduler(cfg)
     sched.emit()
     actual = sched.print_emit_dep_order()
     assert actual == EXPECTED_EMIT_DEP_ORDER_384x256_BF16_2x1, (
@@ -191,7 +191,7 @@ def test_384x256_bf16_partition_2x1():
 def test_256x256_bf16_partition_1x1():
     """Exact check of emit dependency order for 256x256 BF16, 1x1 partition."""
     cfg = make_256x256_bf16()
-    sched = SubtileBasedLogicalScheduler(cfg)
+    sched = LogicalScheduler(cfg)
     sched.emit()
     actual = sched.print_emit_dep_order()
     assert actual == EXPECTED_EMIT_DEP_ORDER_256x256_BF16_1x1, (
@@ -328,7 +328,7 @@ MAINLOOP (dependency paths):
 def test_320x320_bf16_partition_1x5():
     """Exact check of emit dependency order for 320x320 BF16, 1x5 partition."""
     cfg = make_320x320_bf16()
-    sched = SubtileBasedLogicalScheduler(cfg)
+    sched = LogicalScheduler(cfg)
     sched.emit()
     actual = sched.print_emit_dep_order()
     assert actual == EXPECTED_EMIT_DEP_ORDER_320x320_BF16_1x5, (
@@ -405,7 +405,7 @@ MAINLOOP (dependency paths):
 def test_256x256_fp4_partition_1x1():
     """Exact check of emit dependency order for 256x256 FP4, 1x1 partition."""
     cfg = make_256x256_fp4()
-    sched = SubtileBasedLogicalScheduler(cfg)
+    sched = LogicalScheduler(cfg)
     sched.emit()
     actual = sched.print_emit_dep_order()
     assert actual == EXPECTED_EMIT_DEP_ORDER_256x256_FP4_1x1, (
