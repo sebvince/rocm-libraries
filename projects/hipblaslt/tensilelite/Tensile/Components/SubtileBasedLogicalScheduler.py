@@ -21,11 +21,13 @@ The schedule is built in these passes:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import copy
 import io
 import math
 
+
+TENSOR_SIDE = {'A': 'A', 'B': 'B', 'SA': 'A', 'SB': 'B'}
 
 # ── Core primitives ─────────────────────────────────────────
 
@@ -138,10 +140,7 @@ class MFMAPlacement:
     tileB: MFMATileRange       # B tiles consumed
     deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
-    vgpr_tile_map_A: List[dict] = field(default_factory=list)   # [{tileId: vgprTileId}] per unroll iter
-    vgpr_tile_map_B: List[dict] = field(default_factory=list)   # [{tileId: vgprTileId}] per unroll iter
-    vgpr_tile_map_SA: List[dict] = field(default_factory=list)  # [{scaleGroupIdx: vgprTileId}] per unroll iter
-    vgpr_tile_map_SB: List[dict] = field(default_factory=list)  # [{scaleGroupIdx: vgprTileId}] per unroll iter
+    vgpr_tile_maps: Dict[str, List[dict]] = field(default_factory=dict)  # {tensor: [{groupIdx: vgprTileId}]} per unroll iter
 
 
 @dataclass
@@ -509,9 +508,8 @@ class SubtileBasedLogicalScheduler:
              Stops when next_iter matches the seeded state (convergence).
           3. Record unroll_factor, needs_unrolling, and max tile_peaks.
 
-        Keys:
-          A/B:   (tensor, tileId, subIterK)
-          SA/SB: (tensor, scaleGroupIdx, k_chunk_start)
+        Keys use a unified formula parameterized by ReadGranularity:
+          key = (tensor, (tileId // lr_gran.mn) * lr_gran.mn, (k // lr_gran.k) * lr_gran.k)
 
         Sets self.tile_peaks (per-tensor max across unrolls),
         self.needs_unrolling, self.unroll_factor.
@@ -523,11 +521,10 @@ class SubtileBasedLogicalScheduler:
         numK = cfg.numSubIterK
         MAX_UNROLL = 8
 
-        # Build k_gran lookup for scale tensors
-        scale_k_gran = {}
+        lr_grans = {'A': cfg.lrA, 'B': cfg.lrB}
         if cfg.hasScale:
-            scale_k_gran['SA'] = cfg.lrSA.k
-            scale_k_gran['SB'] = cfg.lrSB.k
+            lr_grans['SA'] = cfg.lrSA
+            lr_grans['SB'] = cfg.lrSB
 
         # ── Phase 1: find last MFMA read for each key ──
         last_read = {}  # key -> flat position
@@ -537,20 +534,14 @@ class SubtileBasedLogicalScheduler:
                     continue
                 pos = pi * numK + slot.subIterK
                 k = slot.subIterK
-                # A/B: key = (tensor, tileId, subIterK)
-                for tensor, tileRange in [('A', slot.mfma.tileA),
-                                           ('B', slot.mfma.tileB)]:
+                for tensor in self.tensors:
+                    side = TENSOR_SIDE[tensor]
+                    tileRange = slot.mfma.tileA if side == 'A' else slot.mfma.tileB
+                    gran = lr_grans[tensor]
                     for t in tileRange.tileId_list:
-                        last_read[(tensor, t, k)] = pos
-                # SA/SB: key = (tensor, scaleGroupIdx, k_chunk_start)
-                if cfg.hasScale:
-                    for stensor, tileRange in [('SA', slot.mfma.tileA),
-                                                ('SB', slot.mfma.tileB)]:
-                        sk_gran = scale_k_gran[stensor]
-                        k_chunk = (k // sk_gran) * sk_gran
-                        for t in tileRange.tileId_list:
-                            sg = t // 2
-                            last_read[(stensor, sg, k_chunk)] = pos
+                        group = (t // gran.mn) * gran.mn
+                        k_chunk = (k // gran.k) * gran.k
+                        last_read[(tensor, group, k_chunk)] = pos
 
         # ── Phase 2: iterate until convergence ──
         from collections import deque
@@ -601,34 +592,19 @@ class SubtileBasedLogicalScheduler:
 
                     # ── MFMA reads: look up or seed ──
                     if slot.mfma:
-                        map_A, map_B = {}, {}
-                        for tensor, tileRange, tile_map in [
-                                ('A', slot.mfma.tileA, map_A),
-                                ('B', slot.mfma.tileB, map_B)]:
+                        for tensor in self.tensors:
+                            side = TENSOR_SIDE[tensor]
+                            tileRange = slot.mfma.tileA if side == 'A' else slot.mfma.tileB
+                            gran = lr_grans[tensor]
+                            tile_map = {}
                             for t in tileRange.tileId_list:
-                                key = (tensor, t, k)
+                                group = (t // gran.mn) * gran.mn
+                                k_chunk = (k // gran.k) * gran.k
+                                key = (tensor, group, k_chunk)
                                 if key not in active:
                                     active[key] = pools[tensor].alloc()
-                                tile_map[t] = active[key]
-                        slot.mfma.vgpr_tile_map_A.append(map_A)
-                        slot.mfma.vgpr_tile_map_B.append(map_B)
-
-                        # SA/SB reads
-                        if cfg.hasScale:
-                            map_SA, map_SB = {}, {}
-                            for stensor, tileRange, tile_map in [
-                                    ('SA', slot.mfma.tileA, map_SA),
-                                    ('SB', slot.mfma.tileB, map_SB)]:
-                                sk_gran = scale_k_gran[stensor]
-                                k_chunk = (k // sk_gran) * sk_gran
-                                for t in tileRange.tileId_list:
-                                    sg = t // 2
-                                    key = (stensor, sg, k_chunk)
-                                    if key not in active:
-                                        active[key] = pools[stensor].alloc()
-                                    tile_map[sg] = active[key]
-                            slot.mfma.vgpr_tile_map_SA.append(map_SA)
-                            slot.mfma.vgpr_tile_map_SB.append(map_SB)
+                                tile_map[group] = active[key]
+                            slot.mfma.vgpr_tile_maps.setdefault(tensor, []).append(tile_map)
 
                     # ── LR writes: allocate new tiles ──
                     for lr in slot.lrs:
@@ -636,35 +612,23 @@ class SubtileBasedLogicalScheduler:
                         is_wrapping = lr.mtIteration != "n"
                         target = next_iter if is_wrapping else active
 
-                        if tensor in ('A', 'B'):
-                            tile_map = {}
-                            for t in lr.tiles.tileId_list:
-                                for lk in lr.tiles.subIterK_list:
-                                    key = (tensor, t, lk)
-                                    if key in target:
-                                        pools[tensor].release(target[key])
-                                    vid = pools[tensor].alloc()
-                                    target[key] = vid
-                                    tile_map[t] = vid
-                            lr.vgpr_tile_map.append(tile_map)
-                        elif tensor in ('SA', 'SB') and cfg.hasScale:
-                            tile_map = {}
-                            sk_gran = scale_k_gran[tensor]
-                            seen_keys = set()
-                            for t in lr.tiles.tileId_list:
-                                sg = t // 2
-                                for lk in lr.tiles.subIterK_list:
-                                    k_chunk = (lk // sk_gran) * sk_gran
-                                    key = (tensor, sg, k_chunk)
-                                    if key in seen_keys:
-                                        continue
-                                    seen_keys.add(key)
-                                    if key in target:
-                                        pools[tensor].release(target[key])
-                                    vid = pools[tensor].alloc()
-                                    target[key] = vid
-                                    tile_map[sg] = vid
-                            lr.vgpr_tile_map.append(tile_map)
+                        gran = lr_grans[tensor]
+                        tile_map = {}
+                        seen_keys = set()
+                        for t in lr.tiles.tileId_list:
+                            group = (t // gran.mn) * gran.mn
+                            for lk in lr.tiles.subIterK_list:
+                                k_chunk = (lk // gran.k) * gran.k
+                                key = (tensor, group, k_chunk)
+                                if key in seen_keys:
+                                    continue
+                                seen_keys.add(key)
+                                if key in target:
+                                    pools[tensor].release(target[key])
+                                vid = pools[tensor].alloc()
+                                target[key] = vid
+                                tile_map[group] = vid
+                        lr.vgpr_tile_map.append(tile_map)
 
                     # ── Release tiles whose last read was at this position ──
                     to_release = [key for key, lr_pos in last_read.items()
@@ -689,11 +653,9 @@ class SubtileBasedLogicalScheduler:
                     for pi2, slots2 in enumerate(self._partitions):
                         for slot2 in slots2:
                             if slot2.mfma:
-                                slot2.mfma.vgpr_tile_map_A.pop()
-                                slot2.mfma.vgpr_tile_map_B.pop()
-                                if cfg.hasScale:
-                                    slot2.mfma.vgpr_tile_map_SA.pop()
-                                    slot2.mfma.vgpr_tile_map_SB.pop()
+                                for tensor in self.tensors:
+                                    if tensor in slot2.mfma.vgpr_tile_maps:
+                                        slot2.mfma.vgpr_tile_maps[tensor].pop()
                             for lr2 in slot2.lrs:
                                 lr2.vgpr_tile_map.pop()
                     converged = True
@@ -1869,11 +1831,6 @@ class SubtileBasedLogicalScheduler:
         by the first MFMA, not the next subIterK like mainloop LRs).
         """
         first_mfma = self._partitions[0][0].mfma
-        mfma_maps = {'A': first_mfma.vgpr_tile_map_A,
-                     'B': first_mfma.vgpr_tile_map_B}
-        if self.config.hasScale:
-            mfma_maps['SA'] = first_mfma.vgpr_tile_map_SA
-            mfma_maps['SB'] = first_mfma.vgpr_tile_map_SB
 
         placements = []
         for tensor in self.tensors:
@@ -1881,8 +1838,8 @@ class SubtileBasedLogicalScheduler:
                 tensor=tensor, mtIteration='0',
                 tiles=tiles[tensor],
                 subIterK_slot=0, partition=0)
-            if tensor in mfma_maps:
-                lr.vgpr_tile_map = copy.deepcopy(mfma_maps[tensor])
+            if tensor in first_mfma.vgpr_tile_maps:
+                lr.vgpr_tile_map = copy.deepcopy(first_mfma.vgpr_tile_maps[tensor])
             placements.append(lr)
         return placements
 
@@ -2272,14 +2229,10 @@ class SubtileBasedLogicalScheduler:
                         m = slot.mfma
                         tiles_str = ""
                         parts = []
-                        if m.vgpr_tile_map_A:
-                            parts.append("A:" + str(m.vgpr_tile_map_A[ui]))
-                        if m.vgpr_tile_map_B:
-                            parts.append("B:" + str(m.vgpr_tile_map_B[ui]))
-                        if m.vgpr_tile_map_SA:
-                            parts.append("SA:" + str(m.vgpr_tile_map_SA[ui]))
-                        if m.vgpr_tile_map_SB:
-                            parts.append("SB:" + str(m.vgpr_tile_map_SB[ui]))
+                        for tensor in self.tensors:
+                            maps = m.vgpr_tile_maps.get(tensor)
+                            if maps:
+                                parts.append(f"{tensor}:" + str(maps[ui]))
                         if parts:
                             tiles_str = " " + ", ".join(parts)
                         buf.write(f"      MFMAs (MT n, subIterK {m.subIterK}  ) "

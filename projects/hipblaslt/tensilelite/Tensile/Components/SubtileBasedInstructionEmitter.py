@@ -68,22 +68,22 @@ class InstructionEmitter:
         """Emit MFMA instructions from MFMAPlacement."""
         module = Module()
         subIterK = placement.subIterK
-        tile_map_A = placement.vgpr_tile_map_A[unroll_iter] if placement.vgpr_tile_map_A else {}
-        tile_map_B = placement.vgpr_tile_map_B[unroll_iter] if placement.vgpr_tile_map_B else {}
-        tile_map_SA = placement.vgpr_tile_map_SA[unroll_iter] if placement.vgpr_tile_map_SA else {}
-        tile_map_SB = placement.vgpr_tile_map_SB[unroll_iter] if placement.vgpr_tile_map_SB else {}
+        tile_maps = {t: placement.vgpr_tile_maps[t][unroll_iter]
+                     for t in placement.vgpr_tile_maps}
 
         for a in placement.tileA.tileId_list:
             for b in placement.tileB.tileId_list:
-                aTile = self.vgprTilesA[tile_map_A[a]]
-                bTile = self.vgprTilesB[tile_map_B[b]]
+                groupA = (a // self.config.lrA.mn) * self.config.lrA.mn
+                groupB = (b // self.config.lrB.mn) * self.config.lrB.mn
+                aTile = self.vgprTilesA[tile_maps['A'][groupA]]
+                bTile = self.vgprTilesB[tile_maps['B'][groupB]]
                 dTile = self.dtileInfo.vgprTiles[a + b * self.dtileInfo.localMMATileGrid[0]]
 
                 if self.hasScale:
-                    scaleGroupA = a // 2
-                    scaleGroupB = b // 2
-                    scaleATile = self.vgprTilesSA[tile_map_SA[scaleGroupA]]
-                    scaleBTile = self.vgprTilesSB[tile_map_SB[scaleGroupB]]
+                    scaleGroupA = (a // self.config.lrSA.mn) * self.config.lrSA.mn
+                    scaleGroupB = (b // self.config.lrSB.mn) * self.config.lrSB.mn
+                    scaleATile = self.vgprTilesSA[tile_maps['SA'][scaleGroupA]]
+                    scaleBTile = self.vgprTilesSB[tile_maps['SB'][scaleGroupB]]
                     scaleAVgpr = next(iter(scaleATile))
                     scaleBVgpr = next(iter(scaleBTile))
                     sAsel = (a % 2) + 2 * subIterK
@@ -125,8 +125,9 @@ class InstructionEmitter:
             subtileK = placement.tiles.subIterK_start // self.subtileShapeK
             for tileId in range(placement.tiles.tileId_start, placement.tiles.tileId_end, lrGran.mn):
                 scaleGroupIdx = tileId // lrGran.mn
+                groupKey = scaleGroupIdx * lrGran.mn
                 dsOffset = groupStride * (scaleGroupIdx * (self.config.numSubIterK // self.subtileShapeK) + subtileK)
-                vdst = next(iter(vgprTilesScale[tile_map[scaleGroupIdx]]))
+                vdst = next(iter(vgprTilesScale[tile_map[groupKey]]))
                 module.add(DSLoadB32(
                     dst=vgpr(vdst),
                     src=vgpr(ti.sharedVgprLROffset[0]),

@@ -569,7 +569,7 @@ class TestAssignVgprTiles:
                 for lr in slot.lrs:
                     if lr.tensor not in ('A', 'B') or not lr.vgpr_tile_map:
                         continue
-                    mfma_map_list = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')
+                    mfma_map_list = slot.mfma.vgpr_tile_maps.get(lr.tensor, [])
                     for ui in range(len(mfma_map_list)):
                         mfma_vids = set(mfma_map_list[ui].values())
                         lr_vids = set(lr.vgpr_tile_map[ui].values())
@@ -596,7 +596,7 @@ class TestAssignVgprTiles:
                     if not slot.mfma:
                         continue
                     for tensor, tileRange in [('A', slot.mfma.tileA), ('B', slot.mfma.tileB)]:
-                        mfma_map_0 = getattr(slot.mfma, f'vgpr_tile_map_{tensor}')[0]
+                        mfma_map_0 = slot.mfma.vgpr_tile_maps[tensor][0]
                         for tileId in tileRange.tileId_list:
                             key = (tensor, tileId, slot.subIterK, pi)
                             if key in wrapping_writes:
@@ -612,12 +612,12 @@ class TestAssignVgprTiles:
         parts = sched._partitions
         s0, s1 = parts[0][0], parts[0][1]
 
-        for attr in ('vgpr_tile_map_A', 'vgpr_tile_map_B', 'vgpr_tile_map_SA', 'vgpr_tile_map_SB'):
-            assert len(getattr(s0.mfma, attr)) > 0
+        for tensor in ('A', 'B', 'SA', 'SB'):
+            assert len(s0.mfma.vgpr_tile_maps[tensor]) > 0
 
         for tensor in ('A', 'B'):
-            map_k0 = getattr(s0.mfma, f'vgpr_tile_map_{tensor}')[0]
-            map_k1 = getattr(s1.mfma, f'vgpr_tile_map_{tensor}')[0]
+            map_k0 = s0.mfma.vgpr_tile_maps[tensor][0]
+            map_k1 = s1.mfma.vgpr_tile_maps[tensor][0]
             for tileId in map_k0:
                 if tileId in map_k1:
                     assert map_k0[tileId] != map_k1[tileId]
@@ -652,8 +652,8 @@ class TestAssignVgprTiles:
         sched.assign_vgpr_tiles()
 
         for slot in sched._partitions[0]:
-            assert len(slot.mfma.vgpr_tile_map_A) > 0
-            assert len(slot.mfma.vgpr_tile_map_SA) > 0
+            assert len(slot.mfma.vgpr_tile_maps['A']) > 0
+            assert len(slot.mfma.vgpr_tile_maps['SA']) > 0
 
         assert not sched.needs_unrolling
         self._assert_no_conflict_and_unrolling(sched)
@@ -666,7 +666,7 @@ class TestAssignVgprTiles:
 
         for pi in range(4):
             for slot in sched._partitions[pi]:
-                assert len(slot.mfma.vgpr_tile_map_A) > 0
+                assert len(slot.mfma.vgpr_tile_maps['A']) > 0
 
         assert not sched.needs_unrolling
         self._assert_no_conflict_and_unrolling(sched)
@@ -1440,7 +1440,7 @@ class TestIntegration:
                     if slot.mfma and slot.lrs:
                         for lr in slot.lrs:
                             if lr.vgpr_tile_map and lr.tensor in ('A', 'B'):
-                                mfma_map = getattr(slot.mfma, f'vgpr_tile_map_{lr.tensor}')
+                                mfma_map = slot.mfma.vgpr_tile_maps.get(lr.tensor, [])
                                 if mfma_map:
                                     assert set(mfma_map[0].values()).isdisjoint(
                                         set(lr.vgpr_tile_map[0].values()))
