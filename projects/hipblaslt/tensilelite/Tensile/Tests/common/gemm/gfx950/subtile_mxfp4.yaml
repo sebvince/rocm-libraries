@@ -417,50 +417,41 @@ BenchmarkProblems:
           - Exact: [192, 192, 1, 256]   # Edge
           - Exact: [384, 384, 1, 256]   # Large tile edge
 
-  ##########################
-  # Current known failures #
-  ##########################
-  #
-  # PGR=2 WG 4x1/1x4, K > DU: the PGR=2 scheduler emits duplicate
-  # buffer_loads for subtiles that share a globalReadMap when
-  # loadRatioGR != 1.0 (skewed WG). At K > DepthU the K-loop
-  # SRD advance compounds the error.
-  # Uncomment to re-test after fix.
-  #
-  # -
-  #   - OperationType: GEMM
-  #     DataType: F4
-  #     DestDataType: b
-  #     ComputeDataType: s
-  #     HighPrecisionAccumulate: True
-  #     MXBlockA: 32
-  #     MXBlockB: 32
-  #     TransposeA: 1
-  #     TransposeB: 0
-  #     UseBeta: True
-  #     Batched: True
-  #     ActivationFuncCall: True
-  #
-  #   - InitialSolutionParameters:
-  #     BenchmarkCommonParameters:
-  #       - KernelLanguage: ["Assembly"]
-  #     ForkParameters:
-  #       - MatrixInstruction:
-  #         - [16, 16, 128, 1,  1, 2, 2,  4, 1]  # MT 128x32
-  #         - [16, 16, 128, 1,  1, 2, 4,  4, 1]  # MT 128x64
-  #         - [16, 16, 128, 1,  1, 4, 4,  4, 1]  # MT 256x64
-  #         - [16, 16, 128, 1,  1, 2, 2,  1, 4]  # MT 32x128
-  #         - [16, 16, 128, 1,  1, 4, 2,  1, 4]  # MT 64x128
-  #         - [16, 16, 128, 1,  1, 4, 4,  1, 4]  # MT 64x256
-  #       - PrefetchGlobalRead: [2]
-  #       - PrefetchLocalRead: [1]
-  #       - DepthU: [256]
-  #       - ScheduleIterAlg: [3]
-  #       - DirectToLds: [1]
-  #       - StreamK: [0]
-  #       - StaggerU: [0]
-  #       - UseSubtileImpl: [1]
-  #     BenchmarkJoinParameters:
-  #     BenchmarkFinalParameters:
-  #       - ProblemSizes:
-  #         - Exact: [256, 256, 1, 768]   # K = 3*DU (triggers failure)
+  # PGR=2 WG 4x1/1x4, K > DU — re-enabled after scheduler fix.
+  -
+    - OperationType: GEMM
+      DataType: F4
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      MXBlockA: 32
+      MXBlockB: 32
+      TransposeA: 1
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+      ActivationFuncCall: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 128, 1,  1, 2, 2,  4, 1]  # MT 128x32
+          - [16, 16, 128, 1,  1, 2, 4,  4, 1]  # MT 128x64
+          - [16, 16, 128, 1,  1, 4, 4,  4, 1]  # MT 256x64
+          - [16, 16, 128, 1,  1, 2, 2,  1, 4]  # MT 32x128
+          - [16, 16, 128, 1,  1, 4, 2,  1, 4]  # MT 64x128
+          - [16, 16, 128, 1,  1, 4, 4,  1, 4]  # MT 64x256
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+        - DepthU: [256]
+        - ScheduleIterAlg: [3]
+        - DirectToLds: [1]
+        - StreamK: [0]
+        - StaggerU: [0]
+        - UseSubtileImpl: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [256, 256, 1, 768]   # K = 3*DU (triggers failure)
