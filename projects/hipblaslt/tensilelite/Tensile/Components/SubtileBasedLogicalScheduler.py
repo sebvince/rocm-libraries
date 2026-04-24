@@ -21,7 +21,6 @@ The schedule is built in these passes:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from typing import List, Optional, Tuple
 import copy
 import io
@@ -171,18 +170,6 @@ class SchedulerConfig:
 
 
 # ── Schedule operation types ────────────────────────────────
-
-class OpKind(Enum):
-    MFMA = auto()
-    LR = auto()
-    GR = auto()
-    WAIT_GR = auto()
-    WAIT_LR = auto()
-    SYNC = auto()
-    GR_INC = auto()
-    GR_SCALE = auto()
-    LR_INC = auto()
-
 
 @dataclass
 class MFMAPlacement:
@@ -345,40 +332,12 @@ class SkipOp(BaseOp):
 
 
 @dataclass
-class RefOp(BaseOp):
-    """Reference to another placement or AnnotatedOp."""
-    ref: object = None
-    ref_type: str = 'ref'
-
-    def __post_init__(self):
-        self.kind = self.ref_type
-
-
-@dataclass
 class DepRef:
     """Dependency on another placement (annotate_deps output)."""
     ref: object     # LRPlacement or GRPlacement
     mt_offset: int = 0  # 0 = same MT, -1 = prev MT, -2 = two MTs back, ...
 
 
-
-@dataclass
-class AnnotatedOp:
-    """An operation with its before-dependencies."""
-    kind: str        # 'MFMA', 'LR', 'GR', etc.
-    before: List[BaseOp] = field(default_factory=list)
-    # Original placement reference
-    placement: object = None
-
-
-# ── Grouped output ─────────────────────────────────────────
-
-@dataclass
-class GroupedSubIterK:
-    """Serialized ops within one subIterK (output of group/annotate_deps)."""
-    subIterK: int
-    partition: int = 0
-    ops: List[AnnotatedOp] = field(default_factory=list)
 
 
 # ── Emitted output ─────────────────────────────────────────
@@ -412,7 +371,6 @@ class SubtileBasedLogicalScheduler:
         self.tensors: List[str] = ['A', 'B'] + (['SA', 'SB'] if config.hasScale else [])
         self._completed: set = set()   # tracks which passes have run: {'lr', 'vgpr_tiles', 'gr', 'deps', 'group', 'emit'}
         self._partitions: Optional[List[List[SubIterKSlot]]] = None  # shared mutable state across passes
-        self._grouped: Optional[List[GroupedSubIterK]] = None
         self._emitted: Optional[List[List[EmittedModule]]] = None
         self._preloop_emitted: Optional[List[List[List[EmittedModule]]]] = None
         self._ngll_emitted: Optional[List[List[List[EmittedModule]]]] = None
