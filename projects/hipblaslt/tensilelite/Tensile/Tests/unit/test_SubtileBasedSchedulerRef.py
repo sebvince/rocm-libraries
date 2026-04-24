@@ -61,8 +61,10 @@ def make_256x256_bf16():
     kernel = create_kernel(256, 256, fp4=False, depthU=64)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
-    return SchedulerConfig.from_tile_info(
-        tiA, tiB,
+    return SchedulerConfig(
+        numMFMATilesM=tiA.localMMATileGrid[0],
+        numMFMATilesN=tiB.localMMATileGrid[0],
+        numSubIterK=tiA.localMMATileGrid[1],
         lrA=ReadGranularity(mn=1, k=1),
         lrB=ReadGranularity(mn=1, k=1),
         grA=ReadGranularity(mn=1, k=2),
@@ -107,8 +109,10 @@ def make_384x256_bf16():
     kernel = create_kernel(384, 256, fp4=False, depthU=64)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
-    return SchedulerConfig.from_tile_info(
-        tiA, tiB,
+    return SchedulerConfig(
+        numMFMATilesM=tiA.localMMATileGrid[0],
+        numMFMATilesN=tiB.localMMATileGrid[0],
+        numSubIterK=tiA.localMMATileGrid[1],
         lrA=ReadGranularity(mn=1, k=1),
         lrB=ReadGranularity(mn=1, k=1),
         grA=ReadGranularity(mn=1, k=2),
@@ -201,8 +205,10 @@ def make_320x320_bf16():
     kernel = create_kernel(320, 320, fp4=False, depthU=64)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
-    return SchedulerConfig.from_tile_info(
-        tiA, tiB,
+    return SchedulerConfig(
+        numMFMATilesM=tiA.localMMATileGrid[0],
+        numMFMATilesN=tiB.localMMATileGrid[0],
+        numSubIterK=tiA.localMMATileGrid[1],
         lrA=ReadGranularity(mn=1, k=1),
         lrB=ReadGranularity(mn=1, k=1),
         grA=ReadGranularity(mn=1, k=2),
@@ -338,13 +344,14 @@ def make_256x256_fp4():
     tiB = TileInfo('B', kernel)
     scaleTiA = TileInfo('MXSA', kernel)
     scaleTiB = TileInfo('MXSB', kernel)
-    return SchedulerConfig.from_tile_info(
-        tiA, tiB,
+    return SchedulerConfig(
+        numMFMATilesM=tiA.localMMATileGrid[0],
+        numMFMATilesN=tiB.localMMATileGrid[0],
+        numSubIterK=tiA.localMMATileGrid[1],
         lrA=ReadGranularity(mn=1, k=1),
         lrB=ReadGranularity(mn=1, k=1),
         grA=ReadGranularity(mn=1, k=2),
         grB=ReadGranularity(mn=1, k=2),
-        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(mn=2, k=2),
         lrSB=ReadGranularity(mn=2, k=2),
         grSA=ReadGranularity(mn=scaleTiA.localMMATileGrid[0], k=scaleTiA.localMMATileGrid[1]),

@@ -109,6 +109,7 @@ class SchedulerConfig:
 
         Enumerates all divisors of MAX(M, N) in ascending order and
         partitions the larger dimension. Starts with (1, 1).
+        This will only produces 1xN or Nx1 partitions to allow VGPR pressure reduction.
         """
         M = tileInfoA.localMMATileGrid[0]
         N = tileInfoB.localMMATileGrid[0]
@@ -125,42 +126,6 @@ class SchedulerConfig:
 
         return candidates
 
-    @classmethod
-    def from_tile_info(cls, tileInfoA, tileInfoB,
-                       lrA: ReadGranularity, lrB: ReadGranularity,
-                       grA: ReadGranularity, grB: ReadGranularity,
-                       scaleTileInfoA=None, scaleTileInfoB=None,
-                       lrSA: Optional[ReadGranularity] = None,
-                       lrSB: Optional[ReadGranularity] = None,
-                       grSA: Optional[ReadGranularity] = None,
-                       grSB: Optional[ReadGranularity] = None,
-                       numPartitionsM: int = 1,
-                       numPartitionsN: int = 1):
-        """Build config from TileInfo objects.
-
-        Derives numMFMATilesM/N/K from the tile info:
-        - numMFMATilesM = tileInfoA.localMMATileGrid[0]
-        - numMFMATilesN = tileInfoB.localMMATileGrid[0]
-        - numSubIterK   = tileInfoA.localMMATileGrid[1]
-        """
-        numMFMATilesM = tileInfoA.localMMATileGrid[0]
-        numMFMATilesN = tileInfoB.localMMATileGrid[0]
-        numSubIterK = tileInfoA.localMMATileGrid[1]
-
-        assert tileInfoA.localMMATileGrid[1] == tileInfoB.localMMATileGrid[1], \
-            "A and B must have same localMMATileGrid[1]"
-
-        return cls(
-            numMFMATilesM=numMFMATilesM,
-            numMFMATilesN=numMFMATilesN,
-            numSubIterK=numSubIterK,
-            lrA=lrA, lrB=lrB,
-            grA=grA, grB=grB,
-            numPartitionsM=numPartitionsM,
-            numPartitionsN=numPartitionsN,
-            lrSA=lrSA, lrSB=lrSB,
-            grSA=grSA, grSB=grSB,
-        )
 
 
 # ── Schedule operation types ────────────────────────────────

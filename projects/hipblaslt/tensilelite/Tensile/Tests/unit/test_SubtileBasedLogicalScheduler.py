@@ -88,13 +88,14 @@ def make_cfg_256x256_fp4(depthU=256, k_gran=1, numPartM=1, numPartN=1,
     tiB = TileInfo('B', kernel)
     scaleTiA = TileInfo('MXSA', kernel)
     scaleTiB = TileInfo('MXSB', kernel)
-    return SchedulerConfig.from_tile_info(
-        tiA, tiB,
+    return SchedulerConfig(
+        numMFMATilesM=tiA.localMMATileGrid[0],
+        numMFMATilesN=tiB.localMMATileGrid[0],
+        numSubIterK=tiA.localMMATileGrid[1],
         lrA=ReadGranularity(mn=1, k=k_gran),
         lrB=ReadGranularity(mn=1, k=k_gran),
         grA=ReadGranularity(mn=1, k=2),
         grB=ReadGranularity(mn=1, k=2),
-        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         lrSA=ReadGranularity(mn=2, k=2),
         lrSB=ReadGranularity(mn=2, k=2),
         grSA=ReadGranularity(mn=grSA_mn, k=grSA_k),
@@ -109,8 +110,10 @@ def make_cfg_bf16(MT0=256, MT1=256, depthU=64, numPartM=1, numPartN=1):
     kernel = create_kernel(MT0, MT1, fp4=False, depthU=depthU)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
-    return SchedulerConfig.from_tile_info(
-        tiA, tiB,
+    return SchedulerConfig(
+        numMFMATilesM=tiA.localMMATileGrid[0],
+        numMFMATilesN=tiB.localMMATileGrid[0],
+        numSubIterK=tiA.localMMATileGrid[1],
         lrA=ReadGranularity(mn=1, k=1),
         lrB=ReadGranularity(mn=1, k=1),
         grA=ReadGranularity(mn=1, k=2),
@@ -1236,7 +1239,7 @@ class TestBuildNLL:
 
 
 # ══════════════════════════════════════════════════════════════
-# from_tile_info
+# SchedulerConfig from TileInfo
 # ══════════════════════════════════════════════════════════════
 
 class TestFromTileInfo:
@@ -1249,13 +1252,14 @@ class TestFromTileInfo:
         scaleTiA = TileInfo('MXSA', kernel)
         scaleTiB = TileInfo('MXSB', kernel)
 
-        cfg = SchedulerConfig.from_tile_info(
-            tiA, tiB,
+        cfg = SchedulerConfig(
+            numMFMATilesM=tiA.localMMATileGrid[0],
+            numMFMATilesN=tiB.localMMATileGrid[0],
+            numSubIterK=tiA.localMMATileGrid[1],
             lrA=ReadGranularity(mn=1, k=1),
             lrB=ReadGranularity(mn=1, k=1),
             grA=ReadGranularity(mn=1, k=2),
             grB=ReadGranularity(mn=1, k=2),
-            scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
             lrSA=ReadGranularity(mn=2, k=2),
             lrSB=ReadGranularity(mn=2, k=2),
             grSA=ReadGranularity(mn=8, k=2),
@@ -1522,8 +1526,10 @@ if __name__ == "__main__":
         scaleTiA = None
         scaleTiB = None
 
-        cfg = SchedulerConfig.from_tile_info(
-            tiA, tiB,
+        cfg = SchedulerConfig(
+            numMFMATilesM=tiA.localMMATileGrid[0],
+            numMFMATilesN=tiB.localMMATileGrid[0],
+            numSubIterK=tiA.localMMATileGrid[1],
             lrA=ReadGranularity(mn=1, k=1),
             lrB=ReadGranularity(mn=1, k=1),
             grA=ReadGranularity(mn=1, k=2),
@@ -1538,13 +1544,14 @@ if __name__ == "__main__":
         scaleTiA = TileInfo('MXSA', kernel)
         scaleTiB = TileInfo('MXSB', kernel)
 
-        cfg = SchedulerConfig.from_tile_info(
-            tiA, tiB,
+        cfg = SchedulerConfig(
+            numMFMATilesM=tiA.localMMATileGrid[0],
+            numMFMATilesN=tiB.localMMATileGrid[0],
+            numSubIterK=tiA.localMMATileGrid[1],
             lrA=ReadGranularity(mn=1, k=1),
             lrB=ReadGranularity(mn=1, k=1),
             grA=ReadGranularity(mn=1, k=2),
             grB=ReadGranularity(mn=1, k=2),
-            scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
             lrSA=ReadGranularity(mn=2, k=2),
             lrSB=ReadGranularity(mn=2, k=2),
             grSA=ReadGranularity(mn=8, k=2),
