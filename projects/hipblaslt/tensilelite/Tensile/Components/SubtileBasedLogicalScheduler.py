@@ -90,6 +90,7 @@ class SchedulerConfig:
     grSB: Optional[ReadGranularity] = None
     numPartitionsM: int = 1   # partition grid in M dimension
     numPartitionsN: int = 1   # partition grid in N dimension
+    pgr: int = 2              # PrefetchGlobalRead level: 0 or 2
 
     @property
     def hasScale(self) -> bool:
@@ -458,7 +459,7 @@ class SubtileBasedLogicalScheduler:
             for chunk_idx in range(num_chunks):
                 next_chunk = (chunk_idx + 1) % num_chunks
                 is_wrap = (next_chunk == 0)
-                lr_mt = 1 if is_last and is_wrap else 0
+                lr_mt = 0 if cfg.pgr == 0 else (1 if is_last and is_wrap else 0)
                 lr_k_start = next_chunk * k_gran
                 lr_k_end = lr_k_start + k_gran
                 base_slot = chunk_idx * k_gran
@@ -1682,9 +1683,105 @@ class SubtileBasedLogicalScheduler:
         self._completed.add('emit')
         return all_partitions
 
+    def build_pgr0(self):
+        """Build PGR=0 mainloop: self-contained loop with no pipelining.
+
+        Bypasses PGR=2-specific passes (place_GRs, annotate_deps, etc.)
+        and directly constructs the emitted schedule from LR/MFMA placements.
+
+        Loop body order (matching old mainLoopImplPGR0):
+          GR (all tensors, mtIteration=0)
+          wait_gr + barrier
+          LR (from place_LRs)
+          wait_lr
+          MFMA
+          gr_inc (buffer swap + ptr update) — after last MFMA
+          lr_inc (buffer swap) — after last MFMA
+        """
+        if 'vgpr_tiles' not in self._completed:
+            self.assign_vgpr_tiles()
+
+        cfg = self.config
+        part_ranges = [self._partition_tile_range(pi)
+                       for pi in range(cfg.numPartitions)]
+
+        all_partitions = []
+        gr_seen = set()
+
+        last_pi = cfg.numPartitions - 1
+        for pi in range(cfg.numPartitions):
+            partition_emitted = []
+            slots = self._partitions[pi]
+            target_range = part_ranges[pi]
+            last_k_idx = len(slots) - 1
+
+            for si, slot in enumerate(slots):
+                k = slot.subIterK
+                ops = []
+
+                # GR placements for this subIterK (deduped by granularity)
+                items = [('A', target_range['A'], cfg.grA),
+                         ('B', target_range['B'], cfg.grB)]
+                if cfg.hasScale:
+                    items.append(('SA', target_range['A'], cfg.grSA))
+                    items.append(('SB', target_range['B'], cfg.grSB))
+
+                has_gr = False
+                for tensor, (t_start, t_end), gr_gran in items:
+                    mn = gr_gran.mn
+                    k_gran = gr_gran.k
+                    gr_tile_start = (t_start // mn) * mn
+                    gr_tile_end = ((t_end + mn - 1) // mn) * mn
+                    gr_k_start = (k // k_gran) * k_gran
+                    gr_k_end = gr_k_start + k_gran
+
+                    gr_key = (tensor, gr_tile_start, gr_tile_end,
+                              gr_k_start, gr_k_end)
+                    if gr_key in gr_seen:
+                        continue
+                    gr_seen.add(gr_key)
+                    has_gr = True
+
+                    ops.append(GRPlacement(
+                        tensor=tensor, mtIteration=0,
+                        tiles=MFMATileRange(gr_k_start, gr_k_end,
+                                            gr_tile_start, gr_tile_end),
+                        subIterK_slot=k, partition=pi))
+
+                if has_gr:
+                    ops.append(WaitGROp(wait_gr_counts=WaitGRCounts()))
+                    ops.append(SyncOp())
+
+                # LR and MFMA from existing placements
+                ops.extend(slot.lrs)
+                ops.append(WaitLROp())
+                if slot.mfma:
+                    ops.append(slot.mfma)
+
+                # gr_inc / lr_inc: after last MFMA (end of iteration)
+                is_last_slot = (pi == last_pi and si == last_k_idx)
+                if is_last_slot:
+                    ops.extend(self._make_tensor_depops(GRIncOp))
+                    ops.extend(self._make_tensor_depops(LRIncOp))
+
+                emitted = self._to_emitted(ops)
+                # Chain all modules linearly so the instruction scheduler
+                # preserves PGR=0's strict sequential ordering.
+                for i in range(len(emitted) - 1, 0, -1):
+                    emitted[i].before = emitted[i - 1].moduleId
+                partition_emitted.append(emitted)
+            all_partitions.append(partition_emitted)
+
+        self._emitted = all_partitions
+        self._preloop_emitted = [[[]]]
+        self._completed.add('build')
+
     def build(self):
         """Build mainloop """
-        self.emit()
+        if self.config.pgr == 0:
+            self.build_pgr0()
+        else:
+            self.emit()
         self._completed.add('build')
 
     # ── Loop variant derivation ────────────────────────────
@@ -1900,6 +1997,60 @@ class SubtileBasedLogicalScheduler:
         module.addComment0(f"{label} end")
         return module
 
+    def _emitAllLoops_pgr0(self, writer, kernel):
+        """Emit PGR=0 loop: self-contained mainloop, no preloop/NGLL/NLL.
+
+        Loop body: gr_inc, GR, wait_gr+barrier, lr_inc, LR, wait_lr, MFMA.
+        Loops until counterL == 0.
+        """
+        from rocisa.code import Module, Label
+        from rocisa.instruction import SSubU32, SCmpEQU32, SCBranchSCC0
+        from rocisa.container import sgpr
+
+        module = Module("AllLoops")
+        uf = self.unroll_factor
+
+        module.addComment0("MAINLOOP")
+        loopBegin = Label("LoopBeginL", "")
+
+        if uf == 1:
+            module.add(loopBegin)
+            module.add(self._emitLoop(writer, kernel, "MAINLOOP",
+                                      self._emitted_per_unroll[0]))
+            module.add(SSubU32(dst=sgpr("LoopCounterL"),
+                               src0=sgpr("LoopCounterL"), src1=1,
+                               comment="dec counterL"))
+            module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=0,
+                                 comment="counterL == 0?"))
+            module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
+                                    comment="restart mainloop"))
+        else:
+            module.add(loopBegin)
+            for ui in range(uf):
+                module.add(self._emitLoop(writer, kernel, f"MAINLOOP_C{ui}",
+                                          self._emitted_per_unroll[ui]))
+                module.add(SSubU32(dst=sgpr("LoopCounterL"),
+                                   src0=sgpr("LoopCounterL"), src1=1,
+                                   comment=f"dec counterL (copy {ui})"))
+                module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=0,
+                                     comment=f"counterL == 0? (copy {ui})"))
+                if ui < uf - 1:
+                    from rocisa.instruction import SCBranchSCC1
+                    module.add(SCBranchSCC1(
+                        labelName=f"SkipToEnd",
+                        comment=f"copy {ui} exit"))
+                else:
+                    module.add(SCBranchSCC0(
+                        labelName=loopBegin.getLabelName(),
+                        comment="restart mainloop"))
+
+        module.add(Label("SkipMainloop", ""))
+        module.add(Label("SkipToNGLL", ""))
+        module.add(Label("SkipToNLL", ""))
+        module.add(Label("SkipToEnd", ""))
+
+        return module
+
     def emitAllLoops(self, writer, kernel):
         """Emit complete loop structure: preloop + mainloop + NGLL + NLL.
 
@@ -1914,6 +2065,9 @@ class SubtileBasedLogicalScheduler:
 
         assert 'populate' in self._completed, \
             "populate_instructions() must be called before emitAllLoops()"
+
+        if self.config.pgr == 0:
+            return self._emitAllLoops_pgr0(writer, kernel)
 
         module = Module("AllLoops")
         uf = self.unroll_factor
@@ -2108,8 +2262,9 @@ class SubtileBasedLogicalScheduler:
         Uses per-tensor VGPR tile lists (vgprTilesA/B/SA/SB) indexed by
         vgprTileId from placement tile maps.
         """
-        if self._preloop_emitted is None or self._ngll_emitted is None \
-                or self._nll_emitted is None:
+        if self._preloop_emitted is None or \
+                (self.config.pgr > 0 and
+                 (self._ngll_emitted is None or self._nll_emitted is None)):
             self.build()
 
         from Tensile.Components.SubtileBasedInstructionEmitter import InstructionEmitter
@@ -2122,32 +2277,45 @@ class SubtileBasedLogicalScheduler:
             self.vgprTilesSA, self.vgprTilesSB,
         )
 
-        # Rebuild all loop variants from current _emitted (which now has
-        # vgpr_tile_maps populated by assign_vgpr_tiles, unlike the stale
-        # copies from build()).
-        self.build_preloop()
-        self.build_ngll()
-        self.build_nll()
+        if self.config.pgr == 0:
+            # PGR=0: rebuild mainloop only (no preloop/NGLL/NLL)
+            self.build_pgr0()
+            emitter.populate(self._preloop_emitted, unroll_iter=0)
 
-        emitter.populate(self._preloop_emitted, unroll_iter=0)
+            self._emitted_per_unroll = []
+            self._ngll_per_unroll = []
+            self._nll_per_unroll = []
+            for ui in range(self.unroll_factor):
+                em_copy = copy.deepcopy(self._emitted)
+                emitter.populate(em_copy, unroll_iter=ui)
+                self._emitted_per_unroll.append(em_copy)
+        else:
+            # Rebuild all loop variants from current _emitted (which now has
+            # vgpr_tile_maps populated by assign_vgpr_tiles, unlike the stale
+            # copies from build()).
+            self.build_preloop()
+            self.build_ngll()
+            self.build_nll()
 
-        self._emitted_per_unroll = []
-        self._ngll_per_unroll = []
-        self._nll_per_unroll = []
-        for ui in range(self.unroll_factor):
-            em_copy = copy.deepcopy(self._emitted)
-            emitter.populate(em_copy, unroll_iter=ui)
-            self._emitted_per_unroll.append(em_copy)
+            emitter.populate(self._preloop_emitted, unroll_iter=0)
 
-            ngll_copy = copy.deepcopy(self._ngll_emitted)
-            ngll_ui = (ui + 1) % self.unroll_factor
-            emitter.populate(ngll_copy, unroll_iter=ngll_ui)
-            self._ngll_per_unroll.append(ngll_copy)
+            self._emitted_per_unroll = []
+            self._ngll_per_unroll = []
+            self._nll_per_unroll = []
+            for ui in range(self.unroll_factor):
+                em_copy = copy.deepcopy(self._emitted)
+                emitter.populate(em_copy, unroll_iter=ui)
+                self._emitted_per_unroll.append(em_copy)
 
-            nll_copy = copy.deepcopy(self._nll_emitted)
-            nll_ui = (ui + 2) % self.unroll_factor
-            emitter.populate(nll_copy, unroll_iter=nll_ui)
-            self._nll_per_unroll.append(nll_copy)
+                ngll_copy = copy.deepcopy(self._ngll_emitted)
+                ngll_ui = (ui + 1) % self.unroll_factor
+                emitter.populate(ngll_copy, unroll_iter=ngll_ui)
+                self._ngll_per_unroll.append(ngll_copy)
+
+                nll_copy = copy.deepcopy(self._nll_emitted)
+                nll_ui = (ui + 2) % self.unroll_factor
+                emitter.populate(nll_copy, unroll_iter=nll_ui)
+                self._nll_per_unroll.append(nll_copy)
 
         self._completed.add('populate')
 
