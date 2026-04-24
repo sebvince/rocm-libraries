@@ -151,7 +151,7 @@ class InstructionEmitter:
         return list(module.flatitems())
 
     def emit_wait_gr(self, source):
-        """Emit SWaitCnt for wait_gr from DepOp with wait_gr_counts."""
+        """Emit SWaitCnt for wait_gr from BaseOp with wait_gr_counts."""
         counts = source.wait_gr_counts
         if counts is None:
             return []
@@ -203,19 +203,14 @@ class InstructionEmitter:
         return list(module.flatitems())
 
     def emit_skip(self, source):
-        """Emit skip guard: compare LoopCounterL and branch.
-
-        source.tensor encodes 'LE:value:target' or 'EQ:value:target'.
-        """
-        parts = source.tensor.split(':')
-        compare, value, target = parts[0], int(parts[1]), parts[2]
-        skipLabel = Label(f"SkipTo{target}", "")
+        """Emit skip guard: compare LoopCounterL and branch."""
+        skipLabel = Label(f"SkipTo{source.target}", "")
         cmpMap = {"EQ": SCmpEQU32, "LE": SCmpLeU32}
         return [
-            cmpMap[compare](src0=sgpr("LoopCounterL"), src1=value,
-                            comment=f"LoopCounter {compare} {value}?"),
+            cmpMap[source.compare](src0=sgpr("LoopCounterL"), src1=source.value,
+                                   comment=f"LoopCounter {source.compare} {source.value}?"),
             SCBranchSCC1(labelName=skipLabel.getLabelName(),
-                         comment=f"skip to {target}"),
+                         comment=f"skip to {source.target}"),
         ]
 
     def populate(self, emitted, unroll_iter=0):

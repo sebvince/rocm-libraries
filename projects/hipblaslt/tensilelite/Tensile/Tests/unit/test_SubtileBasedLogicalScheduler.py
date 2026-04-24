@@ -238,9 +238,10 @@ def _preop_kinds(placement):
     """Return list of (kind, wait_gr_counts_dict_or_None) for preOps."""
     result = []
     for op in placement.preOps:
-        if op.wait_gr_counts:
-            result.append((op.kind, {'A': op.wait_gr_counts.A, 'B': op.wait_gr_counts.B,
-                                      'SA': op.wait_gr_counts.SA, 'SB': op.wait_gr_counts.SB}))
+        counts = getattr(op, 'wait_gr_counts', None)
+        if counts:
+            result.append((op.kind, {'A': counts.A, 'B': counts.B,
+                                      'SA': counts.SA, 'SB': counts.SB}))
         else:
             result.append((op.kind, None))
     return result

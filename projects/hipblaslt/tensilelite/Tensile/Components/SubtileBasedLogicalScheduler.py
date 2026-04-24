@@ -191,7 +191,7 @@ class MFMAPlacement:
     tileA: MFMATileRange       # A tiles consumed
     tileB: MFMATileRange       # B tiles consumed
     deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
-    preOps: List['DepOp'] = field(default_factory=list)     # populated by remove_cross_deps()
+    preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     vgpr_tile_map_A: List[dict] = field(default_factory=list)   # [{tileId: vgprTileId}] per unroll iter
     vgpr_tile_map_B: List[dict] = field(default_factory=list)   # [{tileId: vgprTileId}] per unroll iter
     vgpr_tile_map_SA: List[dict] = field(default_factory=list)  # [{scaleGroupIdx: vgprTileId}] per unroll iter
@@ -207,7 +207,7 @@ class LRPlacement:
     subIterK_slot: int         # which subIterK this LR is placed in
     partition: int = 0         # which partition this LR belongs to
     deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
-    preOps: List['DepOp'] = field(default_factory=list)     # populated by remove_cross_deps()
+    preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     vgpr_tile_map: List[dict] = field(default_factory=list)  # [{tileId: vgprTileId}] per unroll iter
 
 
@@ -220,7 +220,7 @@ class GRPlacement:
     subIterK_slot: int         # which subIterK this GR is placed in
     partition: int = 0         # which partition this GR belongs to
     deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
-    preOps: List['DepOp'] = field(default_factory=list)     # populated by remove_cross_deps()
+    preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
 
 
 # ── Per-subIterK container ──────────────────────────────────
@@ -254,32 +254,104 @@ class WaitGRCounts:
 
 
 @dataclass
-class DepOp:
-    """A typed dependency in a before-chain.
-
-    Kinds:
-      'wait_gr'      — wait for global reads (no sync)
-      'wait_gr_sync' — wait for global reads + sync barrier
-      'wait_lr'      — wait for local reads (no sync, used before MFMAs)
-      'wait_lr_sync' — wait for local reads + sync barrier (used before GRs,
-                        to ensure LR finished reading LDS before GR overwrites it)
-      'lr_inc'       — LDS buffer swap for LR (needs tensor)
-      'gr_inc'       — pointer update + LDS swap for GR (needs tensor)
-      'ref'          — reference to another AnnotatedOp in same subIterK (group)
-      'lr_ref'       — dependency on a specific LR placement (annotate_deps)
-      'gr_ref'       — dependency on a specific GR placement (annotate_deps)
-    """
-    kind: str
-    tensor: str = ""
-    ref: Optional[object] = None  # placement (annotate_deps) or AnnotatedOp (group)
-    wait_gr_counts: Optional[WaitGRCounts] = None  # only for kind='wait_gr'
+class BaseOp:
+    """Base class for typed dependency operations in a before-chain."""
+    kind: str = ""
 
     def __str__(self):
-        if self.kind in ('wait_gr', 'wait_gr_sync') and self.wait_gr_counts:
-            return f"{self.kind}({self.wait_gr_counts})"
-        if self.tensor:
-            return f"{self.kind}({self.tensor})"
         return self.kind
+
+
+@dataclass
+class WaitGROp(BaseOp):
+    """Wait for global reads to complete. Optionally includes a sync barrier."""
+    wait_gr_counts: Optional[WaitGRCounts] = None
+    has_sync: bool = False
+
+    def __post_init__(self):
+        self.kind = 'wait_gr_sync' if self.has_sync else 'wait_gr'
+
+    def __str__(self):
+        if self.wait_gr_counts:
+            return f"{self.kind}({self.wait_gr_counts})"
+        return self.kind
+
+
+@dataclass
+class WaitLROp(BaseOp):
+    """Wait for local reads to complete. Optionally includes a sync barrier."""
+    has_sync: bool = False
+
+    def __post_init__(self):
+        self.kind = 'wait_lr_sync' if self.has_sync else 'wait_lr'
+
+
+@dataclass
+class SyncOp(BaseOp):
+    """Standalone sync barrier."""
+    def __post_init__(self):
+        self.kind = 'sync'
+
+
+@dataclass
+class LRIncOp(BaseOp):
+    """LDS buffer swap for local reads on a specific tensor."""
+    tensor: str = ""
+
+    def __post_init__(self):
+        self.kind = 'lr_inc'
+
+    def __str__(self):
+        return f"lr_inc({self.tensor})"
+
+
+@dataclass
+class GRIncOp(BaseOp):
+    """Pointer update + LDS swap for global reads on a specific tensor."""
+    tensor: str = ""
+
+    def __post_init__(self):
+        self.kind = 'gr_inc'
+
+    def __str__(self):
+        return f"gr_inc({self.tensor})"
+
+
+@dataclass
+class GRScaleOp(BaseOp):
+    """Scale global reads. Carries mtIteration for NGLL filtering."""
+    mtIteration: Optional[str] = None
+
+    def __post_init__(self):
+        self.kind = 'gr_scale'
+
+
+@dataclass
+class SkipOp(BaseOp):
+    """Skip guard: compare LoopCounter and branch."""
+    compare: str = ""
+    value: int = 0
+    target: str = ""
+
+    def __post_init__(self):
+        self.kind = 'skip'
+
+    @property
+    def tensor(self) -> str:
+        return f"{self.compare}:{self.value}:{self.target}"
+
+    def __str__(self):
+        return f"skip({self.tensor})"
+
+
+@dataclass
+class RefOp(BaseOp):
+    """Reference to another placement or AnnotatedOp."""
+    ref: object = None
+    ref_type: str = 'ref'
+
+    def __post_init__(self):
+        self.kind = self.ref_type
 
 
 @dataclass
@@ -294,7 +366,7 @@ class DepRef:
 class AnnotatedOp:
     """An operation with its before-dependencies."""
     kind: str        # 'MFMA', 'LR', 'GR', etc.
-    before: List[DepOp] = field(default_factory=list)
+    before: List[BaseOp] = field(default_factory=list)
     # Original placement reference
     placement: object = None
 
@@ -323,7 +395,7 @@ class EmittedModule:
     before: Optional[int] = None   # moduleId that must complete before this module
     opType: str = ""
     label: str = ""                # human-readable label for debugging
-    source: object = None          # original placement or DepOp, for populate_instructions
+    source: object = None          # original placement or BaseOp, for populate_instructions
 
 
 # ── Main scheduler class ───────────────────────────────────
@@ -958,7 +1030,7 @@ class SubtileBasedLogicalScheduler:
         """Annotate each placement with its raw before-dependencies.
 
         Populates the `before` field on MFMAPlacement, LRPlacement, and
-        GRPlacement objects in self._partitions. Each lr_ref/gr_ref DepOp
+        GRPlacement objects in self._partitions. Each lr_ref/gr_ref BaseOp
         is resolved to point at the specific placement it depends on.
 
         Iterates all partitions. Two-pass per partition:
@@ -1329,7 +1401,7 @@ class SubtileBasedLogicalScheduler:
                     slot.mfma.deps = same
                     slot.mfma.preOps = []
                     if cross:
-                        slot.mfma.preOps.append(DepOp(kind='wait_lr'))
+                        slot.mfma.preOps.append(WaitLROp())
 
                 # ── LRs ──
                 for lr in slot.lrs:
@@ -1340,8 +1412,8 @@ class SubtileBasedLogicalScheduler:
                         dep = cross[0]
                         counts = self._compute_inflight_loads(
                             pi, lr.subIterK_slot, dep.ref.tensor, dep)
-                        lr.preOps.append(DepOp(kind='wait_gr_sync',
-                                               wait_gr_counts=counts))
+                        lr.preOps.append(WaitGROp(wait_gr_counts=counts,
+                                                  has_sync=True))
 
                 # ── GRs ──
                 for gr in slot.grs:
@@ -1350,7 +1422,7 @@ class SubtileBasedLogicalScheduler:
                     has_lr_dep = any(
                         isinstance(d.ref, LRPlacement)
                         for d in same + cross)
-                    gr.preOps = [DepOp(kind='wait_lr_sync')] if has_lr_dep else []
+                    gr.preOps = [WaitLROp(has_sync=True)] if has_lr_dep else []
 
         self._completed.add('remove_deps')
 
@@ -1360,7 +1432,7 @@ class SubtileBasedLogicalScheduler:
         Walks all LR and GR placements in global execution order
         (partition 0 slots → partition 1 slots → ..., within each slot: LR then GR).
         Tracks per-tensor the last-seen mtIteration. When a tensor's mtIteration
-        changes, inserts a DepOp into that placement's preOps:
+        changes, inserts a BaseOp into that placement's preOps:
           - lr_inc for LR placements
           - gr_inc for GR placements
         """
@@ -1380,7 +1452,7 @@ class SubtileBasedLogicalScheduler:
                     if tensor not in first_lr:
                         first_lr[tensor] = lr
                     if tensor in last_lr_mt and last_lr_mt[tensor] != mt:
-                        lr.preOps.append(DepOp(kind='lr_inc', tensor=tensor))
+                        lr.preOps.append(LRIncOp(tensor=tensor))
                         lr_inc_tensors.add(tensor)
                     last_lr_mt[tensor] = mt
                 for gr in slot.grs:
@@ -1389,7 +1461,7 @@ class SubtileBasedLogicalScheduler:
                     prev_mt = last_gr_mt.get(tensor, last_lr_mt.get(tensor))
                     if prev_mt is not None and prev_mt != mt:
                         if gr.tiles.tileId_start == 0:
-                            gr.preOps.append(DepOp(kind='gr_inc', tensor=tensor))
+                            gr.preOps.append(GRIncOp(tensor=tensor))
                     last_gr_mt[tensor] = mt
 
         # Handle wrap-around: tensors with a single LR per iteration (e.g. SA, SB)
@@ -1399,7 +1471,7 @@ class SubtileBasedLogicalScheduler:
             if tensor not in lr_inc_tensors:
                 last = last_gr_mt.get(tensor, last_lr_mt.get(tensor))
                 if last is not None and last != lr.mtIteration:
-                    lr.preOps.append(DepOp(kind='lr_inc', tensor=tensor))
+                    lr.preOps.append(LRIncOp(tensor=tensor))
 
         self._completed.add('gr_inc')
 
@@ -1408,25 +1480,25 @@ class SubtileBasedLogicalScheduler:
     _LR_GR_ORDER = ['A', 'B', 'SA', 'SB']
 
     @staticmethod
-    def _merge_preops(all_preops: List[List['DepOp']]) -> List['DepOp']:
+    def _merge_preops(all_preops: List[List['BaseOp']]) -> List['BaseOp']:
         """Merge preOps from multiple placements.
 
-        Combines wait_gr/wait_gr_sync counts into a single DepOp, deduplicates barrier ops
+        Combines wait_gr/wait_gr_sync counts into a single BaseOp, deduplicates barrier ops
         (wait_lr_sync, wait_lr), and collects the rest.
         """
         wait_gr_ops = []
         has_wait_gr_sync = False
-        seen_kinds = set()
+        seen_wait_lr = False
         others = []
         for preops in all_preops:
             for op in preops:
-                if op.kind in ('wait_gr', 'wait_gr_sync') and op.wait_gr_counts:
-                    if op.kind == 'wait_gr_sync':
+                if isinstance(op, WaitGROp) and op.wait_gr_counts:
+                    if op.has_sync:
                         has_wait_gr_sync = True
                     wait_gr_ops.append(op.wait_gr_counts)
-                elif op.kind in ('wait_lr_sync', 'wait_lr'):
-                    if op.kind not in seen_kinds:
-                        seen_kinds.add(op.kind)
+                elif isinstance(op, WaitLROp):
+                    if not seen_wait_lr:
+                        seen_wait_lr = True
                         others.append(op)
                 else:
                     others.append(op)
@@ -1435,8 +1507,8 @@ class SubtileBasedLogicalScheduler:
             merged_counts = WaitGRCounts()
             for t in ('A', 'B', 'SA', 'SB'):
                 setattr(merged_counts, t, min(getattr(c, t) for c in wait_gr_ops))
-            merged_kind = 'wait_gr_sync' if has_wait_gr_sync else 'wait_gr'
-            result.append(DepOp(kind=merged_kind, wait_gr_counts=merged_counts))
+            result.append(WaitGROp(wait_gr_counts=merged_counts,
+                                   has_sync=has_wait_gr_sync))
         result.extend(others)
         return result
 
@@ -1497,8 +1569,8 @@ class SubtileBasedLogicalScheduler:
                         if seen_wait_lr_sync:
                             gr.preOps = [
                                 op for op in gr.preOps
-                                if op.kind != 'wait_lr_sync']
-                        elif any(op.kind == 'wait_lr_sync'
+                                if not (isinstance(op, WaitLROp) and op.has_sync)]
+                        elif any(isinstance(op, WaitLROp) and op.has_sync
                                  for op in gr.preOps):
                             seen_wait_lr_sync = True
 
@@ -1548,7 +1620,7 @@ class SubtileBasedLogicalScheduler:
                     continue
                 first_gr = slot.grs[0]
                 has_wait_lr_sync = any(
-                    op.kind == 'wait_lr_sync' for op in first_gr.preOps)
+                    isinstance(op, WaitLROp) and op.has_sync for op in first_gr.preOps)
                 if not has_wait_lr_sync:
                     continue
                 has_deps = bool(first_gr.deps)
@@ -1562,19 +1634,19 @@ class SubtileBasedLogicalScheduler:
                     continue
                 prev_first_gr = prev_slot.grs[0]
                 prev_has_wait_lr_sync = any(
-                    op.kind == 'wait_lr_sync' for op in prev_first_gr.preOps)
+                    isinstance(op, WaitLROp) and op.has_sync for op in prev_first_gr.preOps)
                 prev_deps_on_lrs = bool(prev_first_gr.deps)
                 if prev_has_wait_lr_sync and prev_deps_on_lrs:
                     first_gr.preOps = [
                         op for op in first_gr.preOps
-                        if op.kind != 'wait_lr_sync']
+                        if not (isinstance(op, WaitLROp) and op.has_sync)]
 
         # Downgrade remaining wait_lr_sync → sync on GRs with no LR deps.
         # The MFMA in the same subIterK already ensures wait_lr.
         for pi, slots in enumerate(self._partitions):
             for slot in slots:
                 for gr in slot.grs:
-                    if not any(op.kind == 'wait_lr_sync' for op in gr.preOps):
+                    if not any(isinstance(op, WaitLROp) and op.has_sync for op in gr.preOps):
                         continue
                     has_lr_dep = False
                     node = gr
@@ -1587,7 +1659,7 @@ class SubtileBasedLogicalScheduler:
                     if has_lr_dep:
                         continue
                     gr.preOps = [
-                        DepOp(kind='sync') if op.kind == 'wait_lr_sync' else op
+                        SyncOp() if (isinstance(op, WaitLROp) and op.has_sync) else op
                         for op in gr.preOps]
 
         self._completed.add('remove_wait_lr_sync')
@@ -1674,37 +1746,28 @@ class SubtileBasedLogicalScheduler:
 
                     # preOps
                     for preOp in placement.preOps:
-                        if preOp.kind == 'wait_gr':
-                            # Standalone: no incoming before-link, but later
-                            # deps chain from it
+                        if isinstance(preOp, WaitGROp):
                             depId = add('wait_gr', str(preOp), source=preOp)
                             prevId = depId
                             if firstPreOpId is None:
                                 firstPreOpId = depId
+                            if preOp.has_sync:
+                                depId = add('sync', 'sync',
+                                            source=SyncOp())
+                                setBefore(depId, prevId)
+                                prevId = depId
+                                lastDepId = depId
                             continue
-                        elif preOp.kind == 'wait_gr_sync':
-                            # Expand to wait_gr + sync
-                            depId = add('wait_gr', str(preOp), source=preOp)
-                            prevId = depId
-                            if firstPreOpId is None:
-                                firstPreOpId = depId
-                            depId = add('sync', 'sync',
-                                        source=DepOp(kind='sync'))
-                            setBefore(depId, prevId)
-                            prevId = depId
-                            lastDepId = depId
-                            continue
-                        elif preOp.kind == 'wait_lr_sync':
-                            # Expand to wait_lr + sync
+                        elif isinstance(preOp, WaitLROp) and preOp.has_sync:
                             depId = add('wait_lr', 'wait_lr',
-                                        source=DepOp(kind='wait_lr'))
+                                        source=WaitLROp())
                             setBefore(depId, prevId)
                             prevId = depId
                             lastDepId = depId
                             if firstPreOpId is None:
                                 firstPreOpId = depId
                             depId = add('sync', 'sync',
-                                        source=DepOp(kind='sync'))
+                                        source=SyncOp())
                             setBefore(depId, prevId)
                             prevId = depId
                             lastDepId = depId
@@ -1787,12 +1850,10 @@ class SubtileBasedLogicalScheduler:
                         removed.add(em.moduleId)
                     elif em.opType == 'gr_inc':
                         removed.add(em.moduleId)
-                    elif em.opType == 'gr_scale' and isinstance(src, DepOp) \
-                            and hasattr(src, 'mtIteration') \
-                            and getattr(src, 'mtIteration', None) == 'n+2':
+                    elif isinstance(src, GRScaleOp) and src.mtIteration == 'n+2':
                         removed.add(em.moduleId)
                     elif em.opType == 'wait_gr':
-                        if isinstance(src, DepOp) and src.wait_gr_counts is not None:
+                        if isinstance(src, WaitGROp) and src.wait_gr_counts is not None:
                             src.wait_gr_counts = WaitGRCounts()
                 part_ngll.append(self._rewire_before(new_emitted, removed))
             ngll.append(part_ngll)
@@ -1827,7 +1888,7 @@ class SubtileBasedLogicalScheduler:
                 # Also zero inflight counts on remaining WaitGR(n).
                 wait_gr_to_remove = set()
                 for em in new_emitted:
-                    if em.opType == 'wait_gr' and isinstance(em.source, DepOp):
+                    if em.opType == 'wait_gr' and isinstance(em.source, WaitGROp):
                         cnts = em.source.wait_gr_counts
                         if cnts is not None and cnts.A == 0 and cnts.B == 0 \
                                 and cnts.SA == 0 and cnts.SB == 0:
@@ -1857,7 +1918,7 @@ class SubtileBasedLogicalScheduler:
 
     @staticmethod
     def _to_emitted(ops) -> List[EmittedModule]:
-        """Wrap GRPlacement/LRPlacement/DepOp objects into EmittedModules."""
+        """Wrap GRPlacement/LRPlacement/BaseOp objects into EmittedModules."""
         result = []
         for mid, op in enumerate(ops):
             if isinstance(op, GRPlacement):
@@ -1870,12 +1931,12 @@ class SubtileBasedLogicalScheduler:
                 em = EmittedModule(moduleId=mid, opType='lr',
                                    label=f'LR {op.tensor} (MT {op.mtIteration}, subIterK {t.fmt_k()}) ids {t.fmt_tiles()}',
                                    source=op)
-            elif isinstance(op, DepOp):
-                if op.kind == 'skip':
-                    parts = op.tensor.split(':')
-                    label = f'skip {parts[0]} {parts[1]} → {parts[2]}'
+            elif isinstance(op, BaseOp):
+                if isinstance(op, SkipOp):
+                    label = f'skip {op.compare} {op.value} → {op.target}'
                 else:
-                    label = f'{op.kind.upper()} {op.tensor}'.strip()
+                    tensor = getattr(op, 'tensor', '')
+                    label = f'{op.kind.upper()} {tensor}'.strip()
                 em = EmittedModule(moduleId=mid, opType=op.kind,
                                    label=label, source=op)
             else:
@@ -1919,10 +1980,9 @@ class SubtileBasedLogicalScheduler:
             placements.append(lr)
         return placements
 
-    def _make_tensor_depops(self, kind: str) -> List[DepOp]:
-        """Create a DepOp of the given kind for each tensor."""
-        return [DepOp(kind=kind, tensor=tensor)
-                for tensor in self.tensors]
+    def _make_tensor_depops(self, cls) -> List[BaseOp]:
+        """Create a BaseOp subclass instance for each tensor."""
+        return [cls(tensor=tensor) for tensor in self.tensors]
 
     def build_preloop(self) -> List[List[List[EmittedModule]]]:
         """Build preloop: pipeline initialization sequence before mainloop.
@@ -1960,15 +2020,15 @@ class SubtileBasedLogicalScheduler:
 
         emitted = self._to_emitted([
             *self._preloop_make_gr('0', all_tiles),
-            *self._make_tensor_depops('gr_inc'),
-            DepOp(kind='wait_gr', wait_gr_counts=WaitGRCounts()),
-            DepOp(kind='sync'),
+            *self._make_tensor_depops(GRIncOp),
+            WaitGROp(wait_gr_counts=WaitGRCounts()),
+            SyncOp(),
             *self._preloop_make_lr(lr_tiles),
-            DepOp(kind='wait_lr'),
-            DepOp(kind='skip', tensor='LE:1:NLL'),
+            WaitLROp(),
+            SkipOp(compare='LE', value=1, target='NLL'),
             *self._preloop_make_gr('1', part0_tiles),
-            # *self._make_tensor_depops('gr_inc'),
-            DepOp(kind='skip', tensor='LE:2:NGLL'),
+            # *self._make_tensor_depops(GRIncOp),
+            SkipOp(compare='LE', value=2, target='NGLL'),
         ])
 
         self._preloop_emitted = [[emitted]]
