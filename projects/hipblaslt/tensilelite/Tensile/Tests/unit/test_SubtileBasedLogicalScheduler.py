@@ -24,7 +24,7 @@ from Tensile.Components.SubtileBasedLogicalScheduler import (
     EmittedModule,
     LRPlacement,
     GRPlacement,
-    DepRef,
+    Dep,
     WaitGRCounts,
 )
 from unittest.mock import MagicMock

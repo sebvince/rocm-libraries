@@ -21,7 +21,7 @@ The schedule is built in these passes:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import copy
 import io
 import math
@@ -138,7 +138,7 @@ class MFMAPlacement:
     subIterK: int
     tileA: MFMATileRange       # A tiles consumed
     tileB: MFMATileRange       # B tiles consumed
-    deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
+    deps: List['Dep'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     vgpr_tile_maps: Dict[str, List[dict]] = field(default_factory=dict)  # {tensor: [{groupIdx: vgprTileId}]} per unroll iter
 
@@ -151,7 +151,7 @@ class LRPlacement:
     tiles: MFMATileRange
     subIterK_slot: int         # which subIterK this LR is placed in
     partition: int = 0         # which partition this LR belongs to
-    deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
+    deps: List['Dep'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     vgpr_tile_map: List[dict] = field(default_factory=list)  # [{tileId: vgprTileId}] per unroll iter
 
@@ -164,7 +164,7 @@ class GRPlacement:
     tiles: MFMATileRange
     subIterK_slot: int         # which subIterK this GR is placed in
     partition: int = 0         # which partition this GR belongs to
-    deps: List['DepRef'] = field(default_factory=list)      # populated by annotate_deps()
+    deps: List['Dep'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
 
 
@@ -281,9 +281,9 @@ class SkipOp(BaseOp):
 
 
 @dataclass
-class DepRef:
+class Dep:
     """Dependency on another placement (annotate_deps output)."""
-    ref: object     # LRPlacement or GRPlacement
+    ref: Union[LRPlacement, GRPlacement]
     mt_offset: int = 0  # 0 = same MT, -1 = prev MT, -2 = two MTs back, ...
 
 
@@ -1037,7 +1037,7 @@ class SubtileBasedLogicalScheduler:
                     deps_for_t = []
                     for lr in lr_by_tensor.get(t, []):
                         if _tiles_overlap(slot.mfma, t, lr.tiles):
-                            deps_for_t.append(DepRef(
+                            deps_for_t.append(Dep(
                                 ref=lr, mt_offset=_mt_offset(pi, k, 'MFMA', lr)))
                     slot.mfma.deps.extend(_dedup_deps(deps_for_t))
 
@@ -1047,7 +1047,7 @@ class SubtileBasedLogicalScheduler:
             for lr in slot.lrs:
                 for gr in gr_by_tensor.get(lr.tensor, []):
                     if _range_overlaps(lr.tiles, gr.tiles):
-                        lr.deps.append(DepRef(
+                        lr.deps.append(Dep(
                             ref=gr, mt_offset=_mt_offset(pi, k, 'LR', gr, consumer=lr)))
 
             # GR: depends on collision LR (LDS double-buffer)
@@ -1062,7 +1062,7 @@ class SubtileBasedLogicalScheduler:
                 for lr in lr_by_tensor.get(gr.tensor, []):
                     if _range_overlaps(lr.tiles, gr.tiles):
                         mt_off = target_data - _parse_mt(lr.mtIteration)
-                        gr.deps.append(DepRef(ref=lr, mt_offset=mt_off))
+                        gr.deps.append(Dep(ref=lr, mt_offset=mt_off))
                 if not gr.deps:
                     raise ValueError(
                         f"GR {gr.tensor} mt={gr.mtIteration} at slot {k} "
@@ -1196,7 +1196,7 @@ class SubtileBasedLogicalScheduler:
                 'SA': self.config.grSA, 'SB': self.config.grSB}[tensor]
 
     def _compute_inflight_loads(self, consumer_pi: int, consumer_slot: int,
-                                tensor: str, dep_ref: DepRef) -> WaitGRCounts:
+                                tensor: str, dep_ref: Dep) -> WaitGRCounts:
         """Count inflight GR atomic loads between a dep GR and the consumer.
 
         Walks backward through the flattened schedule (all partitions x subIterK)
@@ -1409,7 +1409,7 @@ class SubtileBasedLogicalScheduler:
                     # Build chain: each LR depends on the previous
                     for i in range(1, len(ordered_lrs)):
                         ordered_lrs[i].deps = [
-                            DepRef(ref=ordered_lrs[i - 1], mt_offset=0)]
+                            Dep(ref=ordered_lrs[i - 1], mt_offset=0)]
 
                 last_lr = ordered_lrs[-1] if ordered_lrs else None
 
@@ -1436,19 +1436,19 @@ class SubtileBasedLogicalScheduler:
                     # First GR: if any GR had deps, point to last LR
                     if any_deps and last_lr is not None:
                         ordered_grs[0].deps = [
-                            DepRef(ref=last_lr, mt_offset=0)]
+                            Dep(ref=last_lr, mt_offset=0)]
                     else:
                         ordered_grs[0].deps = []
 
                     # Build chain: each GR depends on the previous
                     for i in range(1, len(ordered_grs)):
                         ordered_grs[i].deps = [
-                            DepRef(ref=ordered_grs[i - 1], mt_offset=0)]
+                            Dep(ref=ordered_grs[i - 1], mt_offset=0)]
                 elif len(ordered_grs) == 1:
                     # Single GR: still consolidate dep to last LR if it had deps
                     if ordered_grs[0].deps and last_lr is not None:
                         ordered_grs[0].deps = [
-                            DepRef(ref=last_lr, mt_offset=0)]
+                            Dep(ref=last_lr, mt_offset=0)]
 
         self._completed.add('group_lr_gr')
 
@@ -1523,8 +1523,8 @@ class SubtileBasedLogicalScheduler:
 
         self._completed.add('remove_wait_lr_sync')
 
-    def _split_deps(self, deps: List[DepRef], consumer_pi: int,
-                    consumer_slot: int) -> Tuple[List[DepRef], List[DepRef]]:
+    def _split_deps(self, deps: List[Dep], consumer_pi: int,
+                    consumer_slot: int) -> Tuple[List[Dep], List[Dep]]:
         """Split deps into same-subIterK and cross-subIterK lists.
 
         A dep is "same subIterK" if mt_offset == 0 AND the producer is in the
@@ -1554,7 +1554,7 @@ class SubtileBasedLogicalScheduler:
           - wait_gr is standalone (no incoming before-link), but later deps chain from it
           - wait_gr_sync expands to two modules: wait_gr then sync
           - wait_lr_sync expands to two modules: wait_lr then sync
-          - Same-subIterK DepRef deps become ordering constraints (no new module)
+          - Same-subIterK Dep deps become ordering constraints (no new module)
         """
         if 'remove_wait_lr_sync' not in self._completed:
             self.remove_unnecessary_wait_lr_sync()
@@ -1639,7 +1639,7 @@ class SubtileBasedLogicalScheduler:
                             if firstPreOpId is None:
                                 firstPreOpId = depId
 
-                    # deps (same-subIterK DepRefs — ordering constraints)
+                    # deps (same-subIterK Deps — ordering constraints)
                     # Wire dep refs as roots of the preOp chain so the
                     # dependency is not lost when preOps are present.
                     for dep in placement.deps:
@@ -2354,8 +2354,8 @@ class SubtileBasedLogicalScheduler:
                 buf.write(f"            - {dep_str}\n")
     
 
-    def _format_dep_ref(self, dep: DepRef) -> str:
-        """Format a DepRef for display."""
+    def _format_dep_ref(self, dep: Dep) -> str:
+        """Format a Dep for display."""
         p = dep.ref
         slot = p.subIterK_slot if hasattr(p, 'subIterK_slot') else '?'
         part = p.partition if hasattr(p, 'partition') else 0
