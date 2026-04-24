@@ -575,15 +575,11 @@ class SubtileBasedLogicalScheduler:
                 self.free.append(vid)
                 self.active_count -= 1
 
-        tensor_names = ['A', 'B']
-        if cfg.hasScale:
-            tensor_names += ['SA', 'SB']
-
-        max_peaks = {t: 0 for t in tensor_names}
+        max_peaks = {t: 0 for t in self.tensors}
         carry_active = {}
         all_next_iters = []     # next_iter from each iteration, for cycle detection
 
-        pools = {t: _FreeList() for t in tensor_names}
+        pools = {t: _FreeList() for t in self.tensors}
 
         for unroll_iter in range(MAX_UNROLL):
             if unroll_iter == 0:
@@ -592,7 +588,7 @@ class SubtileBasedLogicalScheduler:
                 active = dict(carry_active)
                 # Reset active_count to match carry_active (tiles that survived
                 # as live from the previous iteration's wrapping LRs).
-                for t in tensor_names:
+                for t in self.tensors:
                     pools[t].active_count = sum(
                         1 for key in active if key[0] == t)
 
@@ -678,7 +674,7 @@ class SubtileBasedLogicalScheduler:
                         del active[key]
 
             # Track max peaks across iterations
-            for t in tensor_names:
+            for t in self.tensors:
                 max_peaks[t] = max(max_peaks[t], pools[t].peak)
 
             # Check convergence: if this iteration's next_iter matches
@@ -1084,10 +1080,7 @@ class SubtileBasedLogicalScheduler:
             # Uses lr_by_tensor (all LRs across partitions) so that a more recent
             # LR loading a different subIterK still subsumes older data deps.
             if slot.mfma:
-                tensor_names = ['A', 'B']
-                if cfg.hasScale:
-                    tensor_names += ['SA', 'SB']
-                for t in tensor_names:
+                for t in self.tensors:
                     deps_for_t = []
                     for lr in lr_by_tensor.get(t, []):
                         if _tiles_overlap(slot.mfma, t, lr.tiles):
@@ -1146,11 +1139,7 @@ class SubtileBasedLogicalScheduler:
         def _dep_exec_order(dep):
             return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
 
-        tensors = ['A', 'B']
-        if self.config.hasScale:
-            tensors += ['SA', 'SB']
-
-        for tensor in tensors:
+        for tensor in self.tensors:
             lr_with_gr_deps = []
             for pi, slots in enumerate(self._partitions):
                 for slot in slots:
