@@ -21,10 +21,50 @@ The schedule is built in these passes:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import Dict, List, Optional, Tuple, Union
 import copy
 import io
 import math
+
+
+class Pass(IntEnum):
+    """Scheduler passes in dependency order.
+
+    The numeric value defines topological order. The main pipeline is linear
+    (each pass depends on the previous), except VGPR_TILES which forks off
+    LR independently of GR.
+    """
+    LR                  = 0
+    VGPR_TILES          = 1
+    GR                  = 2
+    DEPS                = 3
+    REMOVE_GR_DEPS      = 4
+    REMOVE_LR_DEPS      = 5
+    REMOVE_DEPS         = 6
+    GR_INC              = 7
+    GROUP_LR_GR         = 8
+    REMOVE_WAIT_LR_SYNC = 9
+    EMIT                = 10
+    BUILD               = 11
+    POPULATE            = 12
+
+
+_PASS_PIPELINE = {
+    Pass.LR:                   ('place_LRs',                        []),
+    Pass.VGPR_TILES:           ('assign_vgpr_tiles',                [Pass.LR]),
+    Pass.GR:                   ('place_GRs',                        [Pass.LR]),
+    Pass.DEPS:                 ('annotate_deps',                    [Pass.GR]),
+    Pass.REMOVE_GR_DEPS:       ('remove_unnecessary_gr_deps',       [Pass.DEPS]),
+    Pass.REMOVE_LR_DEPS:       ('remove_unnecessary_lr_deps',       [Pass.REMOVE_GR_DEPS]),
+    Pass.REMOVE_DEPS:          ('remove_cross_deps',                [Pass.REMOVE_LR_DEPS]),
+    Pass.GR_INC:               ('insert_gr_lr_inc',                 [Pass.REMOVE_DEPS]),
+    Pass.GROUP_LR_GR:          ('group_lr_gr',                      [Pass.GR_INC]),
+    Pass.REMOVE_WAIT_LR_SYNC:  ('remove_unnecessary_wait_lr_sync', [Pass.GROUP_LR_GR]),
+    Pass.EMIT:                 ('emit',                             [Pass.REMOVE_WAIT_LR_SYNC]),
+    Pass.BUILD:                ('build',                            [Pass.EMIT]),
+    Pass.POPULATE:             ('populate_instructions',            []),
+}
 
 
 TENSOR_SIDE = {'A': 'A', 'B': 'B', 'SA': 'A', 'SB': 'B'}
@@ -350,12 +390,17 @@ class SubtileBasedLogicalScheduler:
     def __init__(self, config: SchedulerConfig):
         self.config = config
         self.tensors: List[str] = ['A', 'B'] + (['SA', 'SB'] if config.hasScale else [])
-        self._completed: set = set()   # tracks which passes have run: {'lr', 'vgpr_tiles', 'gr', 'deps', 'group', 'emit'}
+        self._completed: set = set()   # tracks which passes have run (Pass enum members)
         self._partitions: Optional[List[List[SubIterKSlot]]] = None  # shared mutable state across passes
         self._emitted: Optional[List[List[EmittedModule]]] = None
         self._preloop_emitted: Optional[List[List[List[EmittedModule]]]] = None
         self._ngll_emitted: Optional[List[List[List[EmittedModule]]]] = None
         self._nll_emitted: Optional[List[List[List[EmittedModule]]]] = None
+
+    def _ensure_pass(self, *prerequisites: Pass) -> None:
+        for p in prerequisites:
+            if p not in self._completed:
+                getattr(self, _PASS_PIPELINE[p][0])()
 
     # ── Place LRs ─────────────────────────────────────────
 
@@ -420,7 +465,7 @@ class SubtileBasedLogicalScheduler:
                     loaded_ranges[side] = {cur[side], nxt[side]}
 
         self._partitions = partitions
-        self._completed.add('lr')
+        self._completed.add(Pass.LR)
         return partitions
 
     def _place_LRs_for_partition(self, cur: tuple, nxt: tuple,
@@ -537,8 +582,7 @@ class SubtileBasedLogicalScheduler:
         Sets self.tile_peaks (per-tensor max across unrolls),
         self.needs_unrolling, self.unroll_factor.
         """
-        if 'lr' not in self._completed:
-            self.place_LRs()
+        self._ensure_pass(Pass.LR)
 
         cfg = self.config
         numK = cfg.numSubIterK
@@ -699,7 +743,7 @@ class SubtileBasedLogicalScheduler:
         self.needs_unrolling = self.unroll_factor > 1
         self.tile_peaks = max_peaks
 
-        self._completed.add('vgpr_tiles')
+        self._completed.add(Pass.VGPR_TILES)
 
     # ── Place GRs ─────────────────────────────────────────
 
@@ -899,8 +943,7 @@ class SubtileBasedLogicalScheduler:
          - Overall loads are spread accross all subIterKs of all partitions.
 
         """
-        if 'lr' not in self._completed:
-            self.place_LRs()
+        self._ensure_pass(Pass.LR)
 
         part_ranges = [self._partition_tile_range(pi)
                        for pi in range(self.config.numPartitions)]
@@ -915,7 +958,7 @@ class SubtileBasedLogicalScheduler:
         # Distribute GRs accross partition.
         self._distribute_grs(gr_list, lr_mt_n_info)
 
-        self._completed.add('gr')
+        self._completed.add(Pass.GR)
         return self._partitions[0]
 
     # ── Annotate dependencies ─────────────────────────────
@@ -937,8 +980,7 @@ class SubtileBasedLogicalScheduler:
         - LR depends on GR for same tensor (data must be in LDS)
         - GR depends on collision LR for same tensor (LDS double-buffer)
         """
-        if 'gr' not in self._completed:
-            self.place_GRs()
+        self._ensure_pass(Pass.GR)
         cfg = self.config
         numK = cfg.numSubIterK
 
@@ -962,7 +1004,7 @@ class SubtileBasedLogicalScheduler:
             self._annotate_deps_partition(pi, slots, cfg, lr_by_data,
                                           gr_by_tensor, lr_by_tensor)
 
-        self._completed.add('deps')
+        self._completed.add(Pass.DEPS)
 
     def _annotate_deps_partition(self, pi: int, slots: List[SubIterKSlot],
                                  cfg: SchedulerConfig, lr_by_data: list,
@@ -1109,8 +1151,7 @@ class SubtileBasedLogicalScheduler:
         Wraps around: the first LR's dep is compared against the last from the
         previous MT iteration (max dep exec_order shifted by mt_offset -1).
         """
-        if 'deps' not in self._completed:
-            self.annotate_deps()
+        self._ensure_pass(Pass.DEPS)
 
         def _dep_exec_order(dep):
             return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
@@ -1138,7 +1179,7 @@ class SubtileBasedLogicalScheduler:
                 else:
                     max_guaranteed = eo
 
-        self._completed.add('remove_gr_deps')
+        self._completed.add(Pass.REMOVE_GR_DEPS)
 
     # ── Remove unnecessary LR deps ────────────────────────
 
@@ -1152,8 +1193,7 @@ class SubtileBasedLogicalScheduler:
            LR dep (same tensor, same or later exec order), the current GR's dep
            is redundant because the previous GR already created that sync point.
         """
-        if 'remove_gr_deps' not in self._completed:
-            self.remove_unnecessary_gr_deps()
+        self._ensure_pass(Pass.REMOVE_GR_DEPS)
 
         def _dep_exec_order(dep):
             return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
@@ -1168,7 +1208,7 @@ class SubtileBasedLogicalScheduler:
                             gr_with_lr_deps.append((pi, slot.subIterK, gr, dep))
 
         if len(gr_with_lr_deps) <= 1:
-            self._completed.add('remove_lr_deps')
+            self._completed.add(Pass.REMOVE_LR_DEPS)
             return
 
         mfma_by_pos = {}
@@ -1209,7 +1249,7 @@ class SubtileBasedLogicalScheduler:
                 prev_gr_lr_eo[tensor] = eo
             prev_gr_pos = (pi, subIterK)
 
-        self._completed.add('remove_lr_deps')
+        self._completed.add(Pass.REMOVE_LR_DEPS)
 
     # ── Remove cross-subIterK deps ─────────────────────────
 
@@ -1272,8 +1312,7 @@ class SubtileBasedLogicalScheduler:
           - GR depending on LRs   → single wait_lr_sync
           - LR depending on GRs   → single wait_gr_sync with per-tensor inflight counts
         """
-        if 'remove_lr_deps' not in self._completed:
-            self.remove_unnecessary_lr_deps()
+        self._ensure_pass(Pass.REMOVE_LR_DEPS)
 
         for pi, slots in enumerate(self._partitions):
             for slot in slots:
@@ -1306,7 +1345,7 @@ class SubtileBasedLogicalScheduler:
                         for d in same + cross)
                     gr.preOps = [WaitLROp(has_sync=True)] if has_lr_dep else []
 
-        self._completed.add('remove_deps')
+        self._completed.add(Pass.REMOVE_DEPS)
 
     def insert_gr_lr_inc(self):
         """Insert gr_inc/lr_inc preOps at MacroTile iteration transitions.
@@ -1318,8 +1357,7 @@ class SubtileBasedLogicalScheduler:
           - lr_inc for LR placements
           - gr_inc for GR placements
         """
-        if 'remove_deps' not in self._completed:
-            self.remove_cross_deps()
+        self._ensure_pass(Pass.REMOVE_DEPS)
 
         last_lr_mt = {}  # tensor -> mtIteration for LR only
         last_gr_mt = {}  # tensor -> mtIteration for GR only
@@ -1356,7 +1394,7 @@ class SubtileBasedLogicalScheduler:
                 if last is not None and last != lr.mtIteration:
                     lr.preOps.append(LRIncOp(tensor=tensor))
 
-        self._completed.add('gr_inc')
+        self._completed.add(Pass.GR_INC)
 
     # ── Group LR/GR chains ─────────────────────────────────────
 
@@ -1410,8 +1448,7 @@ class SubtileBasedLogicalScheduler:
           own preOps; only redundant wait_lr_sync ops are removed (keep the
           first occurrence only).
         """
-        if 'gr_inc' not in self._completed:
-            self.insert_gr_lr_inc()
+        self._ensure_pass(Pass.GR_INC)
 
         order = self._LR_GR_ORDER
 
@@ -1474,7 +1511,7 @@ class SubtileBasedLogicalScheduler:
                         ordered_grs[0].deps = [
                             Dep(ref=last_lr, mt_offset=0)]
 
-        self._completed.add('group_lr_gr')
+        self._completed.add(Pass.GROUP_LR_GR)
 
     def remove_unnecessary_wait_lr_sync(self):
         """Remove redundant wait_lr_sync from GRs after grouping.
@@ -1494,8 +1531,7 @@ class SubtileBasedLogicalScheduler:
         to just sync — the wait_lr is already guaranteed by the MFMA op in the
         same subIterK.
         """
-        if 'group_lr_gr' not in self._completed:
-            self.group_lr_gr()
+        self._ensure_pass(Pass.GROUP_LR_GR)
 
         for pi, slots in enumerate(self._partitions):
             for si, slot in enumerate(slots):
@@ -1545,7 +1581,7 @@ class SubtileBasedLogicalScheduler:
                         SyncOp() if (isinstance(op, WaitLROp) and op.has_sync) else op
                         for op in gr.preOps]
 
-        self._completed.add('remove_wait_lr_sync')
+        self._completed.add(Pass.REMOVE_WAIT_LR_SYNC)
 
     def _split_deps(self, deps: List[Dep], consumer_pi: int,
                     consumer_slot: int) -> Tuple[List[Dep], List[Dep]]:
@@ -1580,8 +1616,7 @@ class SubtileBasedLogicalScheduler:
           - WaitLROp with has_sync expands to two modules: wait_lr then sync
           - Same-subIterK Dep deps become ordering constraints (no new module)
         """
-        if 'remove_wait_lr_sync' not in self._completed:
-            self.remove_unnecessary_wait_lr_sync()
+        self._ensure_pass(Pass.REMOVE_WAIT_LR_SYNC)
 
         all_partitions = []
         for pi, slots in enumerate(self._partitions):
@@ -1679,13 +1714,13 @@ class SubtileBasedLogicalScheduler:
             all_partitions.append(partition_emitted)
 
         self._emitted = all_partitions
-        self._completed.add('emit')
+        self._completed.add(Pass.EMIT)
         return all_partitions
 
     def build(self):
         """Build mainloop """
         self.emit()
-        self._completed.add('build')
+        self._completed.add(Pass.BUILD)
 
     # ── Loop variant derivation ────────────────────────────
 
@@ -1712,8 +1747,7 @@ class SubtileBasedLogicalScheduler:
 
         WaitGR inflight counts are zeroed since no new GRs are in flight.
         """
-        if 'emit' not in self._completed:
-            self.emit()
+        self._ensure_pass(Pass.EMIT)
 
         ngll = []
         for partition_emitted in self._emitted:
@@ -1739,8 +1773,7 @@ class SubtileBasedLogicalScheduler:
     def build_nll(self) -> List[List[List[EmittedModule]]]:
         """NLL (No Load Loop): mainloop without GR, LR(n+1), GR_INC, LR_INC,
         WaitGR(n+1)+Sync. Keeps LR(n), MFMAs, WaitGR(n) with zeroed counts."""
-        if 'emit' not in self._completed:
-            self.emit()
+        self._ensure_pass(Pass.EMIT)
 
         nll = []
         for partition_emitted in self._emitted:
@@ -1912,7 +1945,7 @@ class SubtileBasedLogicalScheduler:
                                         SCBranchSCC1, SBranch)
         from rocisa.container import sgpr
 
-        assert 'populate' in self._completed, \
+        assert Pass.POPULATE in self._completed, \
             "populate_instructions() must be called before emitAllLoops()"
 
         module = Module("AllLoops")
@@ -2014,8 +2047,7 @@ class SubtileBasedLogicalScheduler:
 
         Must be called after scheduling is complete.
         """
-        if 'vgpr_tiles' not in self._completed:
-            self.assign_vgpr_tiles()
+        self._ensure_pass(Pass.VGPR_TILES)
 
         cfg = self.config
 
@@ -2044,8 +2076,7 @@ class SubtileBasedLogicalScheduler:
           vgprTilesA/B:   List[RegisterTileInfo]
           vgprTilesSA/SB: List[RegisterTileInfo]
         """
-        if 'vgpr_tiles' not in self._completed:
-            self.assign_vgpr_tiles()
+        self._ensure_pass(Pass.VGPR_TILES)
 
         from Tensile.Components.SubtileBasedKernel import TileInfo
 
@@ -2149,7 +2180,7 @@ class SubtileBasedLogicalScheduler:
             emitter.populate(nll_copy, unroll_iter=nll_ui)
             self._nll_per_unroll.append(nll_copy)
 
-        self._completed.add('populate')
+        self._completed.add(Pass.POPULATE)
 
     # ── Print helpers ───────────────────────────────────────
 
