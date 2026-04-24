@@ -29,6 +29,10 @@ import math
 
 TENSOR_SIDE = {'A': 'A', 'B': 'B', 'SA': 'A', 'SB': 'B'}
 
+def fmt_mt(mt: int) -> str:
+    """Format MT iteration integer as display string: 0 → 'n', 1 → 'n+1', 2 → 'n+2'."""
+    return "n" if mt == 0 else f"n+{mt}"
+
 # ── Core primitives ─────────────────────────────────────────
 
 @dataclass
@@ -147,7 +151,7 @@ class MFMAPlacement:
 class LRPlacement:
     """Local Read placement for one tensor in one subIterK slot."""
     tensor: str                # 'A', 'B', 'SA', 'SB'
-    mtIteration: str           # 'n', 'n+1'
+    mtIteration: int           # 0 = current MT, 1 = next MT
     tiles: MFMATileRange
     subIterK_slot: int         # which subIterK this LR is placed in
     partition: int = 0         # which partition this LR belongs to
@@ -160,7 +164,7 @@ class LRPlacement:
 class GRPlacement:
     """Global Read placement for one tensor in one subIterK slot."""
     tensor: str                # 'A', 'B', 'SA', 'SB'
-    mtIteration: str           # 'n+2'
+    mtIteration: int           # 1 = next MT, 2 = two MTs ahead
     tiles: MFMATileRange
     subIterK_slot: int         # which subIterK this GR is placed in
     partition: int = 0         # which partition this GR belongs to
@@ -426,7 +430,7 @@ class SubtileBasedLogicalScheduler:
             for chunk_idx in range(num_chunks):
                 next_chunk = (chunk_idx + 1) % num_chunks
                 is_wrap = (next_chunk == 0)
-                lr_mt = "n+1" if is_last and is_wrap else "n"
+                lr_mt = 1 if is_last and is_wrap else 0
                 lr_k_start = next_chunk * k_gran
                 lr_k_end = lr_k_start + k_gran
                 base_slot = chunk_idx * k_gran
@@ -600,7 +604,7 @@ class SubtileBasedLogicalScheduler:
                     # ── LR writes: allocate new tiles ──
                     for lr in slot.lrs:
                         tensor = lr.tensor
-                        is_wrapping = lr.mtIteration != "n"
+                        is_wrapping = lr.mtIteration != 0
                         target = next_iter if is_wrapping else active
 
                         gran = lr_grans[tensor]
@@ -696,8 +700,7 @@ class SubtileBasedLogicalScheduler:
 
             target_pi = (pi + offsetPartition) % numP
             wraps = (pi + offsetPartition) >= numP
-            mt_offset = offsetMT + (1 if wraps else 0)
-            mt_str = f"n+{mt_offset}"
+            mt_val = offsetMT + (1 if wraps else 0)
 
             target_range = part_ranges[target_pi]
 
@@ -720,19 +723,19 @@ class SubtileBasedLogicalScheduler:
                     gr_k_start = (k // k_gran) * k_gran
                     gr_k_end = gr_k_start + k_gran
 
-                    key = (tensor, mt_str, gr_tile_start, gr_tile_end,
+                    key = (tensor, mt_val, gr_tile_start, gr_tile_end,
                            gr_k_start, gr_k_end)
                     if key in seen:
                         continue
                     seen.add(key)
-                    gr_list.append((tensor, mt_str, gr_tile_start,
+                    gr_list.append((tensor, mt_val, gr_tile_start,
                                     gr_tile_end, gr_k_start, gr_k_end,
                                     gr_gran))
 
         # Cross-MT dedup: if a tile/k range appears at both n+1 and n+2,
         # the n+1 load is redundant — the previous iteration's n+2 already
         # wrote the same data into LDS.  Remove the n+1 duplicate.
-        base_mt = f"n+{offsetMT}"
+        base_mt = offsetMT
         n2_keys = {(t, ts, te, ks, ke)
                    for t, mt, ts, te, ks, ke, _ in gr_list
                    if mt != base_mt}
@@ -745,7 +748,7 @@ class SubtileBasedLogicalScheduler:
             print(f"Phase 1: {len(gr_list)} GR entries")
             for i, (t, mt, ts, te, ks, ke, g) in enumerate(gr_list):
                 loads = ((te - ts) // g.mn) * ((ke - ks) // g.k)
-                print(f"  [{i}] {t:2s} {mt} tiles[{ts},{te - 1}] k[{ks},{ke - 1}] "
+                print(f"  [{i}] {t:2s} {fmt_mt(mt)} tiles[{ts},{te - 1}] k[{ks},{ke - 1}] "
                       f"gr_gran(mn={g.mn},k={g.k}) loads={loads}")
 
         return gr_list
@@ -760,7 +763,7 @@ class SubtileBasedLogicalScheduler:
         for pi, partition_slots in enumerate(self._partitions):
             for slot in partition_slots:
                 for lr in slot.lrs:
-                    if lr.mtIteration == "n":
+                    if lr.mtIteration == 0:
                         lr_mt_n_info.setdefault((pi, lr.tensor), []).append(
                             (slot.subIterK,
                              lr.tiles.subIterK_start,
@@ -768,15 +771,15 @@ class SubtileBasedLogicalScheduler:
         return lr_mt_n_info
 
     @staticmethod
-    def _has_lr_conflict(lr_mt_n_info, tensor, mt_str, pi, subIterK,
+    def _has_lr_conflict(lr_mt_n_info, tensor, mt_val, pi, subIterK,
                          gr_k_start, gr_k_end):
-        """Return True if placing GR(mt_str) at (pi, subIterK) conflicts.
+        """Return True if placing GR(mt_val) at (pi, subIterK) conflicts.
 
         GR(MT n+2) writes the same LDS buffer as MT n, so it conflicts
         only if a later LR(MT n) in the same partition accesses an
         overlapping subIterK range.
         """
-        if "n+2" not in mt_str:
+        if mt_val != 2:
             return False
         for lr_slot, lr_ks, lr_ke in lr_mt_n_info.get((pi, tensor), []):
             if lr_slot > subIterK and gr_k_start < lr_ke and lr_ks < gr_k_end:
@@ -797,10 +800,10 @@ class SubtileBasedLogicalScheduler:
 
         # 2a. Explode GR entries into atomic loads (1 load each)
         atoms = []
-        for tensor, mt_str, t_start, t_end, k_start, k_end, gr_gran in gr_list:
+        for tensor, mt_val, t_start, t_end, k_start, k_end, gr_gran in gr_list:
             mn = gr_gran.mn
             for pos in range(t_start, t_end, mn):
-                atoms.append((tensor, mt_str, pos, pos + mn, k_start, k_end))
+                atoms.append((tensor, mt_val, pos, pos + mn, k_start, k_end))
 
         loads_per_slot = len(atoms) // numSlots
 
@@ -808,12 +811,12 @@ class SubtileBasedLogicalScheduler:
         #     each bucket maps to (partition=flat//numK, subIterK=flat%numK)
         buckets = [[] for _ in range(numSlots)]
         for atom in atoms:
-            tensor, mt_str, _, _, ks, ke = atom
+            tensor, mt_val, _, _, ks, ke = atom
             cur = 0
             while cur < numSlots - 1:
                 pi = cur // numK
                 subK = cur % numK
-                if (not self._has_lr_conflict(lr_mt_n_info, tensor, mt_str,
+                if (not self._has_lr_conflict(lr_mt_n_info, tensor, mt_val,
                                               pi, subK, ks, ke) and
                         len(buckets[cur]) < loads_per_slot):
                     break
@@ -828,7 +831,7 @@ class SubtileBasedLogicalScheduler:
                 si = flat % numK
                 if bucket:
                     items = ", ".join(
-                        f"{t} {mt} tile[{ts},{te-1}] k[{ks},{ke-1}]"
+                        f"{t} {fmt_mt(mt)} tile[{ts},{te-1}] k[{ks},{ke-1}]"
                         for t, mt, ts, te, ks, ke in bucket)
                     print(f"  P{pi} s{si}: {len(bucket)} atoms — {items}")
                 else:
@@ -840,18 +843,18 @@ class SubtileBasedLogicalScheduler:
             si = flat % numK
             target_slot = self._partitions[pi][si]
             for atom in bucket:
-                tensor, mt_str, ts, te, ks, ke = atom
+                tensor, mt_val, ts, te, ks, ke = atom
                 if target_slot.grs:
                     prev = target_slot.grs[-1]
                     if (prev.tensor == tensor and
-                            prev.mtIteration == mt_str and
+                            prev.mtIteration == mt_val and
                             prev.tiles.subIterK_start == ks and
                             prev.tiles.subIterK_end == ke and
                             prev.tiles.tileId_end == ts):
                         prev.tiles = MFMATileRange(ks, ke, prev.tiles.tileId_start, te)
                         continue
                 target_slot.grs.append(GRPlacement(
-                    tensor=tensor, mtIteration=mt_str,
+                    tensor=tensor, mtIteration=mt_val,
                     tiles=MFMATileRange(ks, ke, ts, te),
                     subIterK_slot=si,
                     partition=pi))
@@ -971,10 +974,6 @@ class SubtileBasedLogicalScheduler:
         # and slots run in order 0, 1, 2, ...
         _order = {'MFMA': 0, 'LR': 1, 'GR': 2}
 
-        def _parse_mt(mt_str):
-            """'n' → 0, 'n+1' → 1, 'n+2' → 2."""
-            return 0 if mt_str == "n" else int(mt_str.split('+')[1])
-
         def _slot_offset(consumer_partition, consumer_slot, consumer_type, producer):
             """Offset from partition+slot ordering: 0 if producer ran first, -1 otherwise."""
             prod_partition = producer.partition
@@ -991,14 +990,13 @@ class SubtileBasedLogicalScheduler:
             return -1 if _order[prod_type] >= _order[consumer_type] else 0
 
         def _mt_offset(consumer_partition, consumer_slot, consumer_type, producer, consumer=None):
-            # MFMA→LR: MFMA always consumes mt="n" (offset 0).
+            # MFMA→LR: MFMA always consumes mt=0 (current).
             if consumer_type == 'MFMA' and isinstance(producer, LRPlacement):
-                mt_off = _parse_mt(producer.mtIteration)
-                if mt_off > 0:
-                    return -mt_off
+                if producer.mtIteration > 0:
+                    return -producer.mtIteration
             # LR→GR: mt difference determines how many iterations back.
             if consumer_type == 'LR' and isinstance(producer, GRPlacement) and consumer:
-                diff = _parse_mt(producer.mtIteration) - _parse_mt(consumer.mtIteration)
+                diff = producer.mtIteration - consumer.mtIteration
                 if diff != 0:
                     return -diff
             # Same effective mt: partition+slot ordering decides.
@@ -1052,20 +1050,20 @@ class SubtileBasedLogicalScheduler:
 
             # GR: depends on collision LR (LDS double-buffer)
             # GR(n+x) collides with LR(n+x-2) — same buffer, period 2.
-            # target_data = parse_mt(gr.mt) - 2. For each LR of same tensor,
-            # mt_offset = target_data - parse_mt(lr.mt). Dedup keeps latest.
-            #   GR(n+2)→LR(n):   mt_offset = 0   (same iteration)
-            #   GR(n+2)→LR(n+1): mt_offset = -1  (prev iter LR(n+1) handled n)
-            #   GR(n+1)→LR(n):   mt_offset = -1  (prev iter LR(n) handled n-1)
+            # target_data = gr.mtIteration - 2. For each LR of same tensor,
+            # mt_offset = target_data - lr.mtIteration. Dedup keeps latest.
+            #   GR(2)→LR(0):  mt_offset = 0   (same iteration)
+            #   GR(2)→LR(1):  mt_offset = -1  (prev iter LR(1) handled n)
+            #   GR(1)→LR(0):  mt_offset = -1  (prev iter LR(0) handled n-1)
             for gr in slot.grs:
-                target_data = _parse_mt(gr.mtIteration) - 2
+                target_data = gr.mtIteration - 2
                 for lr in lr_by_tensor.get(gr.tensor, []):
                     if _range_overlaps(lr.tiles, gr.tiles):
-                        mt_off = target_data - _parse_mt(lr.mtIteration)
+                        mt_off = target_data - lr.mtIteration
                         gr.deps.append(Dep(ref=lr, mt_offset=mt_off))
                 if not gr.deps:
                     raise ValueError(
-                        f"GR {gr.tensor} mt={gr.mtIteration} at slot {k} "
+                        f"GR {gr.tensor} mt={fmt_mt(gr.mtIteration)} at slot {k} "
                         f"has no overlapping LR(n) dependency")
 
         for slot in slots:
@@ -1326,6 +1324,7 @@ class SubtileBasedLogicalScheduler:
         # Handle wrap-around: tensors with a single LR per iteration (e.g. SA, SB)
         # still need lr_inc because the GR at end-of-iteration writes to the other
         # LDS buffer, and the next iteration's LR must swap to read from it.
+        # Safe: preOps are consumed by emit(), not during this walk.
         for tensor, lr in first_lr.items():
             if tensor not in lr_inc_tensors:
                 last = last_gr_mt.get(tensor, last_lr_mt.get(tensor))
@@ -1705,7 +1704,7 @@ class SubtileBasedLogicalScheduler:
                 for em in new_emitted:
                     src = em.source
                     if em.opType == 'gr' and isinstance(src, GRPlacement) \
-                            and src.mtIteration == 'n+2':
+                            and src.mtIteration == 2:
                         removed.add(em.moduleId)
                     elif em.opType == 'gr_inc':
                         removed.add(em.moduleId)
@@ -1736,20 +1735,14 @@ class SubtileBasedLogicalScheduler:
                     if em.opType == 'gr':
                         removed.add(em.moduleId)
                     elif em.opType == 'lr' and isinstance(src, LRPlacement) \
-                            and src.mtIteration == 'n+1':
+                            and src.mtIteration == 1:
                         removed.add(em.moduleId)
                     elif em.opType in ('gr_inc', 'lr_inc'):
                         removed.add(em.moduleId)
 
-                # Remove WaitGR(n+1) and its paired Sync.
-                # Also zero inflight counts on remaining WaitGR(n).
-                wait_gr_to_remove = set()
+                # Zero inflight counts on remaining WaitGR.
                 for em in new_emitted:
                     if em.opType == 'wait_gr' and isinstance(em.source, WaitGROp):
-                        cnts = em.source.wait_gr_counts
-                        if cnts is not None and cnts.A == 0 and cnts.B == 0 \
-                                and cnts.SA == 0 and cnts.SB == 0:
-                            pass
                         if em.moduleId not in removed:
                             em.source.wait_gr_counts = WaitGRCounts()
 
@@ -1781,12 +1774,12 @@ class SubtileBasedLogicalScheduler:
             if isinstance(op, GRPlacement):
                 t = op.tiles
                 em = EmittedModule(moduleId=mid, opType='gr',
-                                   label=f'GR {op.tensor} (MT {op.mtIteration}, subIterK {t.fmt_k()}) ids {t.fmt_tiles()}',
+                                   label=f'GR {op.tensor} (MT {fmt_mt(op.mtIteration)}, subIterK {t.fmt_k()}) ids {t.fmt_tiles()}',
                                    source=op)
             elif isinstance(op, LRPlacement):
                 t = op.tiles
                 em = EmittedModule(moduleId=mid, opType='lr',
-                                   label=f'LR {op.tensor} (MT {op.mtIteration}, subIterK {t.fmt_k()}) ids {t.fmt_tiles()}',
+                                   label=f'LR {op.tensor} (MT {fmt_mt(op.mtIteration)}, subIterK {t.fmt_k()}) ids {t.fmt_tiles()}',
                                    source=op)
             elif isinstance(op, BaseOp):
                 if isinstance(op, SkipOp):
@@ -1824,7 +1817,7 @@ class SubtileBasedLogicalScheduler:
         placements = []
         for tensor in self.tensors:
             lr = LRPlacement(
-                tensor=tensor, mtIteration='0',
+                tensor=tensor, mtIteration=0,
                 tiles=tiles[tensor],
                 subIterK_slot=0, partition=0)
             if tensor in first_mfma.vgpr_tile_maps:
@@ -1871,14 +1864,14 @@ class SubtileBasedLogicalScheduler:
             lr_tiles['SB'] = MFMATileRange(0, cfg.lrSB.k, *part0['B'])
 
         emitted = self._to_emitted([
-            *self._preloop_make_gr('0', all_tiles),
+            *self._preloop_make_gr(0, all_tiles),
             *self._make_tensor_depops(GRIncOp),
             WaitGROp(wait_gr_counts=WaitGRCounts()),
             SyncOp(),
             *self._preloop_make_lr(lr_tiles),
             WaitLROp(),
             SkipOp(compare='LE', value=1, target='NLL'),
-            *self._preloop_make_gr('1', part0_tiles),
+            *self._preloop_make_gr(1, part0_tiles),
             # *self._make_tensor_depops(GRIncOp),
             SkipOp(compare='LE', value=2, target='NGLL'),
         ])
@@ -2192,7 +2185,7 @@ class SubtileBasedLogicalScheduler:
                           f"A : {m.tileA.fmt_tiles()} , B : {m.tileB.fmt_tiles()}\n")
             for lr in slot.lrs:
                 t = self._fmt_tensor(lr.tensor)
-                buf.write(f"      LR {t} (MT {lr.mtIteration}, "
+                buf.write(f"      LR {t} (MT {fmt_mt(lr.mtIteration)}, "
                           f"subIterK {lr.tiles.fmt_k()}) "
                           f"{lr.tiles.fmt_tiles()}\n")
         return buf.getvalue()
@@ -2232,7 +2225,7 @@ class SubtileBasedLogicalScheduler:
                         if lr.vgpr_tile_map:
                             tile_str = f" tiles:{lr.vgpr_tile_map[ui]}"
                         t = self._fmt_tensor(lr.tensor)
-                        buf.write(f"      LR {t} (MT {lr.mtIteration}, "
+                        buf.write(f"      LR {t} (MT {fmt_mt(lr.mtIteration)}, "
                                   f"subIterK {lr.tiles.fmt_k()}) "
                                   f"{lr.tiles.fmt_tiles()}{tile_str}\n")
         return buf.getvalue()
@@ -2253,11 +2246,11 @@ class SubtileBasedLogicalScheduler:
                               f"B : {m.tileB.fmt_tiles()}\n")
                 for lr in slot.lrs:
                     t = self._fmt_tensor(lr.tensor)
-                    buf.write(f"      LR {t} (MT {lr.mtIteration}, "
+                    buf.write(f"      LR {t} (MT {fmt_mt(lr.mtIteration)}, "
                               f"subIterK {lr.tiles.fmt_k()}) "
                               f"{lr.tiles.fmt_tiles()}\n")
                 for gr in slot.grs:
-                    buf.write(f"      GR {gr.tensor} (MT {gr.mtIteration}, "
+                    buf.write(f"      GR {gr.tensor} (MT {fmt_mt(gr.mtIteration)}, "
                               f"subIterK {gr.tiles.fmt_k()}) "
                               f"ids {gr.tiles.fmt_tiles()}\n")
         return buf.getvalue()
@@ -2297,12 +2290,12 @@ class SubtileBasedLogicalScheduler:
             return label
         elif isinstance(placement, LRPlacement):
             t = self._fmt_tensor(placement.tensor)
-            label = (f"LR {t} (MT {placement.mtIteration}, "
+            label = (f"LR {t} (MT {fmt_mt(placement.mtIteration)}, "
                      f"subIterK {placement.tiles.fmt_k()}) "
                      f"{placement.tiles.fmt_tiles()}")
             return label
         elif isinstance(placement, GRPlacement):
-            return (f"GR {placement.tensor} (MT {placement.mtIteration}, "
+            return (f"GR {placement.tensor} (MT {fmt_mt(placement.mtIteration)}, "
                     f"subIterK {placement.tiles.fmt_k()}) "
                     f"ids {placement.tiles.fmt_tiles()}")
         return str(placement)

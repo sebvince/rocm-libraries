@@ -26,6 +26,7 @@ from Tensile.Components.SubtileBasedLogicalScheduler import (
     GRPlacement,
     Dep,
     WaitGRCounts,
+    fmt_mt,
 )
 from unittest.mock import MagicMock
 
@@ -212,7 +213,7 @@ def _assert_lr(slot, tensor, mt, k_start, k_end, tile_start, tile_end):
     assert lr.tiles.tileId_end == tile_end
 
 
-def _assert_gr(slot, tensor, k_start, k_end, tile_start, tile_end, mt='n+2', idx=0):
+def _assert_gr(slot, tensor, k_start, k_end, tile_start, tile_end, mt=2, idx=0):
     """Assert a GR placement matches expected values."""
     grs = [gr for gr in slot.grs if gr.tensor == tensor]
     assert len(grs) > idx, \
@@ -283,16 +284,16 @@ class TestPlaceLRs:
         assert s0.mfma.tileA.tileId_end == 8
         assert s0.mfma.tileB.tileId_end == 8
         _assert_slot_lrs(s0, ['A', 'B'])
-        _assert_lr(s0, 'A', 'n', 1, 2, 0, 8)
-        _assert_lr(s0, 'B', 'n', 1, 2, 0, 8)
+        _assert_lr(s0, 'A', 0,1, 2, 0, 8)
+        _assert_lr(s0, 'B', 0,1, 2, 0, 8)
 
         # subIterK=1: LR A, B (wrapping), SA, SB (wrapping)
         s1 = slots[1]
         assert s1.mfma.subIterK == 1
         _assert_slot_lrs(s1, ['A', 'B', 'SA', 'SB'])
-        _assert_lr(s1, 'A', 'n+1', 0, 1, 0, 8)
-        _assert_lr(s1, 'SA', 'n+1', 0, 2, 0, 8)
-        _assert_lr(s1, 'SB', 'n+1', 0, 2, 0, 8)
+        _assert_lr(s1, 'A', 1,0, 1, 0, 8)
+        _assert_lr(s1, 'SA', 1,0, 2, 0, 8)
+        _assert_lr(s1, 'SB', 1,0, 2, 0, 8)
 
     def test_1x1_k2_DU256(self):
         """MT=256x256, DU=256, FP4, LR A/B with k=2.
@@ -311,13 +312,13 @@ class TestPlaceLRs:
 
         # subIterK=0: LR A + LR SA (side grouping, all MT n+1)
         _assert_slot_lrs(slots[0], ['A', 'SA'])
-        _assert_lr(slots[0], 'A', 'n+1', 0, 2, 0, 8)
-        _assert_lr(slots[0], 'SA', 'n+1', 0, 2, 0, 8)
+        _assert_lr(slots[0], 'A', 1,0, 2, 0, 8)
+        _assert_lr(slots[0], 'SA', 1,0, 2, 0, 8)
 
         # subIterK=1: LR B + LR SB
         _assert_slot_lrs(slots[1], ['B', 'SB'])
-        _assert_lr(slots[1], 'B', 'n+1', 0, 2, 0, 8)
-        _assert_lr(slots[1], 'SB', 'n+1', 0, 2, 0, 8)
+        _assert_lr(slots[1], 'B', 1,0, 2, 0, 8)
+        _assert_lr(slots[1], 'SB', 1,0, 2, 0, 8)
 
     def test_1x1_k1_DU512(self):
         """MT=256x256, DU=512, FP4, LR k=1.
@@ -337,23 +338,23 @@ class TestPlaceLRs:
         # subIterK=0: A, B (k=1) + SA (k=2, A-side)
         _assert_slot_lrs(slots[0], ['A', 'B', 'SA'])
         assert slots[0].mfma.subIterK == 0
-        _assert_lr(slots[0], 'A', 'n', 1, 2, 0, 8)
-        _assert_lr(slots[0], 'SA', 'n', 2, 4, 0, 8)
+        _assert_lr(slots[0], 'A', 0,1, 2, 0, 8)
+        _assert_lr(slots[0], 'SA', 0,2, 4, 0, 8)
 
         # subIterK=1: A, B + SB (k=2, B-side)
         _assert_slot_lrs(slots[1], ['A', 'B', 'SB'])
-        _assert_lr(slots[1], 'A', 'n', 2, 3, 0, 8)
-        _assert_lr(slots[1], 'SB', 'n', 2, 4, 0, 8)
+        _assert_lr(slots[1], 'A', 0,2, 3, 0, 8)
+        _assert_lr(slots[1], 'SB', 0,2, 4, 0, 8)
 
         # subIterK=2: A, B only
         _assert_slot_lrs(slots[2], ['A', 'B'])
-        _assert_lr(slots[2], 'A', 'n', 3, 4, 0, 8)
+        _assert_lr(slots[2], 'A', 0,3, 4, 0, 8)
 
         # subIterK=3: all wrapping → MT n+1
         _assert_slot_lrs(slots[3], ['A', 'B', 'SA', 'SB'])
-        _assert_lr(slots[3], 'A', 'n+1', 0, 1, 0, 8)
-        _assert_lr(slots[3], 'SA', 'n+1', 0, 2, 0, 8)
-        _assert_lr(slots[3], 'SB', 'n+1', 0, 2, 0, 8)
+        _assert_lr(slots[3], 'A', 1,0, 1, 0, 8)
+        _assert_lr(slots[3], 'SA', 1,0, 2, 0, 8)
+        _assert_lr(slots[3], 'SB', 1,0, 2, 0, 8)
 
     def test_1x1_k2_DU512(self):
         """MT=256x256, DU=512, FP4, LR A/B with k=2.
@@ -369,17 +370,17 @@ class TestPlaceLRs:
 
         # Chunk 0: A+SA at s0, B+SB at s1 (MT n, loading [2,3])
         _assert_slot_lrs(slots[0], ['A', 'SA'])
-        _assert_lr(slots[0], 'A', 'n', 2, 4, 0, 8)
-        _assert_lr(slots[0], 'SA', 'n', 2, 4, 0, 8)
+        _assert_lr(slots[0], 'A', 0,2, 4, 0, 8)
+        _assert_lr(slots[0], 'SA', 0,2, 4, 0, 8)
         _assert_slot_lrs(slots[1], ['B', 'SB'])
-        _assert_lr(slots[1], 'B', 'n', 2, 4, 0, 8)
-        _assert_lr(slots[1], 'SB', 'n', 2, 4, 0, 8)
+        _assert_lr(slots[1], 'B', 0,2, 4, 0, 8)
+        _assert_lr(slots[1], 'SB', 0,2, 4, 0, 8)
 
         # Chunk 1: A+SA at s2, B+SB at s3 (MT n+1, loading [0,1])
         _assert_slot_lrs(slots[2], ['A', 'SA'])
-        _assert_lr(slots[2], 'A', 'n+1', 0, 2, 0, 8)
+        _assert_lr(slots[2], 'A', 1,0, 2, 0, 8)
         _assert_slot_lrs(slots[3], ['B', 'SB'])
-        _assert_lr(slots[3], 'B', 'n+1', 0, 2, 0, 8)
+        _assert_lr(slots[3], 'B', 1,0, 2, 0, 8)
 
     def test_2x2_k1_DU256(self):
         """MT=256x256, DU=256, FP4, k=1, 2x2 partition.
@@ -404,19 +405,19 @@ class TestPlaceLRs:
 
         # s0: A, B K-prefetch + SA wrapping for P1 tiles [4-7]
         _assert_slot_lrs(p0[0], ['A', 'B', 'SA'])
-        _assert_lr(p0[0], 'A', 'n', 1, 2, 0, 4)
-        _assert_lr(p0[0], 'B', 'n', 1, 2, 0, 4)
+        _assert_lr(p0[0], 'A', 0,1, 2, 0, 4)
+        _assert_lr(p0[0], 'B', 0,1, 2, 0, 4)
         lr_sa0 = _get_lr(p0[0], 'SA')
         assert lr_sa0.tiles.tileId_start == 4
         assert lr_sa0.tiles.tileId_end == 8
-        assert lr_sa0.mtIteration == "n"
+        assert lr_sa0.mtIteration == 0
 
         # s1: A wrapping only (B unchanged for P1)
         _assert_slot_lrs(p0[1], ['A'])
         lr_a1 = _get_lr(p0[1], 'A')
         assert lr_a1.tiles.tileId_start == 4
         assert lr_a1.tiles.tileId_end == 8
-        assert lr_a1.mtIteration == "n"
+        assert lr_a1.mtIteration == 0
 
         # P1: A[4-7],B[0-3] → B wrapping for P2
         p1 = partitions[1]
@@ -437,9 +438,9 @@ class TestPlaceLRs:
         lr_sa3 = _get_lr(p3[0], 'SA')
         assert lr_sa3.tiles.tileId_start == 0
         assert lr_sa3.tiles.tileId_end == 4
-        assert lr_sa3.mtIteration == "n+1"
+        assert lr_sa3.mtIteration == 1
         _assert_slot_lrs(p3[1], ['A', 'B', 'SB'])
-        _assert_lr(p3[1], 'A', 'n+1', 0, 1, 0, 4)
+        _assert_lr(p3[1], 'A', 1,0, 1, 0, 4)
 
     def test_2x2_k1_DU512(self):
         """MT=256x256, DU=512, FP4, k=1, 2x2 partition.
@@ -471,8 +472,8 @@ class TestPlaceLRs:
         assert len(p3[1].lrs) == 0
         _assert_slot_lrs(p3[2], ['SA'])
         _assert_slot_lrs(p3[3], ['A', 'B', 'SB'])
-        _assert_lr(p3[3], 'A', 'n+1', 0, 1, 0, 4)
-        _assert_lr(p3[3], 'B', 'n+1', 0, 1, 0, 4)
+        _assert_lr(p3[3], 'A', 1,0, 1, 0, 4)
+        _assert_lr(p3[3], 'B', 1,0, 1, 0, 4)
 
     def test_2x2_k2_DU256(self):
         """MT=256x256, DU=256, FP4, k=2, 2x2 partition.
@@ -490,7 +491,7 @@ class TestPlaceLRs:
         lr_a = _get_lr(partitions[0][0], 'A')
         assert lr_a.tiles.tileId_start == 4
         assert lr_a.tiles.tileId_end == 8
-        assert lr_a.mtIteration == "n"
+        assert lr_a.mtIteration == 0
         assert len(partitions[0][1].lrs) == 0
 
         # P2: no LRs (both A and B already loaded)
@@ -500,8 +501,8 @@ class TestPlaceLRs:
         # P3: last → A+SA, B+SB for MT n+1
         _assert_slot_lrs(partitions[3][0], ['A', 'SA'])
         _assert_slot_lrs(partitions[3][1], ['B', 'SB'])
-        _assert_lr(partitions[3][0], 'A', 'n+1', 0, 2, 0, 4)
-        _assert_lr(partitions[3][1], 'B', 'n+1', 0, 2, 0, 4)
+        _assert_lr(partitions[3][0], 'A', 1,0, 2, 0, 4)
+        _assert_lr(partitions[3][1], 'B', 1,0, 2, 0, 4)
 
     def test_10x1_k1_bf16(self):
         """MT=320x320, BF16, DU=64, k=1, 10x1 partition. No scale.
@@ -523,7 +524,7 @@ class TestPlaceLRs:
         _assert_slot_lrs(partitions[0][1], ['A'])
         lr_a0 = _get_lr(partitions[0][0], 'A')
         assert lr_a0.tiles.subIterK_start == 1
-        assert lr_a0.mtIteration == "n"
+        assert lr_a0.mtIteration == 0
 
         # P1-P8: only A LRs (B deduped)
         for pi in range(1, 9):
@@ -533,8 +534,8 @@ class TestPlaceLRs:
         # P9: last → A+B for MT n+1
         _assert_slot_lrs(partitions[9][0], ['A'])
         _assert_slot_lrs(partitions[9][1], ['A', 'B'])
-        _assert_lr(partitions[9][1], 'A', 'n+1', 0, 1, 0, 1)
-        _assert_lr(partitions[9][1], 'B', 'n+1', 0, 1, 0, 10)
+        _assert_lr(partitions[9][1], 'A', 1,0, 1, 0, 1)
+        _assert_lr(partitions[9][1], 'B', 1,0, 1, 0, 10)
 
     def test_asymmetric_mt(self):
         """MT0=384, MT1=128 — asymmetric tile counts."""
@@ -582,7 +583,7 @@ class TestAssignVgprTiles:
             for pi, slots in enumerate(parts):
                 for slot in slots:
                     for lr in slot.lrs:
-                        if lr.mtIteration == "n" or lr.tensor not in ('A', 'B'):
+                        if lr.mtIteration == 0 or lr.tensor not in ('A', 'B'):
                             continue
                         if not lr.vgpr_tile_map:
                             continue
@@ -720,18 +721,18 @@ class TestPlaceGRs:
 
         # P0: A n+1
         _assert_slot_grs(parts[0][0], ['A'], "P0 s0")
-        _assert_gr(parts[0][0], 'A', 0, 2, 4, 6, mt='n+1')
+        _assert_gr(parts[0][0], 'A', 0, 2, 4, 6, mt=1)
         _assert_slot_grs(parts[0][1], ['A'], "P0 s1")
-        _assert_gr(parts[0][1], 'A', 0, 2, 6, 8, mt='n+1')
+        _assert_gr(parts[0][1], 'A', 0, 2, 6, 8, mt=1)
 
         # P1: B n+1
         _assert_slot_grs(parts[1][0], ['B'], "P1 s0")
-        _assert_gr(parts[1][0], 'B', 0, 2, 4, 6, mt='n+1')
+        _assert_gr(parts[1][0], 'B', 0, 2, 4, 6, mt=1)
 
         # P3: B n+2, SA n+2, SB n+2
         _assert_slot_grs(parts[3][1], ['B', 'SA', 'SB'], "P3 s1")
-        _assert_gr(parts[3][1], 'SA', 0, 2, 0, 8, mt='n+2')
-        _assert_gr(parts[3][1], 'SB', 0, 2, 0, 8, mt='n+2')
+        _assert_gr(parts[3][1], 'SA', 0, 2, 0, 8, mt=2)
+        _assert_gr(parts[3][1], 'SB', 0, 2, 0, 8, mt=2)
 
     def test_2x2_k1_DU512(self):
         """256x256, DU512, FP4, 2x2 partition. GR k=2 × 2 chunks + scale."""
@@ -744,12 +745,12 @@ class TestPlaceGRs:
         # P0: A n+1 across 4 slots
         for i, (k_s, k_e) in enumerate([(0,2),(0,2),(2,4),(2,4)]):
             _assert_slot_grs(parts[0][i], ['A'], f"P0 s{i}")
-        _assert_gr(parts[0][0], 'A', 0, 2, 4, 6, mt='n+1')
-        _assert_gr(parts[0][2], 'A', 2, 4, 4, 6, mt='n+1')
+        _assert_gr(parts[0][0], 'A', 0, 2, 4, 6, mt=1)
+        _assert_gr(parts[0][2], 'A', 2, 4, 4, 6, mt=1)
 
         # P3 s0: SA+SB n+2
         _assert_slot_grs(parts[3][0], ['SA', 'SB'], "P3 s0")
-        _assert_gr(parts[3][0], 'SA', 0, 4, 0, 8, mt='n+2')
+        _assert_gr(parts[3][0], 'SA', 0, 4, 0, 8, mt=2)
 
     def test_10x1_bf16(self):
         """320x320, BF16, 10x1 partition. No scales."""
@@ -761,13 +762,13 @@ class TestPlaceGRs:
         # P0..P4: A atoms
         for pi in range(4):
             _assert_slot_grs(parts[pi][0], ['A'], f"P{pi} s0")
-            _assert_gr(parts[pi][0], 'A', 0, 2, pi*2+1, pi*2+2, mt='n+1')
+            _assert_gr(parts[pi][0], 'A', 0, 2, pi*2+1, pi*2+2, mt=1)
 
         # P5..P9: B atoms
         for pi in range(5, 10):
             b_idx = (pi - 5) * 2
             _assert_slot_grs(parts[pi][0], ['B'], f"P{pi} s0")
-            _assert_gr(parts[pi][0], 'B', 0, 2, b_idx, b_idx+1, mt='n+2')
+            _assert_gr(parts[pi][0], 'B', 0, 2, b_idx, b_idx+1, mt=2)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1652,3 +1653,85 @@ if __name__ == "__main__":
             input("Press Enter for next step...")
 
     sched.deallocVgprTiles(writer)
+
+
+# ══════════════════════════════════════════════════════════════
+# MT iteration integer representation
+# ══════════════════════════════════════════════════════════════
+
+class TestFmtMt:
+    def test_fmt_mt_values(self):
+        assert fmt_mt(0) == "n"
+        assert fmt_mt(1) == "n+1"
+        assert fmt_mt(2) == "n+2"
+        assert fmt_mt(3) == "n+3"
+
+
+class TestMtIterationTypes:
+    def test_mt_iteration_is_int_bf16(self):
+        cfg = make_cfg_bf16()
+        sched = SubtileBasedLogicalScheduler(cfg)
+        sched.place_GRs()
+        for slots in sched._partitions:
+            for slot in slots:
+                for lr in slot.lrs:
+                    assert isinstance(lr.mtIteration, int), \
+                        f"LR {lr.tensor} mtIteration is {type(lr.mtIteration)}"
+                for gr in slot.grs:
+                    assert isinstance(gr.mtIteration, int), \
+                        f"GR {gr.tensor} mtIteration is {type(gr.mtIteration)}"
+
+    def test_mt_iteration_is_int_fp4(self):
+        cfg = make_cfg_256x256_fp4()
+        sched = SubtileBasedLogicalScheduler(cfg)
+        sched.place_GRs()
+        for slots in sched._partitions:
+            for slot in slots:
+                for lr in slot.lrs:
+                    assert isinstance(lr.mtIteration, int), \
+                        f"LR {lr.tensor} mtIteration is {type(lr.mtIteration)}"
+                for gr in slot.grs:
+                    assert isinstance(gr.mtIteration, int), \
+                        f"GR {gr.tensor} mtIteration is {type(gr.mtIteration)}"
+
+
+class TestPreloopMtIntegers:
+    def test_preloop_uses_int_mt(self):
+        cfg = make_cfg_bf16()
+        sched = SubtileBasedLogicalScheduler(cfg)
+        sched.emit()
+        preloop = sched.build_preloop()
+        for partition_emitted in preloop:
+            for emitted in partition_emitted:
+                for em in emitted:
+                    src = em.source
+                    if isinstance(src, GRPlacement):
+                        assert isinstance(src.mtIteration, int), \
+                            f"Preloop GR {src.tensor} mtIteration is {type(src.mtIteration)}"
+                    elif isinstance(src, LRPlacement):
+                        assert isinstance(src.mtIteration, int), \
+                            f"Preloop LR {src.tensor} mtIteration is {type(src.mtIteration)}"
+
+
+class TestBuildNll:
+    def test_nll_removes_expected_ops(self):
+        cfg = make_cfg_bf16()
+        sched = SubtileBasedLogicalScheduler(cfg)
+        sched.emit()
+        nll = sched.build_nll()
+        for partition_emitted in nll:
+            for emitted in partition_emitted:
+                for em in emitted:
+                    src = em.source
+                    assert em.opType != 'gr', "NLL should have no GR ops"
+                    assert em.opType != 'gr_inc', "NLL should have no gr_inc ops"
+                    assert em.opType != 'lr_inc', "NLL should have no lr_inc ops"
+                    if em.opType == 'lr' and isinstance(src, LRPlacement):
+                        assert src.mtIteration == 0, \
+                            f"NLL should only have LR(n=0), got mt={src.mtIteration}"
+                    if em.opType == 'wait_gr':
+                        from Tensile.Components.SubtileBasedLogicalScheduler import WaitGROp
+                        if isinstance(src, WaitGROp) and src.wait_gr_counts:
+                            cnts = src.wait_gr_counts
+                            assert cnts.A == 0 and cnts.B == 0 and cnts.SA == 0 and cnts.SB == 0, \
+                                f"NLL WaitGR should have zeroed counts, got {cnts}"
