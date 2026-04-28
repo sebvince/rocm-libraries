@@ -1452,6 +1452,7 @@ class LogicalScheduler:
                 if last is not None and last != lr.mtIteration:
                     lr.preOps.append(LRIncOp(tensor=tensor))
 
+        # Special case for pgr=0. We will get rid of this once we move all lr/grInc to postOps for PGR1/2
         if self.config.pgr == 0:
             last_lr_per_tensor = {}
             last_gr_per_tensor = {}
@@ -2004,13 +2005,11 @@ class LogicalScheduler:
 
         PGR=1 sequence:
           GR(MT 0)  — all tensors, all tiles
-          GR_INC
           LR        — first partition, subIterK=0
           skip(LE 1, NLL)
 
         PGR=2 sequence:
           GR(MT 0)  — all tensors, all tiles
-          GR_INC
           LR        — first partition, subIterK=0
           skip(LE 1, NLL)
           GR(MT 1)  — first partition tiles
@@ -2043,7 +2042,6 @@ class LogicalScheduler:
                 WaitGROp(wait_gr_counts=WaitGRCounts()),
                 SyncOp(),
                 *self._preloop_make_lr(lr_tiles),
-                WaitLROp(),
                 SkipOp(compare='LE', value=1, target='NLL'),
             ])
         else:
@@ -2057,10 +2055,8 @@ class LogicalScheduler:
                 WaitGROp(wait_gr_counts=WaitGRCounts()),
                 SyncOp(),
                 *self._preloop_make_lr(lr_tiles),
-                WaitLROp(),
                 SkipOp(compare='LE', value=1, target='NLL'),
                 *self._preloop_make_gr(1, part0_tiles),
-                # *self._make_tensor_depops(GRIncOp),
                 SkipOp(compare='LE', value=2, target='NGLL'),
             ])
 
