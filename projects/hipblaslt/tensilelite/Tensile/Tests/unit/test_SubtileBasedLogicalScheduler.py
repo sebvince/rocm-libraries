@@ -139,7 +139,7 @@ def make_cfg_bf16(MT0=256, MT1=256, depthU=64, numPartM=1, numPartN=1):
 
 
 def make_cfg_bf16_pgr0(MT0=256, MT1=256, depthU=64):
-    """Build BF16 config with pgr=0, plr=0."""
+    """Build BF16 config with pgr=0."""
     kernel = create_kernel(MT0, MT1, fp4=False, depthU=depthU)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
@@ -152,12 +152,11 @@ def make_cfg_bf16_pgr0(MT0=256, MT1=256, depthU=64):
         grA=ReadGranularity(mn=1, k=2),
         grB=ReadGranularity(mn=1, k=2),
         pgr=0,
-        plr=0,
     )
 
 
 def make_cfg_bf16_pgr1(MT0=256, MT1=256, depthU=64, numPartM=1, numPartN=1):
-    """Build BF16 config with pgr=1, plr=1."""
+    """Build BF16 config with pgr=1."""
     kernel = create_kernel(MT0, MT1, fp4=False, depthU=depthU)
     tiA = TileInfo('A', kernel)
     tiB = TileInfo('B', kernel)
@@ -172,7 +171,6 @@ def make_cfg_bf16_pgr1(MT0=256, MT1=256, depthU=64, numPartM=1, numPartN=1):
         numPartitionsM=numPartM,
         numPartitionsN=numPartN,
         pgr=1,
-        plr=1,
     )
 
 
@@ -1904,22 +1902,13 @@ class TestBuildNll:
 
 class TestPGR0Config:
 
-    def test_pgr0_requires_plr0(self):
-        with pytest.raises(AssertionError, match="pgr=0 requires plr=0"):
-            SchedulerConfig(
-                numMFMATilesM=8, numMFMATilesN=8, numSubIterK=2,
-                lrA=ReadGranularity(mn=1, k=1), lrB=ReadGranularity(mn=1, k=1),
-                grA=ReadGranularity(mn=1, k=2), grB=ReadGranularity(mn=1, k=2),
-                pgr=0, plr=1,
-            )
-
     def test_pgr0_requires_single_partition(self):
         with pytest.raises(AssertionError, match="pgr=0 requires numPartitions=1"):
             SchedulerConfig(
                 numMFMATilesM=8, numMFMATilesN=8, numSubIterK=2,
                 lrA=ReadGranularity(mn=1, k=1), lrB=ReadGranularity(mn=1, k=1),
                 grA=ReadGranularity(mn=1, k=2), grB=ReadGranularity(mn=1, k=2),
-                pgr=0, plr=0, numPartitionsN=2,
+                pgr=0, numPartitionsN=2,
             )
 
 

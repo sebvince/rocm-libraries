@@ -367,7 +367,6 @@ def make_256x256_bf16_pgr0():
         numPartitionsM=1,
         numPartitionsN=1,
         pgr=0,
-        plr=0,
     )
 
 
@@ -425,7 +424,6 @@ def make_256x256_bf16_pgr1():
         numPartitionsM=1,
         numPartitionsN=1,
         pgr=1,
-        plr=1,
     )
 
 
@@ -751,7 +749,6 @@ def make_256x256_fp4_pgr0():
         numPartitionsM=1,
         numPartitionsN=1,
         pgr=0,
-        plr=0,
     )
 
 

@@ -8,6 +8,9 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import singledispatch
 from typing import Dict, List, NamedTuple, Optional, Tuple, Type
+from Tensile.Components.SubtileBasedLogicalScheduler import (
+      LogicalScheduler, SchedulerConfig as MFMASchedulerConfig,
+      ReadGranularity)
 
 from ...Common import printWarning, roundUp, print2, DebugConfig, DataDirection, \
   INDEX_CHARS, IsaVersion
@@ -1124,9 +1127,7 @@ def mainLoop(writer, kernel):
   pgr = kernel["PrefetchGlobalRead"]
   assert pgr in (0, 1, 2), "SubtileBasedKernel only supports PGR=0, PGR=1, and PGR=2, got PGR=%d" % pgr
 
-  from Tensile.Components.SubtileBasedLogicalScheduler import (
-      LogicalScheduler, SchedulerConfig as MFMASchedulerConfig,
-      ReadGranularity)
+
   tiA = writer.states.a.tileInfo
   tiB = writer.states.b.tileInfo
   scaleTiA = writer.states.mxsa.tileInfo if kernel["ProblemType"].get("MXBlockA", 0) else None
@@ -1142,7 +1143,6 @@ def mainLoop(writer, kernel):
   grSBGran = ReadGranularity(mn=scaleTiB.localMMATileGrid[0], k=scaleTiB.localMMATileGrid[1]) if scaleTiB else None
 
   schedulerPgr = pgr
-  schedulerPlr = 0 if pgr == 0 else 1
 
   vgprBudget = writer.states.regCaps["MaxVgpr"]
   vgprUsed = writer.vgprPool.size() - writer.vgprPool.available()
@@ -1163,8 +1163,7 @@ def mainLoop(writer, kernel):
           grSB=grSBGran,
           numPartitionsM=numPartM,
           numPartitionsN=numPartN,
-          pgr=schedulerPgr,
-          plr=schedulerPlr,
+          pgr=schedulerPgr
       )
       scheduler = LogicalScheduler(cfg)
       scheduler.build()
