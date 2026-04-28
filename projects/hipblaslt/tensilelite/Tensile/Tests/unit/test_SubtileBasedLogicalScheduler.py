@@ -2007,12 +2007,15 @@ class TestAnnotateDeps_PGR0:
     def test_no_crash(self):
         self._build()
 
-    def test_gr_has_no_deps(self):
+    def test_gr_deps_on_lr_mt_minus2(self):
         _, sched = self._build()
         slots = sched._partitions[0]
         for slot in slots:
             for gr in slot.grs:
-                assert gr.deps == []
+                assert gr.deps, f"GR {gr.tensor} should have collision deps"
+                for dep in gr.deps:
+                    assert isinstance(dep.ref, LRPlacement)
+                    assert dep.mt_offset == -2
 
     def test_mfma_deps_on_lr_mt0(self):
         _, sched = self._build()

@@ -1159,19 +1159,16 @@ class LogicalScheduler:
 
             # GR: depends on collision LR (LDS double-buffer)
             # GR(n+x) collides with LR(n+x-2) — same buffer, period 2.
-            # Only applies when PGR >= 1 (GR writes to a different buffer
-            # than the one LR is reading from). PGR=0 has no collision.
-            if cfg.pgr > 0:
-                for gr in slot.grs:
-                    target_data = gr.mtIteration - 2
-                    for lr in lr_by_tensor.get(gr.tensor, []):
-                        if _range_overlaps(lr.tiles, gr.tiles):
-                            mt_off = target_data - lr.mtIteration
-                            gr.deps.append(Dep(ref=lr, mt_offset=mt_off))
-                    if not gr.deps:
-                        raise ValueError(
-                            f"GR {gr.tensor} mt={fmt_mt(gr.mtIteration)} at slot {k} "
-                            f"has no overlapping LR(n) dependency")
+            for gr in slot.grs:
+                target_data = gr.mtIteration - 2
+                for lr in lr_by_tensor.get(gr.tensor, []):
+                    if _range_overlaps(lr.tiles, gr.tiles):
+                        mt_off = target_data - lr.mtIteration
+                        gr.deps.append(Dep(ref=lr, mt_offset=mt_off))
+                if not gr.deps:
+                    raise ValueError(
+                        f"GR {gr.tensor} mt={fmt_mt(gr.mtIteration)} at slot {k} "
+                        f"has no overlapping LR(n) dependency")
 
         for slot in slots:
             for lr in slot.lrs:
