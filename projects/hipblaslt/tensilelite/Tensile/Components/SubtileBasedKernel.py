@@ -30,9 +30,10 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   DSStoreB32, DSStoreB64, DSStoreB8, DSStoreInstruction, FlatLoadB128, FlatLoadB32, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
   MFMAInstruction, MXMFMAInstruction, SAddU32, SAddCU32, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
-  SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SSubBU32, SWaitCnt, SWaitAlu, \
+  SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SSubBU32, SWaitCnt, SWaitAlu, SXorB32, \
   SLongBranchPositive, VAccvgprWrite, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpXEqU32, VCndMaskB32, VReadfirstlaneB32, \
-  VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64, VSubU32, VPermlane16SwapB32, MFMAInstruction
+  VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, VXorB32, \
+  SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64, VSubU32, VPermlane16SwapB32, MFMAInstruction
 from rocisa.register import RegisterPool
 from rocisa.enum import RegisterType, DataTypeEnum
 # Store various scheduling info
@@ -155,6 +156,7 @@ class TileInfo:
 
   sharedVgprGROffset: List[int] = field(init=False)
   sharedVgprLROffset: List[int] = field(init=False)
+  sharedVgprLROffsetSwap: List[int] = field(init=False)
 
   vgprTileFactor: float = 1.0
   # VGPR buffers available for this tile
@@ -369,11 +371,13 @@ class TileInfo:
   def allocOffsetRegisters(self, writer, kernel):
     self.sharedVgprGROffset = []
     self.sharedVgprLROffset = []
+    self.sharedVgprLROffsetSwap = []
 
     for i in range(self.numGRPerSubtile):
       self.sharedVgprGROffset.append(writer.vgprPool.checkOut(1))
     for i in range(self.numLRPerSubtile):
       self.sharedVgprLROffset.append(writer.vgprPool.checkOut(1))
+      self.sharedVgprLROffsetSwap.append(writer.vgprPool.checkOut(1))
 
     # Allocate registers for each subtile
     # TODOBS: Check TLU instead of hardcoding False
@@ -445,6 +449,9 @@ class TileInfo:
     # checkin LR registers
     for voff in self.sharedVgprLROffset:
       writer.vgprPool.checkIn(voff)
+    # checkin LR registers
+    for voff in self.sharedVgprLROffsetSwap:
+      writer.vgprPool.checkIn(voff)
 
 
     for reg in self.localSubtilesRegister:
@@ -514,7 +521,7 @@ def _applyWavePartitionLROffset(module, writer, kernel, tileInfo):
     sInterval = tileInfo.subtileSize if interleaved else MT * depthUBytes // 4
   else:
     raise NotImplementedError("Unsupported loadRatioGR for wave partition: %s"%str(tileInfo.loadRatioGR))
-  
+
   tmpSgpr = writer.sgprPool.checkOut(1)
   module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(sInterval), comment="%s: interleave stride"%tc))
   module.add(VMulLOU32(dst=vgpr(waveId), src1=vgpr(waveId), src0=sgpr(tmpSgpr), comment=""))
@@ -688,7 +695,7 @@ def _grComputeOffset(module, writer, tileInfo, colId, rowId, output):
   bpeBits = int(8*tileInfo.bpe)
 
   tmpVgpr = writer.vgprPool.checkOut(2)
-  colBytes = tmpVgpr + 1 
+  colBytes = tmpVgpr + 1
   loadWidth = 16
 
   module.add(VLShiftLeftB32(dst=vgpr(colBytes), shiftHex=hex(loadWidth.bit_length()-1), src=vgpr(colId), comment="scale col_id by load_width"))
@@ -781,7 +788,7 @@ def _grComputeRowPartition(module, kernel, writer, tileInfo, waveId, rowOffset):
   module.add(VLShiftLeftB32(dst=vgpr(localRow), shiftHex=hex(numRowsPerWave.bit_length()-1), src=vgpr(localRow), comment="%s: local row offset"%tc))
   module.add(VMulLOU32(dst=vgpr(partitionRow), src0=sgpr(tmpSgpr), src1=vgpr(partitionRow), comment="%s: wave row offset"%tc))
   module.add(VAddU32(dst=vgpr(rowOffset), src0=vgpr(localRow), src1=vgpr(partitionRow), comment="%s: row offset"%tc))
-  
+
 
   writer.vgprPool.checkIn(tmpVgpr)
   writer.sgprPool.checkIn(tmpSgpr)
@@ -856,7 +863,7 @@ def _grSwizzleColIds(module, writer, tileInfoA, tileInfoB, blockSize, numRowsPer
 
   module.add(VAndB32(dst=vgpr(colIdA), src0=vgpr(colIdA), src1=hex(blockSize-1), comment="(col + offset) % block_size"))
   module.add(VAndB32(dst=vgpr(colIdB), src0=vgpr(colIdB), src1=hex(blockSize-1), comment="(col + offset) % block_size"))
-  
+
   writer.vgprPool.checkIn(tmpVgpr)
 
 ##################################################
@@ -902,7 +909,7 @@ def graTileAssignment(writer, kernel, useSwizzling=True):
   # Apply swizzling and rotation to colId for A and B
   _grSwizzleColIds(module, writer, tileInfoA, tileInfoB, blockSize, numRowsPerLDSBanks,
                    laneId, colIdA, colIdB, waveId)
-    
+
   # Compute rowOffsetA and rowOffsetB row offset based on wave partitioning (e.g. 2x2, 4x1/1x4)
   _grComputeRowPartition(module, kernel, writer, tileInfoA, waveId, rowOffsetA)
   _grComputeRowPartition(module, kernel, writer, tileInfoB, waveId, rowOffsetB)
@@ -1151,7 +1158,7 @@ def lraTileAssignmentScaleSwizzled(writer, kernel):
   module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(scaleBLdsOffset), comment="scale: LDS offset for B scale"))
   module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[0]), src0=vgpr(tileInfoB.sharedVgprLROffset[0]), src1=sgpr(tmpSgpr), comment="scaleB: +=LDS offset"))
   writer.sgprPool.checkIn(tmpSgpr)
-    
+
   return module
 
 ##################################################
@@ -1164,7 +1171,7 @@ def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
 
   loadWidth = 16
   numWaves = kernel["MIWaveGroup"][0] * kernel["MIWaveGroup"][1]
-  
+
   tileInfo = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
   subtileInfo = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, sId1)]
   regList = tileInfo.localSubtilesRegister[subtileInfo.regListId]
@@ -1173,7 +1180,7 @@ def emitSubtileBufferLoad(tc, writer, kernel, subtileId):
   grBaseId = tileInfo.localSubtiles[tileInfo.getLocalSubtileLinearId(sId0, sId1)].globalReadMap[0]
 
   subtileOffset = math.ceil(tileInfo.loadRatioGR*tileInfo.subtileSize)
-  WriteBaseAddr = "LocalWriteBaseAddrA" if tc == 'A' else "LocalWriteBaseAddrB"
+  WriteBaseAddr = "LocalWriteBaseAddr%s"%tc
   # Emit number of buffer loads equal to number of loads needed to load a subtile
   for i in range(tileInfo.numGRPerSubtile):
     module.add(SAddU32(dst=mgpr(0), src0=sgpr(WriteBaseAddr), src1=((grBaseId + i) * subtileOffset - offsetK)))
@@ -1281,7 +1288,7 @@ def globalReadDTLInitCommonSgpr(writer, kernel):
   btile = writer.states.b.tileInfo
 
   tmpVgpr = writer.vgprPool.checkOut(2)
-  rowOffsetA = tmpVgpr 
+  rowOffsetA = tmpVgpr
   rowOffsetB = tmpVgpr + 1
 
   _grComputeRowPartition(module, kernel, writer, atile, vgprWaveId, rowOffsetA)
@@ -1297,13 +1304,38 @@ def globalReadDTLInitCommonSgpr(writer, kernel):
   module.add(VReadfirstlaneB32(dst=sgpr("LocalWriteBaseAddrB"), src=vgpr(rowOffsetB), comment="Store base LDS offset, will be modified"))
   module.add(SAddU32(dst=sgpr("LocalWriteBaseAddrB"), src0=sgpr("LocalWriteBaseAddrB"), src1=hex(writer.ldsStartOffsetB), comment=""))
 
-  module.add(SMovB32(dst=sgpr("LocalWriteDTLOffsetA"), src=sgpr("LocalWriteBaseAddrA"), comment=""))
-  module.add(SMovB32(dst=sgpr("LocalWriteDTLOffsetB"), src=sgpr("LocalWriteBaseAddrB"), comment=""))
+  module.add(SAddU32(dst=sgpr("LocalWriteSwapA"), src0=sgpr("LocalWriteBaseAddrA"), src1=writer.ldsTotalSize, comment=""))
+  module.add(SXorB32(dst=sgpr("LocalWriteSwapA"), src0=sgpr("LocalWriteBaseAddrA"), src1=sgpr("LocalWriteSwapA"), comment=""))
+  module.add(SAddU32(dst=sgpr("LocalWriteSwapB"), src0=sgpr("LocalWriteBaseAddrB"), src1=writer.ldsTotalSize, comment=""))
+  module.add(SXorB32(dst=sgpr("LocalWriteSwapB"), src0=sgpr("LocalWriteBaseAddrB"), src1=sgpr("LocalWriteSwapB"), comment=""))
 
   writer.vgprPool.checkIn(vgprWaveId)
   writer.vgprPool.checkIn(tmpVgpr)
 
 
+  return module
+
+def localReadDTLInitCommonSwapVgpr(writer, kernel):
+  module = Module()
+
+  atile = writer.states.a.tileInfo
+  btile = writer.states.b.tileInfo
+
+  stmp = writer.sgprPool.checkOut(1)
+  module.add(SMovB32(dst=sgpr(stmp), src=writer.ldsTotalSize, comment="Store Total Lds Size for one buffer"))
+  for i in range(len(atile.sharedVgprLROffset)):
+    vgprId = atile.sharedVgprLROffset[i]
+    vgprSwapId = atile.sharedVgprLROffsetSwap[i]
+    module.add(VAddU32(dst=vgpr(vgprSwapId), src0=vgpr(vgprId), src1=sgpr(stmp), comment=""))
+    module.add(VXorB32(dst=vgpr(vgprSwapId), src0=vgpr(vgprId), src1=vgpr(vgprSwapId), comment=""))
+
+  for i in range(len(btile.sharedVgprLROffset)):
+    vgprId = btile.sharedVgprLROffset[i]
+    vgprSwapId = btile.sharedVgprLROffsetSwap[i]
+    module.add(VAddU32(dst=vgpr(vgprSwapId), src0=vgpr(vgprId), src1=sgpr(stmp), comment=""))
+    module.add(VXorB32(dst=vgpr(vgprSwapId), src0=vgpr(vgprId), src1=vgpr(vgprSwapId), comment=""))
+
+  writer.sgprPool.checkIn(stmp)
   return module
 
 
@@ -1313,7 +1345,9 @@ def globalReadDTLInitCommonSgpr(writer, kernel):
 #
 def globalReadLDSBufferSwap(tc, writer, kernel):
   module = Module()
-  module.addComment0("Emit code to swap %s GR vgpr offsets"%tc)
+  module.addComment0("Emit code to swap %s GR m0 offsets"%tc)
+  module.add(SXorB32(dst=sgpr("LocalWriteBaseAddr%s"%tc), src0=sgpr("LocalWriteBaseAddr%s"%tc), src1=sgpr("LocalWriteSwap%s"%tc), comment=""))
+  #module.add(SMovB32(dst=sgpr("LocalWriteBaseAddr%s"%tc), src=sgpr("LocalWriteSwap%s"%tc), comment=""))
   return module
 
 ##################################################
@@ -1321,7 +1355,17 @@ def globalReadLDSBufferSwap(tc, writer, kernel):
 #
 def localReadLDSBufferSwap(tc, writer, kernel):
   module = Module()
+
+  tile = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
+
   module.addComment0("Emit code to swap %s LR vgpr offsets"%tc)
+
+  for i in range(len(tile.sharedVgprLROffset)):
+    vgprId = tile.sharedVgprLROffset[i]
+    vgprSwapId = tile.sharedVgprLROffsetSwap[i]
+    module.add(VXorB32(dst=vgpr(vgprId), src0=vgpr(vgprId), src1=vgpr(vgprSwapId), comment=""))
+    #module.add(VMovB32(dst=vgpr(vgprId), src=vgpr(vgprSwapId), comment=""))
+
   return module
 
 ##################################################
@@ -1423,7 +1467,7 @@ def mainLoopImpl(writer, kernel, isNLL = False):
   module = Module()
   module.addComment0("REMOVE WHEN IMPLEMNTED: Placeholder for subtile based main loop impl")
 
-  
+
   label = Label("start", comment="")
   module.add(label)
 
@@ -1440,11 +1484,11 @@ def mainLoopImpl(writer, kernel, isNLL = False):
   module.add(SWaitCnt(dscnt=0, vlcnt=-1, vscnt=-1, comment="Wait for all subtile LRs to complete"))
 
   module.add(emitMfmaCode(writer, kernel))
-  #module.add(globalReadLDSBufferSwap('A', writer, kernel))
-  #module.add(globalReadLDSBufferSwap('B', writer, kernel))
+  module.add(globalReadLDSBufferSwap('A', writer, kernel))
+  module.add(globalReadLDSBufferSwap('B', writer, kernel))
 
-  #module.add(localReadLDSBufferSwap('A', writer, kernel))
-  #module.add(localReadLDSBufferSwap('B', writer, kernel))
+  module.add(localReadLDSBufferSwap('A', writer, kernel))
+  module.add(localReadLDSBufferSwap('B', writer, kernel))
 
   module.add(globalReadPtrUpdates('A', writer, kernel))
   module.add(globalReadPtrUpdates('B', writer, kernel))
