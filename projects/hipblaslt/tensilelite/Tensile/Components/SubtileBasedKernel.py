@@ -29,7 +29,7 @@ from rocisa.instruction import BufferLoadB128, BufferLoadB32, BufferLoadB64, \
   DSLoadU8, DSStore2B32, DSStore2B64, DSStoreB128, DSStoreB16, DSStoreB256, \
   DSStoreB32, DSStoreB64, DSStoreB8, DSStoreInstruction, FlatLoadB128, FlatLoadB32, \
   FlatLoadB64, FlatStoreB128, FlatStoreB32, FlatStoreB64, Instruction, MacroInstruction, \
-  MFMAInstruction, SAddU32, SAddCU32, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
+  MFMAInstruction, MXMFMAInstruction, SAddU32, SAddCU32, SBarrier, SBranch, SCBranchSCC0, SCBranchSCC1, SCBranchVCCNZ, SCmpEQU32, SCmpLeU32, \
   SMFMAInstruction, SNop, SSetPrior, SSetRegIMM32B32, SSubU32, SSubBU32, SWaitCnt, SWaitAlu, \
   SLongBranchPositive, VAccvgprWrite, VFmaMixF32, VMadMixF32, VMovB32, VAndB32, VCmpXEqU32, VCndMaskB32, VReadfirstlaneB32, \
   VMovB64, VLShiftRightB32, VLShiftLeftB32, VMulLOU32, VAddU32, VAddCOU32, VAddCCOU32, SMovB32, SMulI32, FlatStoreB32, SWaitCnt, SMovB64, VSubU32, VPermlane16SwapB32, MFMAInstruction
@@ -226,6 +226,11 @@ class TileInfo:
 
       subtileShape0 = self.subtileShape[0]
       subtileShape1 = self.subtileShape[0]
+
+    assert kernel["MatrixInstM"] == 16 and kernel["MatrixInstN"] == 16, \
+      "SubtileBasedKernel only supports MatrixInstM=16 and MatrixInstN=16, got %ux%u" % (kernel["MatrixInstM"], kernel["MatrixInstN"])
+    assert kernel["MatrixInstK"] in (32, 128), \
+      "SubtileBasedKernel only supports MatrixInstK=32 (bf16) or MatrixInstK=128 (mxfp4), got %u" % kernel["MatrixInstK"]
 
     self.mmaTileSize = int(mmaTileShape0 * mmaTileShape1 * bpe)
     self.loadWidthLR = self.mmaTileSize // kernel["WavefrontSize"]
@@ -1096,13 +1101,30 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
 
   aOperand = vgpr(vgprBStart,opBSize) if kernel["SourceSwap"] else vgpr(vgprAStart,opASize)
   bOperand = vgpr(vgprAStart,opASize) if kernel["SourceSwap"] else vgpr(vgprBStart,opBSize)
-    
-  module.add(MFMAInstruction(instType=InstType.INST_BF16, accType=InstType.INST_F32, variant=[16,16,32,1], mfma1k=False, \
-                             acc=accvgprAlias(vgprDStart,opDSize), \
-                             a=aOperand, \
-                             b=bOperand, \
-                             acc2=accvgprAlias(vgprCStart,opCSize), \
-                             comment=comment))
+
+  miK = kernel["MatrixInstK"]
+
+  if miK == 128:
+    # MX FP4: 16x16x128
+    tmpVgprScale = writer.vgprPool.checkOut(1)
+    module.add(VMovB32(dst=vgpr(tmpVgprScale), src=hex(0x80), comment="hardcoded scale 0x80"))
+    module.add(MXMFMAInstruction(instType=InstType.INST_F4, accType=InstType.INST_F32, variant=[16,16,miK,1], \
+                                 acc=accvgprAlias(vgprDStart,opDSize), \
+                                 a=aOperand, \
+                                 b=bOperand, \
+                                 acc2=accvgprAlias(vgprCStart,opCSize), \
+                                 mxsa=vgpr(tmpVgprScale), mxsb=vgpr(tmpVgprScale), \
+                                 comment=comment))
+    writer.vgprPool.checkIn(tmpVgprScale)
+  else:
+    # BF16: 16x16x32
+    module.add(MFMAInstruction(instType=InstType.INST_BF16, accType=InstType.INST_F32, variant=[16,16,miK,1], mfma1k=False, \
+                               acc=accvgprAlias(vgprDStart,opDSize), \
+                               a=aOperand, \
+                               b=bOperand, \
+                               acc2=accvgprAlias(vgprCStart,opCSize), \
+                               comment=comment))
+
   return module
 
 

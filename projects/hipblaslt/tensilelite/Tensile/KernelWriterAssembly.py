@@ -9145,22 +9145,6 @@ class KernelWriterAssembly(KernelWriter):
                       comment="incUpper <- ?"))
           imod.addModuleAsFlatItems(self.incrementSrd(tP, sgpr(incLower), sgpr(incUpper)))
 
-          if "MX" in tP:
-            # TODO: DirectToVgpr
-            tc = tP["MX"]["tensorChar"]
-            imod.addComment1("global read inc %s loop%s"%(tc, loopChar))
-            if prefetchIndex:
-              imod.add(SAddU32(dst=sgpr(tmpS), src0=self.loopCounter(kernel, self.states.unrollIdx), src1=prefetchIndex, comment="remove pf(%u)"%prefetchIndex))
-              imod.add(SCmpEQU32(src0=sgpr(suStr), src1=sgpr(tmpS), comment="Is this wrapIter? (pf)"))
-            else:
-              imod.add(SCmpEQU32(src0=self.loopCounter(kernel, self.states.unrollIdx), \
-                        src1=sgpr(suStr), comment="Is this the wrapIter?"))
-            imod.add(SCSelectB32(dst=sgpr(incLower), src0=sgpr("WrapU%s+0"%tc), src1=sgpr("GlobalReadIncs%s+%u"%(tc,self.states.unrollIdx)), \
-                        comment="incLower <- ?"))
-            imod.add(SCSelectB32(dst=sgpr(incUpper), src0=sgpr("WrapU%s+1"%tc), src1=0,
-                        comment="incUpper <- ?"))
-            imod.addModuleAsFlatItems(self.incrementSrd(tP["MX"], sgpr(incLower), sgpr(incUpper)))
-
           if kernel["ProblemType"]["Sparse"]:
             if (kernel["ProblemType"]["Sparse"] == 2 and tP["isB"]) or (kernel["ProblemType"]["Sparse"] == 1 and tP["isA"]) :
               tc = "Metadata"
@@ -9198,23 +9182,6 @@ class KernelWriterAssembly(KernelWriter):
             if useConstSgprGlobalReadIncs:
               srcGRInc = "GlobalReadIncs%s"%tc
           imod.addModuleAsFlatItems(self.incrementSrd(tP, srcGRInc, hex(incUpper)))
-
-        if "MX" in tP:
-          tc = tP["MX"]["tensorChar"]
-          imod.addComment1("global read inc %s loop%s"%(tc, loopChar))
-          if loopIdx != self.states.unrollIdx or (tc in ('MXSA', 'MXSB') and kernel["ProblemType"]["IndicesSummation"][self.states.unrollIdx] in kernel["ProblemType"]["MirrorDims%s"%tc]):
-            with self.allocTmpSgpr(1) as tmpSgprInfo:
-              incUpper = tmpSgprInfo.idx
-              # GRO may be negative for other summation if stride-other < stride-unroll or if mirror dim.
-              imod.add(SAShiftRightI32(dst=sgpr(incUpper), shiftHex=31, src=sgpr("GlobalReadIncs%s+%u"%(tc,loopIdx)), comment="sign-extend"))
-              imod.addModuleAsFlatItems(self.incrementSrd(tP["MX"], sgpr("GlobalReadIncs%s+%u"%(tc,loopIdx)), sgpr(incUpper)))
-          else:
-            incUpper = 0 # GRO is positive for loop unroll
-            srcGRInc = sgpr("GlobalReadIncs%s+%u"%(tc,loopIdx))
-            useConstSgprGlobalReadIncs = self.states.mxsa.useConstSgprGlobalReadIncs if tc == 'MXSA' else self.states.mxsb.useConstSgprGlobalReadIncs
-            if useConstSgprGlobalReadIncs:
-              srcGRInc = "GlobalReadIncs%s"%tc
-            imod.addModuleAsFlatItems(self.incrementSrd(tP["MX"], srcGRInc, hex(incUpper)))
 
         if kernel["ProblemType"]["Sparse"]:
           if (kernel["ProblemType"]["Sparse"] == 2 and tP["isB"]) or (kernel["ProblemType"]["Sparse"] == 1 and tP["isA"]) :
