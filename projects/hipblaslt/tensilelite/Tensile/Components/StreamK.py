@@ -1192,8 +1192,9 @@ class StreamK(Component):
             element = batchElements[elementIdx]
             addrCalc: AddrCalculation = ss.elementAddr[elementIdx]
             addr = addrCalc.addrDVgpr
-            sumIdx = ss.elementSumIdx[elementIdx]
-
+            # TODO: Check this later, updates vgpr indices to account for vgprValuC macro value
+            # previously this was assumes to zero. Need to check if this is the only change needed
+            sumIdx = ss.elementSumIdx[elementIdx] + writer.states.c.startVgprValu
             storeWidth = kernel["StoreVectorWidth"]
             # storeWidth = 2
             if batchIdx == 0 and elementIdx == 0:
