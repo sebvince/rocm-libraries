@@ -27,8 +27,7 @@ from gpu_test_helpers import (
     generate_export_epilogue,
     print_offset_grid,
 )
-from Tensile.Components.SubtileBasedKernel import graTileAssignment
-
+from Tensile.Components.SubtileBasedKernel import graTileAssignment, graTileAssignmentScaleSwizzled
 
 EXPORT_LOAD_PARAMS = (
     (4, 2, 0x00, "output_ptr"),
@@ -257,6 +256,109 @@ class TestGraTileAssignmentGPU:
     def test_subtile_registers_b(self, gra_env):
         """Validate localSubtilesRegister values for matrix B."""
         self._test_subtile_registers(gra_env, 'B')
+
+
+# ---- Scale GR tests ----
+
+def generate_gra_scale_asm(cfg):
+    """Run graTileAssignmentScaleSwizzled and return (asm, writer, tileInfoA, tileInfoB, kernel)."""
+    writer, kernel, tileInfoA, tileInfoB = create_writer(cfg)
+    init_rocisa()
+
+    writer.sgprPool.checkOut(12)
+    writer.sgprs["StrideA0I"] = 10
+    writer.sgprs["StrideB1J"] = 11
+    tileInfoA.allocOffsetRegisters(writer, kernel)
+    tileInfoB.allocOffsetRegisters(writer, kernel)
+
+    prologue = generate_load_params(EXPORT_LOAD_PARAMS)
+    module = graTileAssignmentScaleSwizzled(writer, kernel)
+    gra_asm = f"{prologue}\n{module}"
+    return gra_asm, writer, tileInfoA, tileInfoB, kernel
+
+
+def compute_expected_scale_gr_offset(thread_id, cfg, tileInfo):
+    """Python reference for scale GR offset (contiguous access, no swizzle/split)."""
+    stride = cfg.stride_a if tileInfo.tc == 'A' else cfg.stride_b
+    scaleBpe = tileInfo.scaleBpe
+    scaleBlockSize = tileInfo.scaleBlockSize
+    scaleLoadWidth = tileInfo.scaleLoadWidth
+    mxBlock = tileInfo.mxBlock
+    scaleStride = stride // mxBlock
+
+    # Simple col/row from serial (contiguous access)
+    if scaleBlockSize > 1:
+        col = thread_id % scaleBlockSize
+        row = thread_id // scaleBlockSize
+    else:
+        col = 0
+        row = thread_id
+
+    col *= scaleLoadWidth
+
+    # offset = row * scaleStride * scaleBpe + col
+    base = (row * scaleStride) << max(0, scaleBpe.bit_length() - 1)
+    base += col
+
+    return [base]
+
+
+SCALE_GR_TILE_CONFIGS = [
+    # 2x2 configs
+    TileConfig(mt_a=256, mt_b=256, depth_u=64, stride_a=4096, stride_b=1024, mxblock=32),
+    TileConfig(mt_a=256, mt_b=256, depth_u=128, stride_a=4096, stride_b=1024, mxblock=32),
+    TileConfig(mt_a=96, mt_b=256, depth_u=64, stride_a=1024, stride_b=256, mxblock=32),
+    # 1x4 config
+    TileConfig(mt_a=80, mt_b=64, depth_u=64, stride_a=1024, stride_b=256, mxblock=32),
+    # 4x1 config
+    TileConfig(mt_a=64, mt_b=80, depth_u=64, stride_a=1024, stride_b=256, mxblock=32),
+]
+
+
+@pytest.mark.skipif(not HAS_HIP, reason="HIP Python bindings not available")
+class TestGraTileAssignmentScaleGPU:
+
+    @pytest.fixture(params=SCALE_GR_TILE_CONFIGS, ids=lambda c: c.label)
+    def gra_scale_env(self, request, tmp_path):
+        cfg = request.param
+        gra_asm, writer, tileInfoA, tileInfoB, kernel = generate_gra_scale_asm(cfg)
+        return SimpleNamespace(
+            cfg=cfg,
+            gra_asm=gra_asm,
+            writer=writer,
+            tileInfoA=tileInfoA,
+            tileInfoB=tileInfoB,
+            kernel=kernel,
+            tmp_path=tmp_path,
+        )
+
+    def test_offset_a_scale(self, gra_scale_env):
+        """Validate scale GR offset for matrix A (stored in sharedVgprGROffset[0])."""
+        cfg = gra_scale_env.cfg
+        tileInfo = gra_scale_env.tileInfoA
+        reg = tileInfo.sharedVgprGROffset[0]
+        results = export_register(gra_scale_env.writer, gra_scale_env.gra_asm, reg, False,
+                                  cfg, gra_scale_env.tmp_path,
+                                  f"scaleGR_A_v{reg}_{cfg.label}")
+        for tid in range(NUM_THREADS):
+            expected = compute_expected_scale_gr_offset(tid, cfg, tileInfo)
+            assert results[tid] == expected[0], \
+                f"[{cfg.label}] Scale A GR v{reg} tid={tid}: " \
+                f"got {results[tid]}, expected {expected[0]}"
+
+    def test_offset_b_scale(self, gra_scale_env):
+        """Validate scale GR offset for matrix B (stored in sharedVgprGROffset[0])."""
+        cfg = gra_scale_env.cfg
+        tileInfo = gra_scale_env.tileInfoB
+        reg = tileInfo.sharedVgprGROffset[0]
+        results = export_register(gra_scale_env.writer, gra_scale_env.gra_asm, reg, False,
+                                  cfg, gra_scale_env.tmp_path,
+                                  f"scaleGR_B_v{reg}_{cfg.label}")
+        for tid in range(NUM_THREADS):
+            expected = compute_expected_scale_gr_offset(tid, cfg, tileInfo)
+            assert results[tid] == expected[0], \
+                f"[{cfg.label}] Scale B GR v{reg} tid={tid}: " \
+                f"got {results[tid]}, expected {expected[0]}"
 
 
 if __name__ == "__main__":

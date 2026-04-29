@@ -60,15 +60,16 @@ class TileConfig:
     stride_a: int = 0   # StrideA0I (in elements), only needed by GRA tests
     stride_b: int = 0   # StrideB1J (in elements), only needed by GRA tests
     use_swizzling: bool = False  # Whether to enable swizzling, only needed by GRA tests
+    mxblock: int = 0    # MX block size (0=disabled, 32=MX32)
 
     @property
     def label(self):
         swz = "_swz" if self.use_swizzling else ""
+        mx = f"_mx{self.mxblock}" if self.mxblock > 0 else ""
         stride = ""
         if self.stride_a and self.stride_a != self.depth_u:
             stride = f"_s{self.stride_a}"
-        return f"{self.mt_a}x{self.mt_b}x{self.depth_u}{swz}{stride}"
-
+        return f"{self.mt_a}x{self.mt_b}x{self.depth_u}{swz}{stride}{mx}"
 
 # ---- HIP helpers ----
 
@@ -104,6 +105,15 @@ def _create_kernel(cfg):
     else:
         raise ValueError(f"Unsupported tile config for wave grouping: mt_a={cfg.mt_a}, mt_b={cfg.mt_b}")
 
+    problemType = {
+        "DataTypeA": dtype,
+        "DataTypeB": dtype,
+        "ComputeDataType": _mock_dtype(4),
+    }
+    if cfg.mxblock > 0:
+        problemType["MXBlockA"] = cfg.mxblock
+        problemType["MXBlockB"] = cfg.mxblock
+
     return {
         "DepthU": cfg.depth_u,
         "MacroTileA": cfg.mt_a,
@@ -114,11 +124,7 @@ def _create_kernel(cfg):
         "MatrixInstK": 32,
         "MIWaveGroup": MIWaveGroup,
         "WavefrontSize": WAVESIZE,
-        "ProblemType": {
-            "DataTypeA": dtype,
-            "DataTypeB": dtype,
-            "ComputeDataType": _mock_dtype(4),
-        },
+        "ProblemType": problemType,
     }
 
 
