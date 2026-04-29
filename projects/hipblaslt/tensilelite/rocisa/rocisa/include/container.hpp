@@ -597,6 +597,52 @@ namespace rocisa
         bool setHi;
     };
 
+    struct EXECLO : public Container
+    {
+        EXECLO()
+            : Container()
+        {
+        }
+
+        EXECLO(const EXECLO& other)
+            : Container()
+        {
+        }
+
+        std::shared_ptr<Container> clone() const override
+        {
+            return std::make_shared<EXECLO>(*this);
+        }
+
+        std::string toString() const override
+        {
+            return "exec_lo";
+        }
+    };
+
+    struct EXECHI : public Container
+    {
+        EXECHI()
+            : Container()
+        {
+        }
+
+        EXECHI(const EXECHI& other)
+            : Container()
+        {
+        }
+
+        std::shared_ptr<Container> clone() const override
+        {
+            return std::make_shared<EXECHI>(*this);
+        }
+
+        std::string toString() const override
+        {
+            return "exec_hi";
+        }
+    };
+
     struct VCC : public Container
     {
         VCC(bool setHi = false)

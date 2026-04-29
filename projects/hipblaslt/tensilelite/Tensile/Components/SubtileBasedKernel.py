@@ -506,7 +506,7 @@ def _applyWavePartitionLROffset(module, writer, kernel, tileInfo):
   module.add(VLShiftRightB32(dst=vgpr(waveId), shiftHex=hex(wavesize.bit_length()-1), src=vgpr("Serial"), comment="waveId"))
 
   # Interleaved needed to be compatible with tensilelite storeC code.
-  interleaved = True
+  interleaved = False#True
   if tileInfo.loadRatioGR == 1.0:
     # W0 W2
     # W1 W3
@@ -1240,7 +1240,7 @@ def emitSubtileDsRead(writer, kernel, tileInfo, subtileId):
       dstVgpr = dstTile.regList.regValues[0]
       numRegs = len(dstTile.regList.regValues)
 
-      interleaved = True
+      interleaved = False#True
       if interleaved:
         if tileInfo.loadRatioGR == 2.0:
           offset = sId0*offsetStride
@@ -1401,7 +1401,12 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
   opCSize = len(vgprTileC.regList.regValues)
   opDSize = len(vgprTileD.regList.regValues)
 
-  accvgprAlias = vgpr if kernel["MIArchVgpr"] else accvgpr
+  # For subtile kernels with agpr overflow, D/C tiles that spilled to the vgpr
+  # pool must use vgpr() in the MFMA operands, not accvgpr().
+  dIsVgpr = (vgprTileD.regList.regPool == writer.vgprPool)
+  cIsVgpr = (vgprTileC.regList.regPool == writer.vgprPool)
+  dAccAlias = vgpr if (dIsVgpr or kernel["MIArchVgpr"]) else accvgpr
+  cAccAlias = vgpr if (cIsVgpr or kernel["MIArchVgpr"]) else accvgpr
 
   aOperand = vgpr(vgprBStart,opBSize) if kernel["SourceSwap"] else vgpr(vgprAStart,opASize)
   bOperand = vgpr(vgprAStart,opASize) if kernel["SourceSwap"] else vgpr(vgprBStart,opBSize)
@@ -1413,20 +1418,20 @@ def emitMfmaInstruction(writer, kernel, vgprTileA, vgprTileB, vgprTileC, vgprTil
     tmpVgprScale = writer.vgprPool.checkOut(1)
     module.add(VMovB32(dst=vgpr(tmpVgprScale), src=hex(0x80), comment="hardcoded scale 0x80"))
     module.add(MXMFMAInstruction(instType=InstType.INST_F4, accType=InstType.INST_F32, variant=[16,16,miK,1], \
-                                 acc=accvgprAlias(vgprDStart,opDSize), \
+                                 acc=dAccAlias(vgprDStart,opDSize), \
                                  a=aOperand, \
                                  b=bOperand, \
-                                 acc2=accvgprAlias(vgprCStart,opCSize), \
+                                 acc2=cAccAlias(vgprCStart,opCSize), \
                                  mxsa=vgpr(tmpVgprScale), mxsb=vgpr(tmpVgprScale), \
                                  comment=comment))
     writer.vgprPool.checkIn(tmpVgprScale)
   else:
     # BF16: 16x16x32
     module.add(MFMAInstruction(instType=InstType.INST_BF16, accType=InstType.INST_F32, variant=[16,16,miK,1], mfma1k=False, \
-                               acc=accvgprAlias(vgprDStart,opDSize), \
+                               acc=dAccAlias(vgprDStart,opDSize), \
                                a=aOperand, \
                                b=bOperand, \
-                               acc2=accvgprAlias(vgprCStart,opCSize), \
+                               acc2=cAccAlias(vgprCStart,opCSize), \
                                comment=comment))
 
   return module

@@ -93,10 +93,12 @@ def _mock_dtype(num_bytes=2):
     return mock
 
 
-def _create_kernel(cfg):
+def _create_kernel(cfg, mi_wave_group=None):
     """Create a minimal kernel dict matching the given tile config."""
     dtype = _mock_dtype(BPE)
-    if ((cfg.mt_a//16) % 2 == 0) and ((cfg.mt_b//16) % 2 == 0):
+    if mi_wave_group is not None:
+        MIWaveGroup = mi_wave_group
+    elif ((cfg.mt_a//16) % 2 == 0) and ((cfg.mt_b//16) % 2 == 0):
         MIWaveGroup = [2,2]
     elif ((cfg.mt_a//16) % 2 != 0) and ((cfg.mt_b//16) % 4 == 0):
         MIWaveGroup = [1,4]
@@ -121,14 +123,16 @@ def _create_kernel(cfg):
         "MacroTile0": cfg.mt_a,
         "MacroTile1": cfg.mt_b,
         "MatrixInstM": 16,
+        "MatrixInstN": 16,
         "MatrixInstK": 32,
         "MIWaveGroup": MIWaveGroup,
         "WavefrontSize": WAVESIZE,
+        "UseSubtileImpl": True,
         "ProblemType": problemType,
     }
 
 
-def create_writer(cfg):
+def create_writer(cfg, mi_wave_group=None):
     """Create a minimal mock writer with register pools, kernel dict, and TileInfo.
 
     Sets up the base writer that all tests need:
@@ -156,15 +160,18 @@ def create_writer(cfg):
     writer.vgprPool.checkOut(1)
 
     # Build kernel and TileInfo
-    kernel = _create_kernel(cfg)
+    kernel = _create_kernel(cfg, mi_wave_group=mi_wave_group)
 
     tileInfoA = TileInfo('A', kernel)
     tileInfoB = TileInfo('B', kernel)
 
+    writer.agprPool = RegisterPool(0, RegisterType.Accvgpr,
+                                    defaultPreventOverflow=False, printRP=False)
+
     writer.states = SimpleNamespace(
         a=SimpleNamespace(tileInfo=tileInfoA),
         b=SimpleNamespace(tileInfo=tileInfoB),
-        regCaps={"MaxSgpr": 106, "MaxVgpr": 256},
+        regCaps={"MaxSgpr": 106, "MaxVgpr": 256, "PhysicalMaxVgpr": 512},
     )
     # LDS layout: A subtiles followed by B subtiles, aligned to readSize
     readSize = 2 * tileInfoA.subtileSize
@@ -222,27 +229,32 @@ def _generate_args_metadata(args):
 
 
 def _scan_register_indices(*texts):
-    """Extract vgpr and sgpr index sets from assembly text.
+    """Extract vgpr, agpr, and sgpr index sets from assembly text.
 
-    Handles bare references (s10, v3) and range references (s[4:7], v[0:3]).
+    Handles bare references (s10, v3, a5) and range references (s[4:7], v[0:3], a[0:3]).
     Also extracts indices from .set directives (.set sgprFoo, 12).
+    Returns (vgprs, agprs, sgprs).
     """
     vgprs = set()
+    agprs = set()
     sgprs = set()
     for text in texts:
         vgprs.update(int(m) for m in re.findall(r'\bv(\d+)\b', text))
+        agprs.update(int(m) for m in re.findall(r'\ba(\d+)\b', text))
         sgprs.update(int(m) for m in re.findall(r'\bs(\d+)\b', text))
         for start, end in re.findall(r'\bs\[(\d+):(\d+)\]', text):
             sgprs.update(range(int(start), int(end) + 1))
         for start, end in re.findall(r'\bv\[(\d+):(\d+)\]', text):
             vgprs.update(range(int(start), int(end) + 1))
+        for start, end in re.findall(r'\ba\[(\d+):(\d+)\]', text):
+            agprs.update(range(int(start), int(end) + 1))
         # .set sgprFoo, N  /  .set vgprBar, N
         sgprs.update(int(m) for m in re.findall(r'\.set\s+sgpr\w+,\s*(\d+)', text))
         vgprs.update(int(m) for m in re.findall(r'\.set\s+vgpr\w+,\s*(\d+)', text))
-    return vgprs, sgprs
+    return vgprs, agprs, sgprs
 
 
-def generate_kernel_asm(inner_asm, writer, args, lds_size=0):
+def generate_kernel_asm(inner_asm, writer, args, lds_size=0, num_threads=None):
     """Generate a complete AMDHSA kernel wrapping inner_asm.
 
     Args:
@@ -255,16 +267,22 @@ def generate_kernel_asm(inner_asm, writer, args, lds_size=0):
     Returns:
         Assembly source string.
     """
+    if num_threads is None:
+        num_threads = NUM_THREADS
     set_directives = generate_set_directives(writer.sgprs)
     args_metadata, kernarg_size = _generate_args_metadata(args)
 
     # Auto-compute register counts from inner_asm + set directives
-    vgpr_indices, sgpr_indices = _scan_register_indices(
+    vgpr_indices, agpr_indices, sgpr_indices = _scan_register_indices(
         inner_asm, set_directives)
 
     max_vgpr = max(vgpr_indices | {0}) + 1
     max_sgpr = max(sgpr_indices | {0}) + 1
     max_vgpr = max(((max_vgpr + 3) // 4) * 4, 4)  # align to 4 for accum_offset
+    # On gfx950, VGPRs and accVGPRs share the physical register file.
+    # next_free_vgpr must cover accum_offset (= max_vgpr) + all accvgprs used.
+    num_agprs = max(agpr_indices | {-1}) + 1  # 0 if no agprs used
+    next_free_vgpr = max_vgpr + num_agprs
 
     return f"""\
 .amdgcn_target "amdgcn-amd-amdhsa--{GFX_TARGET}"
@@ -284,7 +302,7 @@ def generate_kernel_asm(inner_asm, writer, args, lds_size=0):
 .amdhsa_kernel test_kernel
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
   .amdhsa_accum_offset {max_vgpr}
-  .amdhsa_next_free_vgpr {max_vgpr}
+  .amdhsa_next_free_vgpr {next_free_vgpr}
   .amdhsa_next_free_sgpr {max_sgpr}
   .amdhsa_group_segment_fixed_size {lds_size}
   .amdhsa_private_segment_fixed_size 0
@@ -322,8 +340,8 @@ amdhsa.kernels:
     .private_segment_fixed_size: 0
     .wavefront_size: {WAVESIZE}
     .sgpr_count: {max_sgpr}
-    .vgpr_count: {max_vgpr}
-    .max_flat_workgroup_size: {NUM_THREADS}
+    .vgpr_count: {next_free_vgpr}
+    .max_flat_workgroup_size: {num_threads}
 ...
 .end_amdgpu_metadata
 """
@@ -414,7 +432,7 @@ def assemble_kernel(asm_source, output_path):
             os.unlink(obj_path)
 
 
-def run_on_gpu(co_path, output_size, inputs=(), scalars=(), lds_size=0):
+def run_on_gpu(co_path, output_size, inputs=(), scalars=(), lds_size=0, num_threads=None):
     """Load code object, launch kernel, read output buffer.
 
     Builds the kernarg struct dynamically: one u64 per input buffer pointer,
@@ -431,6 +449,8 @@ def run_on_gpu(co_path, output_size, inputs=(), scalars=(), lds_size=0):
     Returns:
         bytes: Raw output buffer contents.
     """
+    if num_threads is None:
+        num_threads = NUM_THREADS
     hip_check(hip.hipInit(0))
 
     module = hip_check(hip.hipModuleLoad(co_path.encode() if isinstance(co_path, str) else co_path))
@@ -446,7 +466,7 @@ def run_on_gpu(co_path, output_size, inputs=(), scalars=(), lds_size=0):
 
     # Allocate output buffer
     d_output = hip_check(hip.hipMalloc(output_size))
-    hip_check(hip.hipMemset(d_output, 0, output_size))
+    hip_check(hip.hipMemset(d_output, 0xff, output_size))
 
     # Build kernarg struct: [input_ptrs...] + [output_ptr] + [scalars...]
     fields = []
@@ -472,7 +492,7 @@ def run_on_gpu(co_path, output_size, inputs=(), scalars=(), lds_size=0):
     hip_check(hip.hipModuleLaunchKernel(
         kernel,
         1, 1, 1,
-        NUM_THREADS, 1, 1,
+        num_threads, 1, 1,
         lds_size,
         None,
         None,
@@ -491,14 +511,14 @@ def run_on_gpu(co_path, output_size, inputs=(), scalars=(), lds_size=0):
     return bytes(h_output)
 
 
-def assemble_and_run(asm, tmp_path, label, output_size, inputs=(), scalars=(), lds_size=0):
+def assemble_and_run(asm, tmp_path, label, output_size, inputs=(), scalars=(), lds_size=0, num_threads=None):
     """Write asm to file, assemble to code object, run on GPU, return raw bytes."""
     co_path = str(tmp_path / f"test_{label}.co")
     asm_path = str(tmp_path / f"test_{label}.s")
     with open(asm_path, "w") as f:
         f.write(asm)
     assemble_kernel(asm, co_path)
-    return run_on_gpu(co_path, output_size, inputs=inputs, scalars=scalars, lds_size=lds_size)
+    return run_on_gpu(co_path, output_size, inputs=inputs, scalars=scalars, lds_size=lds_size, num_threads=num_threads)
 
 
 

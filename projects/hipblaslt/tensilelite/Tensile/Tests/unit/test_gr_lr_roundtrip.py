@@ -362,20 +362,15 @@ def compare_tiles(actual_bytes, expected_tiles, tileInfoA, tileInfoB, wave_id, d
 
 
 def _build_tile_to_mma(tileInfo):
-    """Build map from vgprTile index to (mmaId0, mmaId1)."""
-    if tileInfo.loadRatioGR >= 2.0:
-        interleave_factor = 1
-    elif tileInfo.loadRatioGR == 1.0:
-        interleave_factor = 2
-    else:  # loadRatioGR == 0.5
-        interleave_factor = 4
+    """Build map from vgprTile index to (mmaId0, mmaId1).
+    Non-interleaved layout: interleave_factor = 1 for all configs."""
     tile_to_mma = {}
     for linearId, subtile in enumerate(tileInfo.localSubtiles):
         for mfmaIdx, tileIdx in enumerate(subtile.localReadMap):
             sId0, sId1 = tileInfo.getLocalSubtileIdFromLinearId(linearId)
             mfmaR = mfmaIdx % tileInfo.subtileShape[0]
             mfmaC = mfmaIdx // tileInfo.subtileShape[0]
-            mmaId0 = sId0 * tileInfo.subtileShape[0] * interleave_factor + mfmaR
+            mmaId0 = sId0 * tileInfo.subtileShape[0] + mfmaR
             mmaId1 = sId1 * tileInfo.subtileShape[1] + mfmaC
             tile_to_mma[tileIdx] = (mmaId0, mmaId1)
     return tile_to_mma

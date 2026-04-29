@@ -7445,10 +7445,25 @@ class KernelWriterAssembly(KernelWriter):
       #instCycles = kernel["MatrixInstM"] // 2 # 32x32 is 64 cycles, 16x16 is 32 cycles, 4x4 is 8 cycles
       #module.add(SNop(waitState=instCycles))
       module.addComment1("Mapping of Acc register -> C Vgpr register")
-      self.codes.accVgprRead = mapAcctoArchRegs(kernel, self.states.maxLimitAgprs, write=False)
+      # For subtile kernels with mixed agpr/vgpr accumulators the spilled
+      # D-tile values live in arch vgprs allocated from the pool (not at
+      # ValuC+N). Determine their base vgpr so mapAcctoArchRegs can address
+      # them correctly.
+      spilledVgprBase = None
+      if kernel.get("UseSubtileImpl"):
+        # For subtile kernels, D-tile accumulators that overflow the accvgpr
+        # pool are placed in arch vgprs allocated from the vgpr pool.
+        # mapAcctoArchRegs needs to know the base address of those vgprs so it
+        # can emit correct moves instead of referencing "ValuC+N" (which points
+        # to the wrong location in the subtile allocation scheme).
+        for vtile in self.states.d.tileInfo.vgprTiles:
+          if vtile.regList.regPool == self.vgprPool:
+            spilledVgprBase = vtile.regList.regValues[0]
+            break
+      self.codes.accVgprRead = mapAcctoArchRegs(kernel, self.states.maxLimitAgprs, write=False, spilledVgprBase=spilledVgprBase)
       if (kernel["StreamK"] > 0 and kernel["StreamKAtomic"] == 0) or \
          ((kernel["GlobalSplitU"] == -1 or kernel["GlobalSplitU"] > 0) and (kernel["GlobalSplitUAlgorithm"] == "MultipleBufferSingleKernel" or kernel["AdaptiveGemmGSUA"] == 1)):
-        self.codes.accVgprWrite = mapAcctoArchRegs(kernel, self.states.maxLimitAgprs, write=True)
+        self.codes.accVgprWrite = mapAcctoArchRegs(kernel, self.states.maxLimitAgprs, write=True, spilledVgprBase=spilledVgprBase)  # same spilledVgprBase
       if kernel["MIArchVgpr"]:
         module.addComment1("Multiply MI out register with Alpha -> C Vgpr register")
         self.codes.mulAlphaMultipleBuffer = moveMIoutToArch(kernel, self.states.startVgprAlphaTmp)
@@ -13573,10 +13588,14 @@ class KernelWriterAssembly(KernelWriter):
   # Global Write Elements
   ##############################################################################
   class BF16CVTVgprStruct(NamedTuple): # class for bf16 vgprs
-    vgprBf16Temp: int = -1
-    vgprBf16Mask: int = -1
-    vgprFp32Nan: int = -1
-    vgprBf16Inc: int = -1
+    vgprBf16Temp: int = -1        # rounding bias constant (0x7fff) for standard bf16 pack path
+    vgprBf16Mask: int = -1        # mask constant (0xffff0000) for extracting bf16 bits from f32
+    vgprFp32Nan: int = -1         # NaN sentinel used during bf16 saturation/rounding
+    vgprBf16Inc: int = -1         # increment constant for bf16 rounding (standard pack path)
+    # UseSubtileImpl paired dwordx4 store extras (+0..+3 above are reused as pack/perm staging):
+    vgprPermAddr: int = -1        # per-lane ds_bpermute byte address (partner_lane*4); constant for the whole batch
+    vgprLaneGroupDelta: int = -1  # per-lane lane_group*8: M-row byte offset added to addrDVgpr for the dwordx4 store
+    vgprAddrScratch: int = -1     # per-store scratch: holds (addrDVgpr scaled + lane_group*8) without modifying addrDVgpr
 
   class FP8CVTVgprStruct(NamedTuple):
     vgprFp8NanInf: int = -1
@@ -14140,10 +14159,31 @@ class KernelWriterAssembly(KernelWriter):
 
       cvtVgprStruct  = None
       cvtVgpr        = None
-      if kernel["ProblemType"]["DestDataType"].isBFloat16() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
-        cvtVgpr = self.vgprPool.checkOut(4)
+      is16bitHPA = (kernel["ProblemType"]["DestDataType"].isBFloat16() or
+                    kernel["ProblemType"]["DestDataType"].isHalf()) and \
+                   kernel["ProblemType"]["HighPrecisionAccumulate"]
+      if is16bitHPA:
+        # For UseSubtileImpl, allocate 7 vgprs with 2-alignment (64-bit aligned) so
+        # that the first 4 (reused as pack scratch for the paired 16bit store) satisfy
+        # the buffer_store_dwordx4 alignment requirement.  Any pool vgpr skipped for
+        # alignment becomes a hole that subsequent element-address checkouts fill, so
+        # pool.size() (= startVgprValu) stays within budget for large macro-tiles.
+        # If a very large tile causes accvgpr staging to exceed 256 vgprs despite the
+        # alignment overhead, reduce the batch via NumElementsPerBatchStore.
+        #   +0..+3: scratch for pack output + ds_bpermute + v_permlane32_swap
+        #           (reuses vgprBf16Temp/Mask/Nan/Inc slots; constants written at batch
+        #           start are overwritten by the packed 16bit values before the store)
+        #   +4: vgprPermAddr       — ds_permute partner-lane byte address
+        #   +5: vgprLaneGroupDelta — lane_group*8, pre-computed once per batch
+        #   +6: vgprAddrScratch    — per-store adjusted D address; avoids modifying addrDVgpr
+        numCvtVgprs = 7 if kernel.get("UseSubtileImpl") else 4
+        cvtAlign    = 2 if kernel.get("UseSubtileImpl") else 1
+        cvtVgpr = self.vgprPool.checkOutAligned(numCvtVgprs, cvtAlign)
         cvtVgprStruct = self.BF16CVTVgprStruct(vgprBf16Temp=cvtVgpr, vgprBf16Mask=(cvtVgpr+1), \
-                                               vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3))
+                                               vgprFp32Nan=(cvtVgpr+2), vgprBf16Inc=(cvtVgpr+3), \
+                                               vgprPermAddr=(cvtVgpr+4) if kernel.get("UseSubtileImpl") else -1, \
+                                               vgprLaneGroupDelta=(cvtVgpr+5) if kernel.get("UseSubtileImpl") else -1, \
+                                               vgprAddrScratch=(cvtVgpr+6) if kernel.get("UseSubtileImpl") else -1)
       elif kernel["ProblemType"]["DestDataType"].isAnyFloat8() and kernel["ProblemType"]["HighPrecisionAccumulate"]:
         cvtVgpr = self.vgprPool.checkOut(4)
         cvtVgprStruct = self.FP8CVTVgprStruct(vgprFp8Temp=cvtVgpr, vgprFp8NanInf=(cvtVgpr+1), \
@@ -14403,7 +14443,11 @@ class KernelWriterAssembly(KernelWriter):
     if ss.numVgprsPerElement:
       numElementsPerBatch = numVgprAvailable // ss.numVgprsPerElement
     else:
-      numElementsPerBatch = len(element) # max, do 'em all
+      # numVgprsPerElement==0: accvgprs are pre-staged (e.g. UseSubtileImpl) so no pool
+      # vgprs are needed per element.  Default to the full element list; use
+      # NumElementsPerBatchStore to cap the batch size (e.g. for very large macro-tiles
+      # where a smaller batch reduces register pressure or improves store pipelining).
+      numElementsPerBatch = len(element)
 
     assert(self.states.c.numVgprValu % gwvw == 0) # sanity check
 
@@ -14415,10 +14459,20 @@ class KernelWriterAssembly(KernelWriter):
       numElementsPerBatch = ss.cfg.numElementsPerBatchLimitedBySgprs
 
     # TODO: Which of DataType or DestDataType is in a better sense? 0114: Check Using DestDataType + HSS
-    if (kernel["ProblemType"]["DataType"].isHalf() or kernel["ProblemType"]["DataType"].isBFloat16()):
+    destType = kernel["ProblemType"]["DestDataType"]
+    srcType  = kernel["ProblemType"]["DataType"]
+    subtileImplDest16b = kernel.get("UseSubtileImpl") and (destType.isHalf() or destType.isBFloat16())
+    if (srcType.isHalf() or srcType.isBFloat16() or subtileImplDest16b):
       # only do an even number of halves - since these share hi/lo pieces of some registers?
       if numElementsPerBatch > 1:
         numElementsPerBatch = int(numElementsPerBatch/2)*2
+        # UseSubtileImpl paired-store: batch must be aligned to MIWaveTile[0]
+        # (the number of M-tiles per N-column) so that batch boundaries don't
+        # split sba=0/sba=1 pairs within an N-column.
+        if kernel.get("UseSubtileImpl") and kernel["MIWaveTile"][0] > 1:
+          miwt0 = kernel["MIWaveTile"][0]
+          if numElementsPerBatch >= miwt0:
+            numElementsPerBatch = (numElementsPerBatch // miwt0) * miwt0
       # dot2: no this constraint
       elif not kernel["EnableMatrixInstruction"] and not kernel["UseDotInstruction"]:
         # The globalWriteBatch routine below can't handle odd elements per batch

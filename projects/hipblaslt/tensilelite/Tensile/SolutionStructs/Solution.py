@@ -633,12 +633,21 @@ class Solution(collections.abc.Mapping):
         state["UseMFMAF32XEmulation"] = True # MFMA version for gfx950 etc.
 
     state["MfmaInitCVgprs"] = False
+    # TODOBS: This is currently hardcoded, will need to add logic to enable this
+    # selectively.
     #state["UseSubtileImpl"] = False
     state["UseSubtileImpl"] = True
 
+    # Only enable for GFX950 for now.
+    state["UseSubtileImpl"] = state["UseSubtileImpl"] and state["ISA"] == IsaVersion(9,5,0)
+    
     if state["UseSubtileImpl"]:
       state["VectorWidthA"] = 1
       state["VectorWidthB"] = 1
+      state["SourceSwap"] = False
+      # Force BufferStore=1: UseSubtileImpl optimized storeD path is only implemented
+      # for buffer stores for now.
+      state["BufferStore"] = 1
     
     # done
     state["AssignedProblemIndependentDerivedParameters"] = True
@@ -1006,6 +1015,9 @@ class Solution(collections.abc.Mapping):
   @staticmethod
   def isDirectToLdsDoable(state, tc, isaInfoMap, printRejectionReason: bool):
     isa = state["ISA"]
+
+    if state["UseSubtileImpl"]:
+      return True
 
     # x4 support for directToLds
     canDTLx4 = isaInfoMap[isa].asmCaps["HasDirectToLdsx4"]
@@ -2267,7 +2279,7 @@ class Solution(collections.abc.Mapping):
             if readRegsB == 4 or readRegsB == 1:
               optPadB *= 2
         if ldsPadA == -1:
-          if isMX and state["ProblemType"]["DataTypeA"].is6bitFloat():
+          if isMX and (state["ProblemType"]["DataTypeA"].is6bitFloat() or state["ProblemType"]["DataTypeA"].isFloat4()):
             ldsPadA = 0
           else:
             if not state["UnrollMajorLDSA"]:
@@ -2300,7 +2312,7 @@ class Solution(collections.abc.Mapping):
           assert(ldsPadA >= 0)
 
         if ldsPadB == -1:
-          if isMX and state["ProblemType"]["DataTypeB"].is6bitFloat():
+          if isMX and (state["ProblemType"]["DataTypeB"].is6bitFloat() or state["ProblemType"]["DataTypeB"].isFloat4()):
             ldsPadB = 0
           else:
             if not state["UnrollMajorLDSB"]:
@@ -3206,7 +3218,7 @@ class Solution(collections.abc.Mapping):
         else:
           state["StoreVectorWidth"] = state["VectorWidthA"]
 
-    if state["EnableMatrixInstruction"]:
+    if state["EnableMatrixInstruction"] and not state["UseSubtileImpl"]:
       if state["SourceSwap"]:
         if ((state["VectorWidthA"] % state["StoreVectorWidth"]) != 0):
           reject(state, printRejectionReason, "MFMA SourceSwap mode doesn't support vwA(%u) with svw(%u)" % (state["VectorWidthA"], state["StoreVectorWidth"]))

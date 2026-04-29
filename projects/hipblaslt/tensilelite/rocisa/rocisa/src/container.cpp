@@ -477,6 +477,20 @@ void init_containers(nb::module_ m)
             new(&self) rocisa::EXEC(std::get<0>(t));
         });
 
+    nb::class_<rocisa::EXECLO, rocisa::Container>(m_con, "EXECLO")
+        .def(nb::init<>())
+        .def("__str__", &rocisa::EXECLO::toString)
+        .def("__deepcopy__", [](const rocisa::EXECLO& self, nb::dict&) { return rocisa::EXECLO(self); })
+        .def("__getstate__", [](const rocisa::EXECLO&) { return std::make_tuple(); })
+        .def("__setstate__", [](rocisa::EXECLO& self, std::tuple<> t) { new(&self) rocisa::EXECLO(); });
+
+    nb::class_<rocisa::EXECHI, rocisa::Container>(m_con, "EXECHI")
+        .def(nb::init<>())
+        .def("__str__", &rocisa::EXECHI::toString)
+        .def("__deepcopy__", [](const rocisa::EXECHI& self, nb::dict&) { return rocisa::EXECHI(self); })
+        .def("__getstate__", [](const rocisa::EXECHI&) { return std::make_tuple(); })
+        .def("__setstate__", [](rocisa::EXECHI& self, std::tuple<> t) { new(&self) rocisa::EXECHI(); });
+
     nb::class_<rocisa::VCC, rocisa::Container>(m_con, "VCC")
         .def(nb::init<bool>(), nb::arg("setHi") = false)
         .def("__str__", &rocisa::VCC::toString)

@@ -5217,6 +5217,28 @@ namespace rocisa
         }
     };
 
+    struct VPermlane32SwapB32 : public CommonInstruction
+    {
+        VPermlane32SwapB32(const std::shared_ptr<Container>&   dst,
+                const InstructionInput&             src,
+                const std::string&                  comment = "")
+            : CommonInstruction(
+                InstType::INST_B32, dst, {src}, std::nullopt, std::nullopt, std::nullopt, comment)
+        {
+            setInst("v_permlane32_swap_b32");
+        }
+
+        VPermlane32SwapB32(const VPermlane32SwapB32& other)
+            : CommonInstruction(other)
+        {
+        }
+
+        std::shared_ptr<Item> clone() const override
+        {
+            return std::make_shared<VPermlane32SwapB32>(*this);
+        }
+    };
+
     struct VBfeI32 : public CommonInstruction
     {
         VBfeI32(const std::shared_ptr<Container>& dst,
