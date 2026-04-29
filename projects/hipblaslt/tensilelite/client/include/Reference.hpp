@@ -115,8 +115,13 @@ namespace TensileLite
         template <>
         inline bool AlmostEqual(float a, float b, double threshold)
         {
+            threshold = -1.0;
             float tol     = (threshold > 0.0) ? static_cast<float>(threshold) : AlmostEqualTolerance_Float;
             float absDiff = std::fabs(a - b);
+            //bool res = a == b
+            //  || absDiff < tol * (std::fabs(a) + std::fabs(b) + 1);
+            //printf("absDiff: %f, tol = %f, ae = %d, bd = %f\n",
+            //       absDiff, tol, res, tol * (std::fabs(a) + std::fabs(b) + 1));
             return a == b
                    || absDiff < tol * (std::fabs(a) + std::fabs(b) + 1);
         }
@@ -182,11 +187,6 @@ namespace TensileLite
                           ContractionInputs const&      inputs,
                           size_t                        elementsToValidate,
                           bool                          tryFastPath = true);
-
-        // Check whether a given contraction problem is eligible for the fast CPU GEMM path.
-        // This inspects problem geometry, data types, and feature flags but does not
-        // look at runtime input buffers.
-        bool isFastPathEligible(ContractionProblemGemm const& problem);
 
     } // namespace Client
 } // namespace TensileLite
