@@ -4208,6 +4208,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # SrdD/SrdC are used starting now, remove from sgpr pool
       self.removeSgprVarFromPool("SrdD")
       self.removeSgprVarFromPool("SrdC")
+      self.removeSgprVarFromPool("SrdWS")
       module.add(self.globalWriteWorkGroupInit(kernel))
       #if self.states.doShadowInit == 2:
       #  module.add(self.initC(kernel)) # initC while waiting for global reads
@@ -4254,6 +4255,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     module.add(lraTileAssignmentScaleSwizzled(self, kernel))
 
 
+    module.add(self.calculateLoopNumIter(kernel, tensorParametersA, tensorParametersB, self.states.unrollIdx))
 
 
 
@@ -4318,6 +4320,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       if not self.states.doShadowInit:
         self.removeSgprVarFromPool("SrdD")
         self.removeSgprVarFromPool("SrdC")
+        self.removeSgprVarFromPool("SrdWS")
         module.add(self.globalWriteWorkGroupInit(kernel))
 
       ####################################
@@ -6217,12 +6220,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # Gives pointer shift some room to move left, even into the previous macro-tile
     # This slightly reduces the range of the GRO since they have to include the offset
     # Pointer shift still cannot be used with very small matrices < GRVW
-    self.states.srdShiftLeft["A"] = kernel["GlobalReadVectorWidthA"]
-    self.states.srdShiftLeft["B"] = kernel["GlobalReadVectorWidthB"]
+    self.states.srdShiftLeft["A"] = kernel["GlobalReadVectorWidthA"] if not kernel["UseSubtileImpl"] else 0
+    self.states.srdShiftLeft["B"] = kernel["GlobalReadVectorWidthB"] if not kernel["UseSubtileImpl"] else 0
     if kernel["ProblemType"]["MXBlockA"]:
-      self.states.srdShiftLeft["MXSA"] = kernel["GlobalReadVectorWidthMXSA"]
+      self.states.srdShiftLeft["MXSA"] = kernel["GlobalReadVectorWidthMXSA"] if not kernel["UseSubtileImpl"] else 0
     if kernel["ProblemType"]["MXBlockB"]:
-      self.states.srdShiftLeft["MXSB"] = kernel["GlobalReadVectorWidthMXSB"]
+      self.states.srdShiftLeft["MXSB"] = kernel["GlobalReadVectorWidthMXSB"] if not kernel["UseSubtileImpl"] else 0
     if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
       self.states.srdShiftLeft["Metadata"] = kernel["GlobalReadVectorWidthMetadata"]
 
@@ -7961,8 +7964,8 @@ class KernelWriter(metaclass=abc.ABCMeta):
       self.defineSgpr("DebugKernelItems", 1)
 
     # the sgprs overlap with wg ids
-    #if self.states.doShadowInit and kernel["BufferStore"]:
-    if (self.states.doShadowInit or kernel["UseSubtileImpl"]) and kernel["BufferStore"]:
+    # TODO: For subtileimpl, consider shadowInit param as well
+    if self.states.doShadowInit and kernel["BufferStore"]:
       self.defineSgpr("SrdD", 4, 4)
       self.defineSgpr("SrdC", 4, 4)
 
