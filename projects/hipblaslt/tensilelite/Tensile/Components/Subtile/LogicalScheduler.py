@@ -1417,6 +1417,7 @@ class LogicalScheduler:
         last_lr_mt = {}  # tensor -> mtIteration for LR only
         last_gr_mt = {}  # tensor -> mtIteration for GR only
         first_lr = {}  # tensor -> first LR placement seen
+        last_lr = {}  # tensor -> last LR placement seen
         lr_inc_tensors = set()  # tensors that already received lr_inc
 
         for pi, slots in enumerate(self._partitions):
@@ -1429,6 +1430,7 @@ class LogicalScheduler:
                     if tensor in last_lr_mt and last_lr_mt[tensor] != mt:
                         lr.preOps.append(LRIncOp(tensor=tensor))
                         lr_inc_tensors.add(tensor)
+                    last_lr[tensor] = lr
                     last_lr_mt[tensor] = mt
                 for gr in slot.grs:
                     tensor = gr.tensor
@@ -1442,31 +1444,21 @@ class LogicalScheduler:
                             gr.preOps.append(GRIncOp(tensor=tensor))
                     last_gr_mt[tensor] = mt
 
-        # Handle wrap-around: tensors with a single LR per iteration (e.g. SA, SB)
-        # still need lr_inc because the GR at end-of-iteration writes to the other
-        # LDS buffer, and the next iteration's LR must swap to read from it.
-        # Safe: preOps are consumed by emit(), not during this walk.
-        for tensor, lr in first_lr.items():
-            if tensor not in lr_inc_tensors:
-                last = last_gr_mt.get(tensor, last_lr_mt.get(tensor))
-                if last is not None and last != lr.mtIteration:
-                    lr.preOps.append(LRIncOp(tensor=tensor))
-
-        # Special case for pgr=0. We will get rid of this once we move all lr/grInc to postOps for PGR1/2
         if self.config.pgr == 0:
-            last_lr_per_tensor = {}
             last_gr_per_tensor = {}
             for slots in self._partitions:
                 for slot in slots:
-                    for lr in slot.lrs:
-                        last_lr_per_tensor[lr.tensor] = lr
                     for gr in slot.grs:
                         last_gr_per_tensor[gr.tensor] = gr
             for tensor in self._LR_GR_ORDER:
-                if tensor in last_lr_per_tensor and tensor in last_lr_mt:
-                    last_lr_per_tensor[tensor].postOps.append(LRIncOp(tensor=tensor))
+                if tensor in last_lr and tensor in last_lr_mt:
+                    last_lr[tensor].postOps.append(LRIncOp(tensor=tensor))
                 if tensor in last_gr_per_tensor and tensor in last_gr_mt:
                     last_gr_per_tensor[tensor].postOps.append(GRIncOp(tensor=tensor))
+        else:
+            for tensor, lr in first_lr.items():
+                if tensor not in lr_inc_tensors:
+                    lr.preOps.append(LRIncOp(tensor=tensor))
 
         self._completed.add(Pass.GR_INC)
 
