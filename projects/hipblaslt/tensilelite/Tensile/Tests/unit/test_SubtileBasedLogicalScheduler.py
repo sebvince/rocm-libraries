@@ -83,7 +83,7 @@ def create_kernel(MT0=256, MT1=256, fp4=False, depthU=None):
 
 
 def make_cfg_256x256_fp4(depthU=256, k_gran=1, numPartM=1, numPartN=1,
-                         grSA_k=2, grSA_mn=8, grSB_k=2, grSB_mn=8):
+                         grSA_k=2, grSA_mn=8, grSB_k=2, grSB_mn=8, pgr=2):
     """Build FP4 config with scale tensors. k_gran applies to LR A/B."""
     kernel = create_kernel(256, 256, fp4=True, depthU=depthU)
     tiA = TileInfo('A', kernel)
@@ -104,6 +104,7 @@ def make_cfg_256x256_fp4(depthU=256, k_gran=1, numPartM=1, numPartN=1,
         grSB=ReadGranularity(mn=grSB_mn, k=grSB_k),
         numPartitionsM=numPartM,
         numPartitionsN=numPartN,
+        pgr=pgr,
     )
 
 
@@ -142,7 +143,7 @@ def make_cfg_bf16_pgr0(MT0=256, MT1=256, depthU=64):
     )
 
 
-def make_cfg_bf16_pgr1(MT0=256, MT1=256, depthU=64, numPartM=1, numPartN=1):
+def make_cfg_bf16_pgr1(MT0=256, MT1=256, depthU=128, numPartM=1, numPartN=1):
     """Build BF16 config with pgr=1."""
     kernel = create_kernel(MT0, MT1, fp4=False, depthU=depthU)
     tiA = TileInfo('A', kernel)
@@ -1645,8 +1646,10 @@ if __name__ == "__main__":
     if use_pgr0 or use_pgr1:
         if use_pgr0:
             cfg = make_cfg_bf16_pgr0()
-        else:
+        elif use_bf16:
             cfg = make_cfg_bf16_pgr1()
+        else:
+            cfg = make_cfg_256x256_fp4(pgr=1)
 
         print(f"Config: numMFMATilesM={cfg.numMFMATilesM}, "
               f"numMFMATilesN={cfg.numMFMATilesN}, "
@@ -1682,8 +1685,9 @@ if __name__ == "__main__":
             if interactive and i < len(steps) - 1:
                 input("Press Enter for next step...")
 
-        kernel = create_kernel(256, 256, fp4=False, depthU=64)
-        writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = make_writer_and_tileinfos(kernel, fp4=False)
+        fp4 = use_pgr1 and not use_bf16
+        kernel = create_kernel(256, 256, fp4=fp4)
+        writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = make_writer_and_tileinfos(kernel, fp4=fp4)
 
         sched.allocVgprTiles(writer, tiA, tiB,
                              scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
