@@ -2340,7 +2340,7 @@ class LogicalScheduler:
             self._ngll_per_unroll.append(ngll_copy)
 
             nll_copy = copy.deepcopy(self._nll_emitted)
-            nll_ui = (ui + 2) % self.unroll_factor
+            nll_ui = (ui + self.config.pgr) % self.unroll_factor
             emitter.populate(nll_copy, unroll_iter=nll_ui)
             self._nll_per_unroll.append(nll_copy)
 
