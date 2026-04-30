@@ -1005,8 +1005,9 @@ namespace TensileLite
         uint32_t defaultWGMXCCCHUNK = 0;
 
         // Dynamically pick the values
-        if(sizeMapping.streamK != 0 && skgrid != 0 && sizeMapping.workGroupMapping == 0
-           && sizeMapping.workGroupMappingXCC == -1)
+        if(sizeMapping.streamK != 0 && skgrid != 0)
+	  // && sizeMapping.workGroupMapping == 0
+          // && sizeMapping.workGroupMappingXCC == -1)
         {
             auto sizes = problem.problemSizes();
             // Try to find cached WGM and WGMXCC and WGMXCCCHUNK
@@ -1112,8 +1113,9 @@ namespace TensileLite
         size_t defaultStaggerUStrideShift = 0;
 
         // Dynamically pick the values
-        if(sizeMapping.streamK != 0 && skgrid != 0 && sizeMapping.workGroupMapping == 0
-           && sizeMapping.workGroupMappingXCC == -1)
+        if(sizeMapping.streamK != 0 && skgrid != 0)
+	  // && sizeMapping.workGroupMapping == 0
+          // && sizeMapping.workGroupMappingXCC == -1)
         {
             auto sizes = problem.problemSizes();
             // Try to find cached StaggerUMapping, StaggerU and StaggerUStrideShift
