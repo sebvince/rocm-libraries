@@ -1588,6 +1588,60 @@ class TestIntegration:
         finally:
             sched.deallocVgprTiles(writer)
 
+    @pytest.mark.parametrize("pgr", [1, 2])
+    def test_nll_scale_vgprs_differ_across_unroll_copies(self, pgr):
+        """NLL for each unroll copy must use distinct scale VGPRs matching LR loads."""
+        from rocisa.instruction import MXMFMAInstruction
+
+        kernel = create_kernel(256, 256, fp4=True)
+        writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = make_writer_and_tileinfos(kernel, fp4=True)
+
+        cfg = make_cfg_256x256_fp4(pgr=pgr)
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        sched.allocVgprTiles(writer, tiA, tiB,
+                              scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+
+        try:
+            sched.populate_instructions(
+                writer, kernel,
+                tileInfoA=tiA, tileInfoB=tiB,
+                dtileInfo=dTileInfo,
+                scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+            )
+
+            uf = sched.unroll_factor
+            if uf < 2:
+                pytest.skip("unroll_factor < 2, no multi-copy NLL to test")
+
+            def get_scale_vgprs(emitted_3d):
+                sa_vgprs = set()
+                sb_vgprs = set()
+                for partition in emitted_3d:
+                    for group in partition:
+                        for em in group:
+                            if em.opType == 'mfma':
+                                for inst in em.instructions:
+                                    if isinstance(inst, MXMFMAInstruction):
+                                        sa_vgprs.add(str(inst.mxsa))
+                                        sb_vgprs.add(str(inst.mxsb))
+                return sa_vgprs, sb_vgprs
+
+            nll_scales = []
+            for ui in range(uf):
+                nll_scales.append(get_scale_vgprs(sched._nll_per_unroll[ui]))
+
+            for ui in range(uf):
+                for uj in range(ui + 1, uf):
+                    sa_i, sb_i = nll_scales[ui]
+                    sa_j, sb_j = nll_scales[uj]
+                    assert sa_i != sa_j, \
+                        f"PGR{pgr}: NLL_C{ui} and NLL_C{uj} use same scaleA VGPRs {sa_i}"
+                    assert sb_i != sb_j, \
+                        f"PGR{pgr}: NLL_C{ui} and NLL_C{uj} use same scaleB VGPRs {sb_i}"
+        finally:
+            sched.deallocVgprTiles(writer)
+
 # Tool to visualize the scheduling steps on a real kernel configuration. Run with --interactive to step through each phase.
 # Also calls the instruction scheduler to verify the emitted modules are valid input and to show the final instruction counts.
 
@@ -1617,6 +1671,7 @@ if __name__ == "__main__":
 
         steps = [
             ("Place LRs",                     lambda: (sched.place_LRs(), sched.print_lr())),
+            ("Assign VGPR tiles",             lambda: (sched.assign_vgpr_tiles(), sched.print_vgpr())),
             ("Place GRs",                     lambda: (sched.place_GRs(), sched.print_gr())),
             ("Annotate deps",                 lambda: (sched.annotate_deps(), sched.print_deps())),
             ("Remove unnecessary GR deps",    lambda: (sched.remove_unnecessary_gr_deps(), sched.print_deps())),
