@@ -4067,7 +4067,7 @@ class Solution(collections.abc.Mapping):
         state["StoreSwapAddr"] = offsetBlk > 0 and (state["1LDSBuffer"] != 1) and \
           (offsetBlk + int(2**(math.ceil(math.log(offsetBlk, 2)))) > state["MaxLDS"])
 
-      if offsetBlk > 0 and not state["StoreSwapAddr"] and numLdsBlk == 2:
+      if offsetBlk > 0 and not state["StoreSwapAddr"] and not state["UseSubtileImpl"] and numLdsBlk == 2:
         # Rounds offsetBlk to a power of two to enable inlining {s,v}_xor constants for swapping offsets
         # skip ceiling to nearest power of two for numLdsBlk>=3
         offsetBlk = roundupOffsetBlk
