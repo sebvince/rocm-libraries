@@ -54,12 +54,14 @@ def _mock_dtype(num_bytes=2):
     return mock
 
 
-def create_kernel(MT0=256, MT1=256, fp4=False, depthU=None):
+def create_kernel(MT0=256, MT1=256, fp4=False, depthU=None, miWaveGroup=None, sourceSwap=False):
     mxblock = 32 if fp4 else 0
     bpe = 0.5 if fp4 else 2
     matrixInstK = 128 if fp4 else 32
     if depthU is None:
         depthU = 256 if fp4 else 64
+    if miWaveGroup is None:
+        miWaveGroup = [2, 2]
     dtype = _mock_dtype(bpe)
     problemType = {
         "DataTypeA": dtype,
@@ -80,9 +82,9 @@ def create_kernel(MT0=256, MT1=256, fp4=False, depthU=None):
         "MatrixInstM": 16,
         "MatrixInstN": 16,
         "MatrixInstK": matrixInstK,
-        "MIWaveGroup": [2, 2],
+        "MIWaveGroup": miWaveGroup,
         "WavefrontSize": 64,
-        "SourceSwap": False,
+        "SourceSwap": sourceSwap,
         "MIArchVgpr": False,
         "NonTemporalA": 0,
         "NonTemporalB": 0,
@@ -1779,8 +1781,8 @@ if __name__ == "__main__":
             lrB=ReadGranularity(mn=1, k=1),
             grA=ReadGranularity(mn=1, k=2),
             grB=ReadGranularity(mn=1, k=2),
-            numPartitionsM=2,
-            numPartitionsN=1,
+            numPartitionsM=1,
+            numPartitionsN=19,
         )
     else:
         kernel = create_kernel(128, 128, fp4=True, depthU=512)
