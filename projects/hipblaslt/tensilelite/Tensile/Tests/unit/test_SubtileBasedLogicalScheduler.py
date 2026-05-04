@@ -1661,7 +1661,27 @@ if __name__ == "__main__":
         elif use_bf16:
             cfg = make_cfg_bf16_pgr1()
         else:
-            cfg = make_cfg_256x256_fp4(pgr=1)
+            _kernel_fp4_pgr1 = create_kernel(128, 128, fp4=True, depthU=512)
+            _tiA = TileInfo('A', _kernel_fp4_pgr1)
+            _tiB = TileInfo('B', _kernel_fp4_pgr1)
+            _scaleTiA = TileInfo('MXSA', _kernel_fp4_pgr1)
+            _scaleTiB = TileInfo('MXSB', _kernel_fp4_pgr1)
+            cfg = SchedulerConfig(
+                numMFMATilesM=_tiA.localMMATileGrid[0],
+                numMFMATilesN=_tiB.localMMATileGrid[0],
+                numSubIterK=_tiA.localMMATileGrid[1],
+                lrA=ReadGranularity(mn=1, k=1),
+                lrB=ReadGranularity(mn=1, k=1),
+                grA=ReadGranularity(mn=1, k=2),
+                grB=ReadGranularity(mn=1, k=2),
+                lrSA=ReadGranularity(mn=2, k=2),
+                lrSB=ReadGranularity(mn=2, k=2),
+                grSA=ReadGranularity(mn=_scaleTiA.localMMATileGrid[0], k=_scaleTiA.localMMATileGrid[1]),
+                grSB=ReadGranularity(mn=_scaleTiB.localMMATileGrid[0], k=_scaleTiB.localMMATileGrid[1]),
+                numPartitionsM=1,
+                numPartitionsN=1,
+                pgr=1,
+            )
 
         print(f"Config: numMFMATilesM={cfg.numMFMATilesM}, "
               f"numMFMATilesN={cfg.numMFMATilesN}, "
@@ -1698,7 +1718,10 @@ if __name__ == "__main__":
                 input("Press Enter for next step...")
 
         fp4 = use_pgr1 and not use_bf16
-        kernel = create_kernel(256, 256, fp4=fp4)
+        if fp4:
+            kernel = create_kernel(128, 128, fp4=True, depthU=512)
+        else:
+            kernel = create_kernel(256, 256, fp4=fp4)
         writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = make_writer_and_tileinfos(kernel, fp4=fp4)
 
         sched.allocVgprTiles(writer, tiA, tiB,
