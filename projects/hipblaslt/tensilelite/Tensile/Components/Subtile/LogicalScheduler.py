@@ -2158,12 +2158,19 @@ class LogicalScheduler:
             module.add(self._emitLoop(writer, kernel, "NLL",
                                       self._nll_per_unroll[0]))
         else:
+            # NLLEarly (preloop skip when LoopCounterL <= 1) reuses the
+            # NLL copy whose tile maps match the preloop (unroll_iter=0).
+            # nll_ui = (ui + pgr) % uf, so we need ui where nll_ui == 0:
+            nll_early_ui = (uf - self.config.pgr) % uf
+
             # Fall-through from last mainloop copy
             last = uf - 1
             if hasNGLL:
                 module.addComment0(f"NGLL_C{last}")
                 module.add(self._emitLoop(writer, kernel, f"NGLL_C{last}",
                                           self._ngll_per_unroll[last]))
+            if last == nll_early_ui:
+                module.add(Label("SkipToNLL", ""))
             module.addComment0(f"NLL_C{last}")
             module.add(self._emitLoop(writer, kernel, f"NLL_C{last}",
                                       self._nll_per_unroll[last]))
@@ -2176,6 +2183,8 @@ class LogicalScheduler:
                     module.addComment0(f"NGLL_C{ui}")
                     module.add(self._emitLoop(writer, kernel, f"NGLL_C{ui}",
                                               self._ngll_per_unroll[ui]))
+                if ui == nll_early_ui:
+                    module.add(Label("SkipToNLL", ""))
                 module.addComment0(f"NLL_C{ui}")
                 module.add(self._emitLoop(writer, kernel, f"NLL_C{ui}",
                                           self._nll_per_unroll[ui]))
@@ -2183,13 +2192,6 @@ class LogicalScheduler:
                     module.add(SBranch(labelName=endLabel.getLabelName(),
                                        comment="skip other exit paths"))
 
-            # NLLEarly: reached from preloop when LoopCounterL <= 1
-            module.add(SBranch(labelName=endLabel.getLabelName(),
-                               comment="skip NLLEarly"))
-            module.addComment0("NLLEarly")
-            module.add(Label("SkipToNLL", ""))
-            module.add(self._emitLoop(writer, kernel, "NLLEarly",
-                                      self._nll_per_unroll[0]))
             module.add(endLabel)
 
         return module
