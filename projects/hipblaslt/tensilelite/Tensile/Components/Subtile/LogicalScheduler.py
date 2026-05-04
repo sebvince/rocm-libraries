@@ -2149,45 +2149,50 @@ class LogicalScheduler:
             module.add(Label("SkipToNGLL", ""))
 
         if uf == 1:
+            nll_idx = self.config.pgr % uf
             if hasNGLL:
                 module.addComment0("NGLL")
                 module.add(self._emitLoop(writer, kernel, "NGLL",
-                                          self._ngll_per_unroll[0]))
+                                          self._ngll_per_unroll[1 % uf]))
             module.addComment0("NLL")
             module.add(Label("SkipToNLL", ""))
             module.add(self._emitLoop(writer, kernel, "NLL",
-                                      self._nll_per_unroll[0]))
+                                      self._nll_per_unroll[nll_idx]))
         else:
-            # NLLEarly (preloop skip when LoopCounterL <= 1) reuses the
-            # NLL copy whose tile maps match the preloop (unroll_iter=0).
-            # nll_ui = (ui + pgr) % uf, so we need ui where nll_ui == 0:
-            nll_early_ui = (uf - self.config.pgr) % uf
+            # _per_unroll[i] has tiles for unroll_iter=i.
+            # After mainloop C{ui}, data in LDS/vgprs corresponds to
+            # unroll_iter = (ui + pgr) % uf for NLL, (ui + 1) % uf for NGLL.
+            # NLLEarly (preloop skip) needs unroll_iter=0, i.e. _nll_per_unroll[0].
+            # We place SkipToNLL before whichever NLL block uses index 0.
+            pgr = self.config.pgr
+            last = uf - 1
 
             # Fall-through from last mainloop copy
-            last = uf - 1
+            nll_ft = (last + pgr) % uf
             if hasNGLL:
                 module.addComment0(f"NGLL_C{last}")
                 module.add(self._emitLoop(writer, kernel, f"NGLL_C{last}",
-                                          self._ngll_per_unroll[last]))
-            if last == nll_early_ui:
+                                          self._ngll_per_unroll[(last + 1) % uf]))
+            if nll_ft == 0:
                 module.add(Label("SkipToNLL", ""))
             module.addComment0(f"NLL_C{last}")
             module.add(self._emitLoop(writer, kernel, f"NLL_C{last}",
-                                      self._nll_per_unroll[last]))
+                                      self._nll_per_unroll[nll_ft]))
             module.add(SBranch(labelName=endLabel.getLabelName(),
                                comment="skip other exit paths"))
 
             for ui in range(uf - 1):
+                nll_idx = (ui + pgr) % uf
                 module.add(exitLabels[ui])
                 if hasNGLL:
                     module.addComment0(f"NGLL_C{ui}")
                     module.add(self._emitLoop(writer, kernel, f"NGLL_C{ui}",
-                                              self._ngll_per_unroll[ui]))
-                if ui == nll_early_ui:
+                                              self._ngll_per_unroll[(ui + 1) % uf]))
+                if nll_idx == 0:
                     module.add(Label("SkipToNLL", ""))
                 module.addComment0(f"NLL_C{ui}")
                 module.add(self._emitLoop(writer, kernel, f"NLL_C{ui}",
-                                          self._nll_per_unroll[ui]))
+                                          self._nll_per_unroll[nll_idx]))
                 if ui < uf - 2:
                     module.add(SBranch(labelName=endLabel.getLabelName(),
                                        comment="skip other exit paths"))
@@ -2329,13 +2334,11 @@ class LogicalScheduler:
             self._emitted_per_unroll.append(em_copy)
 
             ngll_copy = copy.deepcopy(self._ngll_emitted)
-            ngll_ui = (ui + 1) % self.unroll_factor
-            emitter.populate(ngll_copy, unroll_iter=ngll_ui)
+            emitter.populate(ngll_copy, unroll_iter=ui)
             self._ngll_per_unroll.append(ngll_copy)
 
             nll_copy = copy.deepcopy(self._nll_emitted)
-            nll_ui = (ui + self.config.pgr) % self.unroll_factor
-            emitter.populate(nll_copy, unroll_iter=nll_ui)
+            emitter.populate(nll_copy, unroll_iter=ui)
             self._nll_per_unroll.append(nll_copy)
 
         self._completed.add(Pass.POPULATE)
