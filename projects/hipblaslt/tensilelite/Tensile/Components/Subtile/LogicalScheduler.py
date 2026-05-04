@@ -1226,79 +1226,92 @@ class LogicalScheduler:
     def remove_unnecessary_lr_deps(self):
         """Remove GR→LR collision deps already covered by an earlier sync.
 
-        A GR with an LR dep creates a sync point. 
-        We get the latest LR guaranted at this sync point (prevLRDep), which is the max of:
-         - the GR's own LR dep 
-         - the MFMA's same-tensor LR dep
-        
-        If the current GR's LR dep (currLRDep) has exec order <= prevLRDep, it is already guaranteed
-        and can be removed.
+        A slot is a sync point when it contains any GR-with-LR-dep or any
+        LR-with-GR-deps. At a sync slot, the per-tensor last LR guaranteed
+        is the max exec_order of:
+          - the MFMA's LR deps at that slot
+          - any GR-with-LR-dep's own LR dep at that slot
 
-        Exec order is (mt_offset, partition, subIterK_slot).
-        On wrap-around the exec order is shifted by MT-1.
+        For each LR dep on a GR (curLR), find the previous sync (in exec
+        order, skipping the current slot) providing a last LR for the same
+        tensor. If that last LR's exec_order >= curLR's, the dep is redundant.
+
+        Exec order: (mt_offset, partition, subIterK_slot). On wrap-around
+        the mt_offset is shifted by -1.
         """
         self._ensure_pass(Pass.REMOVE_GR_DEPS)
 
         def _dep_exec_order(dep):
             return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
 
-        gr_with_lr_deps = []
+        # Step 1: collect one sync entry per sync slot.
+        # Each entry: (pos, last_lr_by_tensor, [grs_to_check])
+        sync_slots = []
         for pi, slots in enumerate(self._partitions):
             for slot in slots:
-                for gr in slot.grs:
-                    if gr.deps:
-                        dep = gr.deps[0]
-                        if isinstance(dep.ref, LRPlacement):
-                            gr_with_lr_deps.append((pi, slot.subIterK, gr, dep))
+                grs_with_lr = [
+                    gr for gr in slot.grs
+                    if gr.deps and isinstance(gr.deps[0].ref, LRPlacement)]
+                lr_with_gr_exists = any(
+                    lr.deps and isinstance(lr.deps[0].ref, GRPlacement)
+                    for lr in slot.lrs)
+                if not grs_with_lr and not lr_with_gr_exists:
+                    continue
 
-        if len(gr_with_lr_deps) <= 1:
+                last_lr = {}
+                if slot.mfma:
+                    for d in slot.mfma.deps:
+                        if isinstance(d.ref, LRPlacement):
+                            t = d.ref.tensor
+                            eo = _dep_exec_order(d)
+                            if t not in last_lr or eo > last_lr[t]:
+                                last_lr[t] = eo
+                for gr in grs_with_lr:
+                    dep = gr.deps[0]
+                    t = dep.ref.tensor
+                    eo = _dep_exec_order(dep)
+                    if t not in last_lr or eo > last_lr[t]:
+                        last_lr[t] = eo
+
+                sync_slots.append(((pi, slot.subIterK), last_lr, grs_with_lr))
+
+        if not sync_slots:
             self._completed.add(Pass.REMOVE_LR_DEPS)
             return
 
-        mfma_by_pos = {}
-        for pi, slots in enumerate(self._partitions):
-            for slot in slots:
-                if slot.mfma:
-                    mfma_by_pos[(pi, slot.subIterK)] = slot.mfma
+        sync_slots.sort(key=lambda x: x[0])
+        n = len(sync_slots)
 
-        gr_with_lr_deps.sort(key=lambda x: (x[0], x[1]))
+        # Step 2 & 3: for each GR with LR dep, walk backward (with
+        # wrap-around) to find the previous sync slot providing a last LR
+        # for this tensor.
+        for i in range(n):
+            _, _, grs_to_check = sync_slots[i]
+            for gr in grs_to_check:
+                if not gr.deps:
+                    continue
+                dep = gr.deps[0]
+                tensor = dep.ref.tensor
+                cur_eo = _dep_exec_order(dep)
 
-        last_sync = (gr_with_lr_deps[-1][0], gr_with_lr_deps[-1][1])
-        # Per-tensor max LR exec order guaranteed at last_sync.
-        last_sync_eo = {}
+                prev_eo = None
+                cur_pos = sync_slots[i][0]
+                for j in range(1, n + 1):
+                    idx = (i - j) % n
+                    wrapped = j > i  # crossed iteration boundary
+                    # Same-slot in same iteration is concurrent, skip.
+                    if not wrapped and sync_slots[idx][0] == cur_pos:
+                        continue
+                    prev_last_lr = sync_slots[idx][1]
+                    if tensor in prev_last_lr:
+                        eo = prev_last_lr[tensor]
+                        if wrapped:
+                            eo = (eo[0] - 1, eo[1], eo[2])
+                        prev_eo = eo
+                        break
 
-        def _update_sync_eo(pos, shift):
-            """Collect per-tensor max LR exec order at pos (MFMA deps)."""
-            eo_map = {}
-            mfma = mfma_by_pos.get(pos)
-            if mfma and mfma.deps:
-                for d in mfma.deps:
-                    if isinstance(d.ref, LRPlacement):
-                        t = d.ref.tensor
-                        d_eo = _dep_exec_order(d)
-                        if shift:
-                            d_eo = (d_eo[0] - 1, d_eo[1], d_eo[2])
-                        if t not in eo_map or d_eo > eo_map[t]:
-                            eo_map[t] = d_eo
-            return eo_map
-
-        # Seed from last position (previous MT → shift by -1).
-        last_sync_eo = _update_sync_eo(last_sync, shift=True)
-
-        for pi, subIterK, gr, dep in gr_with_lr_deps:
-            curr_eo = _dep_exec_order(dep)
-            tensor = dep.ref.tensor
-
-            prev_lr_eo = last_sync_eo.get(tensor)
-            if prev_lr_eo is not None and curr_eo <= prev_lr_eo:
-                gr.deps.clear()
-                continue
-
-            last_sync = (pi, subIterK)
-            last_sync_eo = _update_sync_eo(last_sync, shift=False)
-            # The GR's own dep is also a sync point at this slot.
-            if tensor not in last_sync_eo or curr_eo > last_sync_eo[tensor]:
-                last_sync_eo[tensor] = curr_eo
+                if prev_eo is not None and prev_eo >= cur_eo:
+                    gr.deps.clear()
 
         self._completed.add(Pass.REMOVE_LR_DEPS)
 
