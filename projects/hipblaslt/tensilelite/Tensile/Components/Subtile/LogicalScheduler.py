@@ -314,6 +314,9 @@ class WaitLROp(BaseOp):
     def __post_init__(self):
         self.kind = 'wait_lr'
 
+    def __str__(self):
+        return 'wait_lr_sync' if self.has_sync else 'wait_lr'
+
 
 @dataclass
 class SyncOp(BaseOp):
