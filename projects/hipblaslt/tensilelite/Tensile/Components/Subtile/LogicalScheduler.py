@@ -145,6 +145,7 @@ class SchedulerConfig:
     def __post_init__(self):
         assert self.pgr in (0, 1, 2), f"pgr must be 0, 1, or 2, got {self.pgr}"
         self.plr = 0 if self.pgr == 0 else 1
+        self.offsetPartition = 1 if self.pgr >= 2 else 0
         if self.pgr == 0:
             assert self.numPartitions == 1, "pgr=0 requires numPartitions=1"
 
@@ -1000,8 +1001,7 @@ class LogicalScheduler:
 
         pgr = self.config.pgr
         offsetMT = 0 if pgr == 0 else 1
-        offsetPartition = 1 if pgr >= 2 else 0
-        gr_list = self._build_gr_list(part_ranges, offsetMT, offsetPartition)
+        gr_list = self._build_gr_list(part_ranges, offsetMT, self.config.offsetPartition)
         gr_slot_bounds = self._build_gr_slot_bounds()
         self._distribute_grs(gr_list, gr_slot_bounds)
 
@@ -2038,36 +2038,39 @@ class LogicalScheduler:
         """Create MT1 GRs for the PGR=2 preloop, ordered to match the mainloop.
 
         Walks all partition slots, finds GRs whose tileId range matches
-        partition 0, groups by subIterK, sorts within each group by
-        _gr_sort_key, and creates fresh GRPlacements with mtIteration=1.
+        partitions 0..offsetPartition-1, groups by subIterK, sorts within
+        each group by _gr_sort_key, and creates fresh GRPlacements with
+        mtIteration=1.
         """
         self._ensure_pass(Pass.GR)
         cfg = self.config
-        part0 = self._partition_tile_range(0)
-
-        grs_by_k: dict[int, list[GRPlacement]] = {}
-        for slots in self._partitions:
-            for slot in slots:
-                for gr in slot.grs:
-                    side = TENSOR_SIDE[gr.tensor]
-                    t_start, t_end = part0[side]
-                    if gr.tiles.tileId_start < t_end and gr.tiles.tileId_end > t_start:
-                        grs_by_k.setdefault(slot.subIterK, []).append(gr)
 
         result = []
-        for k in range(cfg.numSubIterK):
-            for gr in sorted(grs_by_k.get(k, []), key=self._gr_sort_key):
-                result.append(GRPlacement(
-                    tensor=gr.tensor,
-                    mtIteration=1,
-                    tiles=MFMATileRange(
-                        gr.tiles.subIterK_start,
-                        gr.tiles.subIterK_end,
-                        gr.tiles.tileId_start,
-                        gr.tiles.tileId_end),
-                    subIterK_slot=k,
-                    partition=0,
-                ))
+        for pi in range(cfg.offsetPartition):
+            part_range = self._partition_tile_range(pi)
+
+            grs_by_k: dict[int, list[GRPlacement]] = {}
+            for slots in self._partitions:
+                for slot in slots:
+                    for gr in slot.grs:
+                        side = TENSOR_SIDE[gr.tensor]
+                        t_start, t_end = part_range[side]
+                        if gr.tiles.tileId_start < t_end and gr.tiles.tileId_end > t_start:
+                            grs_by_k.setdefault(slot.subIterK, []).append(gr)
+
+            for k in range(cfg.numSubIterK):
+                for gr in sorted(grs_by_k.get(k, []), key=self._gr_sort_key):
+                    result.append(GRPlacement(
+                        tensor=gr.tensor,
+                        mtIteration=1,
+                        tiles=MFMATileRange(
+                            gr.tiles.subIterK_start,
+                            gr.tiles.subIterK_end,
+                            gr.tiles.tileId_start,
+                            gr.tiles.tileId_end),
+                        subIterK_slot=k,
+                        partition=pi,
+                    ))
         return result
 
     def build_preloop(self) -> List[List[List[EmittedModule]]]:
