@@ -140,11 +140,12 @@ class SchedulerConfig:
     grSB: Optional[ReadGranularity] = None
     numPartitionsM: int = 1   # partition grid in M dimension
     numPartitionsN: int = 1   # partition grid in N dimension
-    pgr: int = 2              # Prefetch Global Read: 0 = current MT, 2 = next MT
+    pgr: int = 2              # Prefetch Global Read
 
     def __post_init__(self):
         assert self.pgr in (0, 1, 2), f"pgr must be 0, 1, or 2, got {self.pgr}"
         self.plr = 0 if self.pgr == 0 else 1
+        # Forcing offsetPartition to 1.
         self.offsetPartition = 1 if self.pgr >= 2 else 0
         if self.pgr == 0:
             assert self.numPartitions == 1, "pgr=0 requires numPartitions=1"
@@ -2037,37 +2038,34 @@ class LogicalScheduler:
     def _make_preloop_mt1_grs(self) -> List[GRPlacement]:
         """Create MT1 GRs for the PGR=2 preloop, ordered to match the mainloop.
 
-        Walks all partition slots, finds GRs whose tileId range matches
-        partitions 0..offsetPartition-1, groups by subIterK, sorts within
-        each group by _gr_sort_key, and creates fresh GRPlacements with
-        mtIteration=1.
+        Covers partitions 0..offsetPartition-1 with proper deduplication.
+        Each unique (tensor, tile-range, k-range) appears exactly once.
         """
-        self._ensure_pass(Pass.GR)
+        self._ensure_pass(Pass.LR)
         cfg = self.config
 
+        seen = set()
         result = []
         for pi in range(cfg.offsetPartition):
-            part_range = self._partition_tile_range(pi)
-
-            grs_by_k: dict[int, list[GRPlacement]] = {}
-            for slots in self._partitions:
-                for slot in slots:
-                    for gr in slot.grs:
-                        side = TENSOR_SIDE[gr.tensor]
-                        t_start, t_end = part_range[side]
-                        if gr.tiles.tileId_start < t_end and gr.tiles.tileId_end > t_start:
-                            grs_by_k.setdefault(slot.subIterK, []).append(gr)
-
-            for k in range(cfg.numSubIterK):
-                for gr in sorted(grs_by_k.get(k, []), key=self._gr_sort_key):
+            target_range = self._partition_tile_range(pi)
+            for slot in self._partitions[0]:
+                k = slot.mfma.subIterK
+                items = [('A', target_range['A'], cfg.grA),
+                         ('B', target_range['B'], cfg.grB)]
+                if cfg.hasScale:
+                    items.append(('SA', target_range['A'], cfg.grSA))
+                    items.append(('SB', target_range['B'], cfg.grSB))
+                for tensor, (t_start, t_end), gr_gran in items:
+                    tr = gr_gran.tile_range(k, t_start, t_end)
+                    key = (tensor, tr.tileId_start, tr.tileId_end,
+                           tr.subIterK_start, tr.subIterK_end)
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     result.append(GRPlacement(
-                        tensor=gr.tensor,
+                        tensor=tensor,
                         mtIteration=1,
-                        tiles=MFMATileRange(
-                            gr.tiles.subIterK_start,
-                            gr.tiles.subIterK_end,
-                            gr.tiles.tileId_start,
-                            gr.tiles.tileId_end),
+                        tiles=tr,
                         subIterK_slot=k,
                         partition=pi,
                     ))
@@ -2150,7 +2148,7 @@ class LogicalScheduler:
         for pi, partition_emitted in enumerate(emitted_3d):
             for k, em_list in enumerate(partition_emitted):
                 module.addComment0(f"partition={pi} subIterK={k}")
-                if schedule:
+                if schedule and em_list:
                     scheduled = instructionSchedule(em_list)
                     module.add(scheduled)
                 else:

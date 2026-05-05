@@ -1045,3 +1045,116 @@ def test_128x128_fp4_pgr1():
         f"--- Expected ---\n{EXPECTED_EMIT_DEP_ORDER_128x128_FP4_PGR1}\n"
         f"--- Actual ---\n{actual}"
     )
+
+
+EXPECTED_PRELOOP_256x256_FP4_1x1 = """\
+MAINLOOP:
+  Partition 0:
+    subIterK=0:
+      [ 0] gr         GR A (MT n, subIterK [0,1]) ids [0-7]
+      [ 1] gr         GR B (MT n, subIterK [0,1]) ids [0-7]
+      [ 2] gr         GR SA (MT n, subIterK [0,1]) ids [0-7]
+      [ 3] gr         GR SB (MT n, subIterK [0,1]) ids [0-7]
+      [ 4] gr_inc     gr_inc(A)
+      [ 5] gr_inc     gr_inc(B)
+      [ 6] gr_inc     gr_inc(SA)
+      [ 7] gr_inc     gr_inc(SB)
+      [ 8] wait_gr    wait_gr(0)
+      [ 9] sync       sync
+      [10] lr         LR A  (MT n, subIterK [0]) [0-7]
+      [11] lr         LR B  (MT n, subIterK [0]) [0-7]
+      [12] lr         LR SA (MT n, subIterK [0,1]) [0-7]
+      [13] lr         LR SB (MT n, subIterK [0,1]) [0-7]
+      [14] skip       skip(LE:1:NLL)
+      [15] gr         GR A (MT n+1, subIterK [0,1]) ids [0-7]
+      [16] gr         GR B (MT n+1, subIterK [0,1]) ids [0-7]
+      [17] gr         GR SA (MT n+1, subIterK [0,1]) ids [0-7]
+      [18] gr         GR SB (MT n+1, subIterK [0,1]) ids [0-7]
+      [19] skip       skip(LE:2:NGLL)
+"""
+
+
+def test_256x256_fp4_preloop_1x1():
+    """Exact check of preloop for 256x256 FP4, 1x1 partition."""
+    cfg = make_256x256_fp4()
+    sched = LogicalScheduler(cfg)
+    sched.emit()
+    preloop = sched.build_preloop()
+    actual = sched.print_emit(preloop)
+    assert actual == EXPECTED_PRELOOP_256x256_FP4_1x1, (
+        f"Preloop mismatch.\n"
+        f"--- Expected ---\n{EXPECTED_PRELOOP_256x256_FP4_1x1}\n"
+        f"--- Actual ---\n{actual}"
+    )
+
+
+EXPECTED_PRELOOP_320x320_BF16_1x5_OFFSET1 = """\
+MAINLOOP:
+  Partition 0:
+    subIterK=0:
+      [ 0] gr         GR A (MT n, subIterK [0,1]) ids [0-9]
+      [ 1] gr         GR B (MT n, subIterK [0,1]) ids [0-9]
+      [ 2] gr_inc     gr_inc(A)
+      [ 3] gr_inc     gr_inc(B)
+      [ 4] wait_gr    wait_gr(0)
+      [ 5] sync       sync
+      [ 6] lr         LR A  (MT n, subIterK [0]) [0-9]
+      [ 7] lr         LR B  (MT n, subIterK [0]) [0-1]
+      [ 8] skip       skip(LE:1:NLL)
+      [ 9] gr         GR A (MT n+1, subIterK [0,1]) ids [0-9]
+      [10] gr         GR B (MT n+1, subIterK [0,1]) ids [0-1]
+      [11] skip       skip(LE:2:NGLL)
+"""
+
+EXPECTED_PRELOOP_320x320_BF16_1x5_OFFSET_ALL = """\
+MAINLOOP:
+  Partition 0:
+    subIterK=0:
+      [ 0] gr         GR A (MT n, subIterK [0,1]) ids [0-9]
+      [ 1] gr         GR B (MT n, subIterK [0,1]) ids [0-9]
+      [ 2] gr_inc     gr_inc(A)
+      [ 3] gr_inc     gr_inc(B)
+      [ 4] wait_gr    wait_gr(0)
+      [ 5] sync       sync
+      [ 6] lr         LR A  (MT n, subIterK [0]) [0-9]
+      [ 7] lr         LR B  (MT n, subIterK [0]) [0-1]
+      [ 8] skip       skip(LE:1:NLL)
+      [ 9] gr         GR A (MT n+1, subIterK [0,1]) ids [0-9]
+      [10] gr         GR B (MT n+1, subIterK [0,1]) ids [0-1]
+      [11] gr         GR B (MT n+1, subIterK [0,1]) ids [2-3]
+      [12] gr         GR B (MT n+1, subIterK [0,1]) ids [4-5]
+      [13] gr         GR B (MT n+1, subIterK [0,1]) ids [6-7]
+      [14] gr         GR B (MT n+1, subIterK [0,1]) ids [8-9]
+      [15] skip       skip(LE:2:NGLL)
+"""
+
+
+def test_320x320_bf16_preloop_1x5_offset1():
+    """Preloop with offsetPartition=1: MT1 GRs cover only partition 0."""
+    cfg = make_320x320_bf16()
+    cfg.offsetPartition = 1
+    sched = LogicalScheduler(cfg)
+    sched.emit()
+    preloop = sched.build_preloop()
+    actual = sched.print_emit(preloop)
+    assert actual == EXPECTED_PRELOOP_320x320_BF16_1x5_OFFSET1, (
+        f"Preloop mismatch.\n"
+        f"--- Expected ---\n{EXPECTED_PRELOOP_320x320_BF16_1x5_OFFSET1}\n"
+        f"--- Actual ---\n{actual}"
+    )
+
+
+def test_320x320_bf16_preloop_1x5_offset_all():
+    """Preloop with offsetPartition=numPartitions: MT1 GRs cover all partitions."""
+    cfg = make_320x320_bf16()
+    # Forcing offsetPartition for testing. Not exposed yet.
+    cfg.offsetPartition = cfg.numPartitions
+    sched = LogicalScheduler(cfg)
+    sched.emit()
+    preloop = sched.build_preloop()
+    actual = sched.print_emit(preloop)
+    assert actual == EXPECTED_PRELOOP_320x320_BF16_1x5_OFFSET_ALL, (
+        f"Preloop mismatch.\n"
+        f"--- Expected ---\n{EXPECTED_PRELOOP_320x320_BF16_1x5_OFFSET_ALL}\n"
+        f"--- Actual ---\n{actual}"
+    )
