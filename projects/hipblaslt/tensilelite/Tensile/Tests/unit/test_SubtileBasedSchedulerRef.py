@@ -1088,6 +1088,39 @@ def test_256x256_fp4_preloop_1x1():
     )
 
 
+EXPECTED_PRELOOP_256x256_FP4_PGR1_1x1 = """\
+MAINLOOP:
+  Partition 0:
+    subIterK=0:
+      [ 0] gr         GR A (MT n, subIterK [0,1]) ids [0-7]
+      [ 1] gr         GR B (MT n, subIterK [0,1]) ids [0-7]
+      [ 2] gr         GR SA (MT n, subIterK [0,1]) ids [0-7]
+      [ 3] gr         GR SB (MT n, subIterK [0,1]) ids [0-7]
+      [ 4] wait_gr    wait_gr(0)
+      [ 5] sync       sync
+      [ 6] lr         LR A  (MT n, subIterK [0]) [0-7]
+      [ 7] lr         LR B  (MT n, subIterK [0]) [0-7]
+      [ 8] lr         LR SA (MT n, subIterK [0,1]) [0-7]
+      [ 9] lr         LR SB (MT n, subIterK [0,1]) [0-7]
+      [10] skip       skip(LE:1:NLL)
+"""
+
+
+def test_256x256_fp4_preloop_pgr1_1x1():
+    """Exact check of preloop for 256x256 FP4, PGR1, 1x1 partition.
+    PGR1 preloop: GR(MT0) + wait + sync + LR + skip(NLL). No MT1 GRs."""
+    cfg = make_256x256_fp4_pgr1()
+    sched = LogicalScheduler(cfg)
+    sched.emit()
+    preloop = sched.build_preloop()
+    actual = sched.print_emit(preloop)
+    assert actual == EXPECTED_PRELOOP_256x256_FP4_PGR1_1x1, (
+        f"Preloop mismatch.\n"
+        f"--- Expected ---\n{EXPECTED_PRELOOP_256x256_FP4_PGR1_1x1}\n"
+        f"--- Actual ---\n{actual}"
+    )
+
+
 EXPECTED_PRELOOP_320x320_BF16_1x5_OFFSET1 = """\
 MAINLOOP:
   Partition 0:
