@@ -1734,8 +1734,8 @@ if __name__ == "__main__":
             scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
         )
 
-        def _print_emitLoop(label, emitted_3d):
-            module = sched._emitLoop(writer, kernel, label, emitted_3d)
+        def _print_emitLoop(label, emitted_3d, schedule=True):
+            module = sched._emitLoop(writer, kernel, label, emitted_3d, schedule=schedule)
             buf = io.StringIO()
             for inst in module.flatitems():
                 buf.write(f"  {str(inst).rstrip()}\n")
@@ -1744,17 +1744,19 @@ if __name__ == "__main__":
         loop_sections = [("MAINLOOP", sched._emitted_per_unroll[0])]
         if use_pgr1:
             loop_sections = [
-                ("PRELOOP",  sched._preloop_emitted),
+                ("PRELOOP",  sched._preloop_emitted, False),
                 ("MAINLOOP", sched._emitted_per_unroll[0]),
                 ("NGLL",     sched._ngll_per_unroll[0]),
                 ("NLL",      sched._nll_per_unroll[0]),
             ]
 
-        for label, emitted_3d in loop_sections:
+        for section in loop_sections:
+            label, emitted_3d = section[0], section[1]
+            schedule = section[2] if len(section) > 2 else True
             print(f"{'=' * 60}")
             print(f"  {label} (emitLoop)")
             print(f"{'=' * 60}")
-            print(_print_emitLoop(label, emitted_3d))
+            print(_print_emitLoop(label, emitted_3d, schedule=schedule))
             if interactive:
                 input("Press Enter for next step...")
 
