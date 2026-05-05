@@ -2124,38 +2124,26 @@ class LogicalScheduler:
         module.addComment0("MAINLOOP")
         loopBegin = Label("LoopBeginL", "")
 
-        exitValue = {0: 0, 1: 1, 2: 2}[self.config.pgr]
+        exitValue = self.config.pgr
 
-        if uf == 1:
-            module.add(loopBegin)
-            module.add(self._emitLoop(writer, kernel, "MAINLOOP",
-                                      self._emitted_per_unroll[0]))
+        exitLabels = [Label(f"ExitC{ui}", "") for ui in range(uf - 1)]
+        module.add(loopBegin)
+        for ui in range(uf):
+            module.add(self._emitLoop(writer, kernel, f"MAINLOOP_C{ui}",
+                                      self._emitted_per_unroll[ui]))
             module.add(SSubU32(dst=sgpr("LoopCounterL"),
                                src0=sgpr("LoopCounterL"), src1=1,
-                               comment="dec counterL"))
+                               comment=f"dec counterL (copy {ui})"))
             module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=exitValue,
-                                 comment=f"counterL == {exitValue}?"))
-            module.add(SCBranchSCC0(labelName=loopBegin.getLabelName(),
-                                    comment="restart mainloop"))
-        else:
-            exitLabels = [Label(f"ExitC{ui}", "") for ui in range(uf - 1)]
-            module.add(loopBegin)
-            for ui in range(uf):
-                module.add(self._emitLoop(writer, kernel, f"MAINLOOP_C{ui}",
-                                          self._emitted_per_unroll[ui]))
-                module.add(SSubU32(dst=sgpr("LoopCounterL"),
-                                   src0=sgpr("LoopCounterL"), src1=1,
-                                   comment=f"dec counterL (copy {ui})"))
-                module.add(SCmpEQU32(src0=sgpr("LoopCounterL"), src1=exitValue,
-                                     comment=f"counterL == {exitValue}? (copy {ui} exit)"))
-                if ui < uf - 1:
-                    module.add(SCBranchSCC1(
-                        labelName=exitLabels[ui].getLabelName(),
-                        comment=f"copy {ui} exit → NGLL_C{ui}"))
-                else:
-                    module.add(SCBranchSCC0(
-                        labelName=loopBegin.getLabelName(),
-                        comment="restart mainloop"))
+                                 comment=f"counterL == {exitValue}? (copy {ui} exit)"))
+            if ui < uf - 1:
+                module.add(SCBranchSCC1(
+                    labelName=exitLabels[ui].getLabelName(),
+                    comment=f"copy {ui} exit → NGLL_C{ui}"))
+            else:
+                module.add(SCBranchSCC0(
+                    labelName=loopBegin.getLabelName(),
+                    comment="restart mainloop"))
 
         # ── NGLL + NLL exit paths ──
         hasNGLL = self.config.pgr >= 2
@@ -2164,56 +2152,45 @@ class LogicalScheduler:
         if hasNGLL:
             module.add(Label("SkipToNGLL", ""))
 
-        if uf == 1:
-            nll_idx = self.config.pgr % uf
-            if hasNGLL:
-                module.addComment0("NGLL")
-                module.add(self._emitLoop(writer, kernel, "NGLL",
-                                          self._ngll_per_unroll[1 % uf]))
-            module.addComment0("NLL")
+        # _per_unroll[i] has tiles for unroll_iter=i.
+        # After mainloop C{ui}, data in LDS/vgprs corresponds to
+        # unroll_iter = (ui + pgr) % uf for NLL, (ui + 1) % uf for NGLL.
+        # NLLEarly (preloop skip) needs unroll_iter=0, i.e. _nll_per_unroll[0].
+        # We place SkipToNLL before whichever NLL block uses index 0.
+        pgr = self.config.pgr
+        last = uf - 1
+
+        # Fall-through from last mainloop copy
+        nll_ft = (last + pgr) % uf
+        if hasNGLL:
+            module.addComment0(f"NGLL_C{last}")
+            module.add(self._emitLoop(writer, kernel, f"NGLL_C{last}",
+                                      self._ngll_per_unroll[(last + 1) % uf]))
+        if nll_ft == 0:
             module.add(Label("SkipToNLL", ""))
-            module.add(self._emitLoop(writer, kernel, "NLL",
-                                      self._nll_per_unroll[nll_idx]))
-        else:
-            # _per_unroll[i] has tiles for unroll_iter=i.
-            # After mainloop C{ui}, data in LDS/vgprs corresponds to
-            # unroll_iter = (ui + pgr) % uf for NLL, (ui + 1) % uf for NGLL.
-            # NLLEarly (preloop skip) needs unroll_iter=0, i.e. _nll_per_unroll[0].
-            # We place SkipToNLL before whichever NLL block uses index 0.
-            pgr = self.config.pgr
-            last = uf - 1
+        module.addComment0(f"NLL_C{last}")
+        module.add(self._emitLoop(writer, kernel, f"NLL_C{last}",
+                                  self._nll_per_unroll[nll_ft]))
+        module.add(SBranch(labelName=endLabel.getLabelName(),
+                           comment="skip other exit paths"))
 
-            # Fall-through from last mainloop copy
-            nll_ft = (last + pgr) % uf
+        for ui in range(uf - 1):
+            nll_idx = (ui + pgr) % uf
+            module.add(exitLabels[ui])
             if hasNGLL:
-                module.addComment0(f"NGLL_C{last}")
-                module.add(self._emitLoop(writer, kernel, f"NGLL_C{last}",
-                                          self._ngll_per_unroll[(last + 1) % uf]))
-            if nll_ft == 0:
+                module.addComment0(f"NGLL_C{ui}")
+                module.add(self._emitLoop(writer, kernel, f"NGLL_C{ui}",
+                                          self._ngll_per_unroll[(ui + 1) % uf]))
+            if nll_idx == 0:
                 module.add(Label("SkipToNLL", ""))
-            module.addComment0(f"NLL_C{last}")
-            module.add(self._emitLoop(writer, kernel, f"NLL_C{last}",
-                                      self._nll_per_unroll[nll_ft]))
-            module.add(SBranch(labelName=endLabel.getLabelName(),
-                               comment="skip other exit paths"))
+            module.addComment0(f"NLL_C{ui}")
+            module.add(self._emitLoop(writer, kernel, f"NLL_C{ui}",
+                                      self._nll_per_unroll[nll_idx]))
+            if ui < uf - 2:
+                module.add(SBranch(labelName=endLabel.getLabelName(),
+                                   comment="skip other exit paths"))
 
-            for ui in range(uf - 1):
-                nll_idx = (ui + pgr) % uf
-                module.add(exitLabels[ui])
-                if hasNGLL:
-                    module.addComment0(f"NGLL_C{ui}")
-                    module.add(self._emitLoop(writer, kernel, f"NGLL_C{ui}",
-                                              self._ngll_per_unroll[(ui + 1) % uf]))
-                if nll_idx == 0:
-                    module.add(Label("SkipToNLL", ""))
-                module.addComment0(f"NLL_C{ui}")
-                module.add(self._emitLoop(writer, kernel, f"NLL_C{ui}",
-                                          self._nll_per_unroll[nll_idx]))
-                if ui < uf - 2:
-                    module.add(SBranch(labelName=endLabel.getLabelName(),
-                                       comment="skip other exit paths"))
-
-            module.add(endLabel)
+        module.add(endLabel)
 
         return module
 
