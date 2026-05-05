@@ -1322,6 +1322,14 @@ class LogicalScheduler:
         return {'A': self.config.grA, 'B': self.config.grB,
                 'SA': self.config.grSA, 'SB': self.config.grSB}[tensor]
 
+    def _count_gr_atoms(self, gr: GRPlacement) -> int:
+        """Count the number of atomic loads for a single GR placement."""
+        gr_gran = self._gr_granularity(gr.tensor)
+        tiles = gr.tiles
+        n_tile = (tiles.tileId_end - tiles.tileId_start) // gr_gran.mn
+        n_k = (tiles.subIterK_end - tiles.subIterK_start) // gr_gran.k
+        return n_tile * n_k
+
     def _compute_inflight_loads(self, consumer_pi: int, consumer_slot: int,
                                 tensor: str, dep_ref: Dep) -> WaitGRCounts:
         """Count inflight GR atomic loads between a dep GR and the consumer.
@@ -1330,6 +1338,11 @@ class LogicalScheduler:
         from the consumer position, counting atomic GR loads for all tensors.
         Stops when reaching the dependency GR (dep_ref.ref) after accounting
         for mt_offset wraps.
+
+        Within a slot, GRs are walked in reverse _gr_sort_key order (matching
+        hardware issue order: last emitted = most recent = walked first).
+        GRs emitted after the dep in the same slot are still inflight but
+        do not need to be waited for, so they are added to the count.
 
         Returns per-tensor inflight load counts.
         """
@@ -1355,15 +1368,14 @@ class LogicalScheduler:
             slot_k = pos % numK
             slot = self._partitions[pi][slot_k]
 
-            for gr in slot.grs:
+            # Walk GRs in reverse emission order (most recently issued first)
+            sorted_grs = sorted(slot.grs, key=self._gr_sort_key, reverse=True)
+            for gr in sorted_grs:
                 if gr.tensor == tensor and gr is dep_ref.ref and wraps_completed >= wraps_needed:
                     return counts
-                gr_gran = self._gr_granularity(gr.tensor)
-                tiles = gr.tiles
-                n_tile = (tiles.tileId_end - tiles.tileId_start) // gr_gran.mn
-                n_k = (tiles.subIterK_end - tiles.subIterK_start) // gr_gran.k
+                atoms = self._count_gr_atoms(gr)
                 cur = getattr(counts, gr.tensor)
-                setattr(counts, gr.tensor, cur + n_tile * n_k)
+                setattr(counts, gr.tensor, cur + atoms)
 
         return counts
 
