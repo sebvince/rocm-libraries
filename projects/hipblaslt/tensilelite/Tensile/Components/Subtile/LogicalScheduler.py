@@ -1480,7 +1480,23 @@ class LogicalScheduler:
 
     # ── Group LR/GR chains ─────────────────────────────────────
 
+    _TENSOR_ORDER = {'A': 0, 'B': 1, 'SA': 2, 'SB': 3}
     _LR_GR_ORDER = ['A', 'B', 'SA', 'SB']
+
+    @staticmethod
+    def _gr_sort_key(gr: GRPlacement) -> tuple:
+        """Sort key for deterministic GR ordering within a subIterK slot.
+
+        Priority (most significant first):
+          1. MT iteration      — earlier MT loads first (n+1 before n+2)
+          2. subIterK start    — lower min K first
+          3. Tensor            — A, B, SA, SB (hardcoded order)
+          4. Tile id start     — lower tile range first
+        """
+        return (gr.mtIteration,
+                gr.tiles.subIterK_start,
+                LogicalScheduler._TENSOR_ORDER[gr.tensor],
+                gr.tiles.tileId_start)
 
     @staticmethod
     def _merge_preops(all_preops: List[List['BaseOp']]) -> List['BaseOp']:
@@ -1568,7 +1584,7 @@ class LogicalScheduler:
                 # ── Phase 2: GR chain ──
                 ordered_grs = sorted(
                     slot.grs,
-                    key=lambda gr: order.index(gr.tensor))
+                    key=self._gr_sort_key)
 
                 if len(ordered_grs) > 1:
                     # Check if any GR has same-subIterK deps
