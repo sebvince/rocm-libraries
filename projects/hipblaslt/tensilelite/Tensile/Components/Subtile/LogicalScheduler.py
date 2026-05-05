@@ -2034,6 +2034,42 @@ class LogicalScheduler:
         """Create a BaseOp subclass instance for each tensor."""
         return [cls(tensor=tensor) for tensor in self.tensors]
 
+    def _make_preloop_mt1_grs(self) -> List[GRPlacement]:
+        """Create MT1 GRs for the PGR=2 preloop, ordered to match the mainloop.
+
+        Walks all partition slots, finds GRs whose tileId range matches
+        partition 0, groups by subIterK, sorts within each group by
+        _gr_sort_key, and creates fresh GRPlacements with mtIteration=1.
+        """
+        self._ensure_pass(Pass.GR)
+        cfg = self.config
+        part0 = self._partition_tile_range(0)
+
+        grs_by_k: dict[int, list[GRPlacement]] = {}
+        for slots in self._partitions:
+            for slot in slots:
+                for gr in slot.grs:
+                    side = TENSOR_SIDE[gr.tensor]
+                    t_start, t_end = part0[side]
+                    if gr.tiles.tileId_start < t_end and gr.tiles.tileId_end > t_start:
+                        grs_by_k.setdefault(slot.subIterK, []).append(gr)
+
+        result = []
+        for k in range(cfg.numSubIterK):
+            for gr in sorted(grs_by_k.get(k, []), key=self._gr_sort_key):
+                result.append(GRPlacement(
+                    tensor=gr.tensor,
+                    mtIteration=1,
+                    tiles=MFMATileRange(
+                        gr.tiles.subIterK_start,
+                        gr.tiles.subIterK_end,
+                        gr.tiles.tileId_start,
+                        gr.tiles.tileId_end),
+                    subIterK_slot=k,
+                    partition=0,
+                ))
+        return result
+
     def build_preloop(self) -> List[List[List[EmittedModule]]]:
         """Build preloop: pipeline initialization sequence before mainloop.
 
@@ -2081,10 +2117,6 @@ class LogicalScheduler:
                 SkipOp(compare='LE', value=1, target='NLL'),
             ])
         else:
-            part0_tiles = {
-                'A': MFMATileRange(0, numK, *part0['A']),
-                'B': MFMATileRange(0, numK, *part0['B']),
-            }
             emitted = self._to_emitted([
                 *self._make_gr_all_tensors(0, all_tiles),
                 *self._make_depops_all_tensors(GRIncOp),
@@ -2092,7 +2124,7 @@ class LogicalScheduler:
                 SyncOp(),
                 *self._make_lr_all_tensors(lr_tiles),
                 SkipOp(compare='LE', value=1, target='NLL'),
-                *self._make_gr_all_tensors(1, part0_tiles),
+                *self._make_preloop_mt1_grs(),
                 SkipOp(compare='LE', value=2, target='NGLL'),
             ])
 
