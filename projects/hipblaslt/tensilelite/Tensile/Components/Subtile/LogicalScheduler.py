@@ -2071,13 +2071,13 @@ class LogicalScheduler:
         self._preloop_emitted = [[emitted]]
         return self._preloop_emitted
 
-    def _emitLoop(self, writer, kernel, label, emitted_3d):
+    def _emitLoop(self, writer, kernel, label, emitted_3d, schedule=True):
         """Emit a loop section from a 3D emitted structure.
 
         emitted_3d: [partition][subIterK][EmittedModule]
 
-        For subIterKs with MFMAs: calls instructionSchedule for interleaving.
-        For subIterKs without MFMAs (preloop): emits instructions sequentially.
+        When schedule=True and a group has MFMAs, calls instructionSchedule
+        for interleaving. When schedule=False, emits instructions sequentially.
         """
         from Tensile.Components.Subtile.InstructionScheduler import instructionSchedule
         from rocisa.code import Module
@@ -2087,8 +2087,7 @@ class LogicalScheduler:
         for pi, partition_emitted in enumerate(emitted_3d):
             for k, em_list in enumerate(partition_emitted):
                 module.addComment0(f"partition={pi} subIterK={k}")
-                hasMFMA = any(em.opType == 'mfma' for em in em_list)
-                if hasMFMA:
+                if schedule:
                     scheduled = instructionSchedule(em_list)
                     module.add(scheduled)
                 else:
@@ -2118,7 +2117,7 @@ class LogicalScheduler:
 
         # ── Preloop ──
         module.add(self._emitLoop(writer, kernel, "PRELOOP",
-                                  self._preloop_emitted))
+                                  self._preloop_emitted, schedule=False))
 
         # ── Mainloop ──
         module.addComment0("MAINLOOP")
