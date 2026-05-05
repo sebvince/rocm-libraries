@@ -1813,8 +1813,10 @@ if __name__ == "__main__":
             lrB=ReadGranularity(mn=1, k=1),
             grA=ReadGranularity(mn=1, k=2),
             grB=ReadGranularity(mn=1, k=2),
+            # numPartitionsM=1,
+            # numPartitionsN=19,
             numPartitionsM=1,
-            numPartitionsN=19,
+            numPartitionsN=5,
         )
     else:
         kernel = create_kernel(128, 128, fp4=True, depthU=512)
