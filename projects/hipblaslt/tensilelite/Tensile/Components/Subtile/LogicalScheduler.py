@@ -116,6 +116,13 @@ class ReadGranularity:
     mn: int
     k: int
 
+    def tile_range(self, k: int, t_start: int, t_end: int) -> 'MFMATileRange':
+        """Snap subIterK and tile indices to this granularity, return MFMATileRange."""
+        ks = (k // self.k) * self.k
+        ts = (t_start // self.mn) * self.mn
+        te = ((t_end + self.mn - 1) // self.mn) * self.mn
+        return MFMATileRange(ks, ks + self.k, ts, te)
+
 
 @dataclass
 class SchedulerConfig:
@@ -846,23 +853,16 @@ class LogicalScheduler:
                     items.append(('SB', target_range['B'], cfg.grSB))
 
                 for tensor, (t_start, t_end), gr_gran in items:
-                    mn = gr_gran.mn
-                    k_gran = gr_gran.k
+                    tr = gr_gran.tile_range(k, t_start, t_end)
 
-                    gr_tile_start = (t_start // mn) * mn
-                    gr_tile_end = ((t_end + mn - 1) // mn) * mn
-
-                    gr_k_start = (k // k_gran) * k_gran
-                    gr_k_end = gr_k_start + k_gran
-
-                    key = (tensor, mt_val, gr_tile_start, gr_tile_end,
-                           gr_k_start, gr_k_end)
+                    key = (tensor, mt_val, tr.tileId_start, tr.tileId_end,
+                           tr.subIterK_start, tr.subIterK_end)
                     if key in seen:
                         continue
                     seen.add(key)
-                    gr_list.append((tensor, mt_val, gr_tile_start,
-                                    gr_tile_end, gr_k_start, gr_k_end,
-                                    gr_gran))
+                    gr_list.append((tensor, mt_val, tr.tileId_start,
+                                    tr.tileId_end, tr.subIterK_start,
+                                    tr.subIterK_end, gr_gran))
 
         # Cross-MT dedup: if a tile/k range appears at both n+1 and n+2,
         # the n+1 load is redundant — the previous iteration's n+2 already
@@ -1971,7 +1971,7 @@ class LogicalScheduler:
         """Wrap Emittable objects (Placements / BaseOps) into EmittedModules."""
         return [EmittedModule(moduleId=mid, source=op) for mid, op in enumerate(ops)]
 
-    def _preloop_make_gr(self, mt: str, tiles: dict) -> List[GRPlacement]:
+    def _make_gr_all_tensors(self, mt: int, tiles: dict) -> List[GRPlacement]:
         """Create GR placements for all tensors at the given MT iteration.
 
         tiles: {'A': MFMATileRange, 'B': MFMATileRange}
@@ -1981,7 +1981,7 @@ class LogicalScheduler:
                             subIterK_slot=0)
                 for tensor in self.tensors]
 
-    def _preloop_make_lr(self, tiles: dict) -> List[LRPlacement]:
+    def _make_lr_all_tensors(self, tiles: dict) -> List[LRPlacement]:
         """Create LR placements for first partition.
 
         tiles: per-tensor MFMATileRange, e.g. {'A': MFMATileRange(0, k, mn0, mn1), ...}
@@ -2002,7 +2002,7 @@ class LogicalScheduler:
             placements.append(lr)
         return placements
 
-    def _make_tensor_depops(self, cls) -> List[BaseOp]:
+    def _make_depops_all_tensors(self, cls) -> List[BaseOp]:
         """Create a BaseOp subclass instance for each tensor."""
         return [cls(tensor=tensor) for tensor in self.tensors]
 
@@ -2046,10 +2046,10 @@ class LogicalScheduler:
 
         if cfg.pgr == 1:
             emitted = self._to_emitted([
-                *self._preloop_make_gr(0, all_tiles),
+                *self._make_gr_all_tensors(0, all_tiles),
                 WaitGROp(wait_gr_counts=WaitGRCounts()),
                 SyncOp(),
-                *self._preloop_make_lr(lr_tiles),
+                *self._make_lr_all_tensors(lr_tiles),
                 SkipOp(compare='LE', value=1, target='NLL'),
             ])
         else:
@@ -2058,13 +2058,13 @@ class LogicalScheduler:
                 'B': MFMATileRange(0, numK, *part0['B']),
             }
             emitted = self._to_emitted([
-                *self._preloop_make_gr(0, all_tiles),
-                *self._make_tensor_depops(GRIncOp),
+                *self._make_gr_all_tensors(0, all_tiles),
+                *self._make_depops_all_tensors(GRIncOp),
                 WaitGROp(wait_gr_counts=WaitGRCounts()),
                 SyncOp(),
-                *self._preloop_make_lr(lr_tiles),
+                *self._make_lr_all_tensors(lr_tiles),
                 SkipOp(compare='LE', value=1, target='NLL'),
-                *self._preloop_make_gr(1, part0_tiles),
+                *self._make_gr_all_tensors(1, part0_tiles),
                 SkipOp(compare='LE', value=2, target='NGLL'),
             ])
 
