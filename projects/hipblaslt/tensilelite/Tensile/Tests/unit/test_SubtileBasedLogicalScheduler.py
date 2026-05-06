@@ -1830,7 +1830,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if use_bf16:
-        kernel = create_kernel(384, 256, fp4=False, depthU=64)
+        kernel = create_kernel(320, 304, fp4=False, depthU=64, miWaveGroup=[4, 1], sourceSwap=True)
         tiA = makeTileInfo('A', kernel)
         tiB = makeTileInfo('B', kernel)
         scaleTiA = None
@@ -1844,7 +1844,8 @@ if __name__ == "__main__":
             lrB=ReadGranularity(mn=1, k=1),
             grA=ReadGranularity(mn=1, k=2),
             grB=ReadGranularity(mn=1, k=2),
-            partitionSizeN=2,
+            partitionSizeM=[5],
+            partitionSizeN=[7, 5, 7],
         )
     else:
         kernel = create_kernel(128, 128, fp4=True, depthU=512)
