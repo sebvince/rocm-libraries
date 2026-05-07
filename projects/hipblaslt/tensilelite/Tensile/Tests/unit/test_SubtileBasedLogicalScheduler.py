@@ -143,8 +143,8 @@ def make_cfg_bf16(MT0=256, MT1=256, depthU=64, numPartM=1, numPartN=1):
 def make_cfg_bf16_pgr0(MT0=256, MT1=256, depthU=64):
     """Build BF16 config with pgr=0."""
     kernel = create_kernel(MT0, MT1, fp4=False, depthU=depthU)
-    tiA = TileInfo('A', kernel)
-    tiB = TileInfo('B', kernel)
+    tiA = makeTileInfo('A', kernel)
+    tiB = makeTileInfo('B', kernel)
     return SchedulerConfig(
         numMFMATilesM=tiA.localMMATileGrid[0],
         numMFMATilesN=tiB.localMMATileGrid[0],
@@ -160,8 +160,8 @@ def make_cfg_bf16_pgr0(MT0=256, MT1=256, depthU=64):
 def make_cfg_bf16_pgr1(MT0=256, MT1=256, depthU=128, numPartM=1, numPartN=1):
     """Build BF16 config with pgr=1."""
     kernel = create_kernel(MT0, MT1, fp4=False, depthU=depthU)
-    tiA = TileInfo('A', kernel)
-    tiB = TileInfo('B', kernel)
+    tiA = makeTileInfo('A', kernel)
+    tiB = makeTileInfo('B', kernel)
     return SchedulerConfig(
         numMFMATilesM=tiA.localMMATileGrid[0],
         numMFMATilesN=tiB.localMMATileGrid[0],
@@ -1664,8 +1664,8 @@ if __name__ == "__main__":
             _kernel_fp4_pgr1 = create_kernel(128, 128, fp4=True, depthU=512)
             _tiA = TileInfo('A', _kernel_fp4_pgr1)
             _tiB = TileInfo('B', _kernel_fp4_pgr1)
-            _scaleTiA = TileInfo('MXSA', _kernel_fp4_pgr1)
-            _scaleTiB = TileInfo('MXSB', _kernel_fp4_pgr1)
+            _scaleTiA = makeTileInfo('MXSA', _kernel_fp4_pgr1)
+            _scaleTiB = makeTileInfo('MXSB', _kernel_fp4_pgr1)
             cfg = SchedulerConfig(
                 numMFMATilesM=_tiA.localMMATileGrid[0],
                 numMFMATilesN=_tiB.localMMATileGrid[0],
