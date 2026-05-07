@@ -353,8 +353,8 @@ def test_320x320_bf16_partition_1x5():
 
 def make_256x256_bf16_pgr0():
     kernel = create_kernel(256, 256, fp4=False, depthU=64)
-    tiA = TileInfo('A', kernel)
-    tiB = TileInfo('B', kernel)
+    tiA = makeTileInfo('A', kernel)
+    tiB = makeTileInfo('B', kernel)
     return SchedulerConfig(
         numMFMATilesM=tiA.localMMATileGrid[0],
         numMFMATilesN=tiB.localMMATileGrid[0],
@@ -410,8 +410,8 @@ def test_256x256_bf16_pgr0():
 
 def make_256x256_bf16_pgr1():
     kernel = create_kernel(256, 256, fp4=False, depthU=64)
-    tiA = TileInfo('A', kernel)
-    tiB = TileInfo('B', kernel)
+    tiA = makeTileInfo('A', kernel)
+    tiB = makeTileInfo('B', kernel)
     return SchedulerConfig(
         numMFMATilesM=tiA.localMMATileGrid[0],
         numMFMATilesN=tiB.localMMATileGrid[0],
@@ -729,10 +729,10 @@ def test_128x128_fp4_partition_1x1():
 
 def make_256x256_fp4_pgr0():
     kernel = create_kernel(256, 256, fp4=True, depthU=256)
-    tiA = TileInfo('A', kernel)
-    tiB = TileInfo('B', kernel)
-    scaleTiA = TileInfo('MXSA', kernel)
-    scaleTiB = TileInfo('MXSB', kernel)
+    tiA = makeTileInfo('A', kernel)
+    tiB = makeTileInfo('B', kernel)
+    scaleTiA = makeTileInfo('MXSA', kernel)
+    scaleTiB = makeTileInfo('MXSB', kernel)
     return SchedulerConfig(
         numMFMATilesM=tiA.localMMATileGrid[0],
         numMFMATilesN=tiB.localMMATileGrid[0],
@@ -800,10 +800,10 @@ def test_256x256_fp4_pgr0():
 
 def make_256x256_fp4_pgr1():
     kernel = create_kernel(256, 256, fp4=True, depthU=256)
-    tiA = TileInfo('A', kernel)
-    tiB = TileInfo('B', kernel)
-    scaleTiA = TileInfo('MXSA', kernel)
-    scaleTiB = TileInfo('MXSB', kernel)
+    tiA = makeTileInfo('A', kernel)
+    tiB = makeTileInfo('B', kernel)
+    scaleTiA = makeTileInfo('MXSA', kernel)
+    scaleTiB = makeTileInfo('MXSB', kernel)
     return SchedulerConfig(
         numMFMATilesM=tiA.localMMATileGrid[0],
         numMFMATilesN=tiB.localMMATileGrid[0],
@@ -874,8 +874,8 @@ def test_256x256_fp4_pgr1():
 
 def make_128x128_bf16_pgr1():
     kernel = create_kernel(128, 128, fp4=False, depthU=128)
-    tiA = TileInfo('A', kernel)
-    tiB = TileInfo('B', kernel)
+    tiA = makeTileInfo('A', kernel)
+    tiB = makeTileInfo('B', kernel)
     return SchedulerConfig(
         numMFMATilesM=tiA.localMMATileGrid[0],
         numMFMATilesN=tiB.localMMATileGrid[0],
@@ -954,10 +954,10 @@ def test_128x128_bf16_pgr1():
 
 def make_128x128_fp4_pgr1():
     kernel = create_kernel(128, 128, fp4=True, depthU=512)
-    tiA = TileInfo('A', kernel)
-    tiB = TileInfo('B', kernel)
-    scaleTiA = TileInfo('MXSA', kernel)
-    scaleTiB = TileInfo('MXSB', kernel)
+    tiA = makeTileInfo('A', kernel)
+    tiB = makeTileInfo('B', kernel)
+    scaleTiA = makeTileInfo('MXSA', kernel)
+    scaleTiB = makeTileInfo('MXSB', kernel)
     return SchedulerConfig(
         numMFMATilesM=tiA.localMMATileGrid[0],
         numMFMATilesN=tiB.localMMATileGrid[0],
