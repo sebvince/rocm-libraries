@@ -743,9 +743,9 @@ class Solution(collections.abc.Mapping):
           for field in ("LSC", "LSP", "NumLoadsCoalesced", "NumLoadsPerpendicular", "NumTotalPackedLoads"):
             state["%s%s" % (field, tc)] = 0
 
-      if state["PrefetchGlobalRead"] not in [0, 2]:
+      if state["PrefetchGlobalRead"] not in [0, 1, 2]:
         reject(state, printRejectionReason,
-               "UseSubtileImpl=1 requires PrefetchGlobalRead 0 or 2, got %d" % state["PrefetchGlobalRead"])
+               "UseSubtileImpl=1 requires PrefetchGlobalRead 0, 1 or 2, got %d" % state["PrefetchGlobalRead"])
       if not (state["MatrixInstM"] == 16 and state["MatrixInstN"] == 16):
         reject(state, printRejectionReason, "UseSubtileImpl=1 requires MatrixInst 16x16")
       if state["ScheduleIterAlg"] == 1 or state["ScheduleIterAlg"] == 2:
