@@ -2597,3 +2597,68 @@ class TestBuildLoopVariants_PGR0:
         sched.emit()
         nll = sched.build_nll()
         assert nll == [[[]]]
+
+
+class TestPGR3:
+    """PGR=3 (3-deep prefetch): preloop fills MT 0..2, mainloop loads MT 3
+    each iter, NGLL drains in 2 phases (NGLL_2 → NGLL_1) then NLL."""
+
+    def _build(self):
+        cfg = make_cfg_256x256_fp4(pgr=3)
+        sched = LogicalScheduler(cfg)
+        sched.place_LRs()
+        sched.place_GRs()
+        sched.annotate_deps()
+        sched.emit()
+        sched.build_preloop()
+        sched.build_ngll()
+        sched.build_nll()
+        return cfg, sched
+
+    def test_pipeline_completes(self):
+        # Smoke test: full pass pipeline runs without crashing for PGR=3.
+        self._build()
+
+    def test_preloop_emits_mt0_mt1_mt2_grs(self):
+        """Preloop should issue GRs for MT 0, MT 1, MT 2 (one per pgr level)."""
+        _, sched = self._build()
+        preloop = sched._preloop_emitted[0][0]
+        gr_mt_values = sorted({em.source.mtIteration
+                               for em in preloop if em.opType == 'gr'})
+        assert gr_mt_values == [0, 1, 2]
+
+    def test_preloop_skip_chain(self):
+        """Preloop should emit skip(LE 1, NLL), skip(LE 2, NGLL_1),
+        skip(LE 3, NGLL_2) — one skip per pgr level."""
+        _, sched = self._build()
+        preloop = sched._preloop_emitted[0][0]
+        skips = [(em.source.compare, em.source.value, em.source.target)
+                 for em in preloop if em.opType == 'skip']
+        assert skips == [
+            ('LE', 1, 'NLL'),
+            ('LE', 2, 'NGLL_1'),
+            ('LE', 3, 'NGLL_2'),
+        ]
+
+    def test_ngll_has_two_phases(self):
+        """PGR=3 should produce pgr-1=2 NGLL variant phases."""
+        _, sched = self._build()
+        assert len(sched._ngll_phases) == 2
+
+    def test_ngll_strips_prefetch_grs(self):
+        """Each NGLL phase strips GRs whose mtIteration == pgr (the prefetch
+        target) and zeros wait_gr inflight counts."""
+        _, sched = self._build()
+        for phase in sched._ngll_phases:
+            for partition_emitted in phase:
+                for em_list in partition_emitted:
+                    for em in em_list:
+                        if em.opType == 'gr':
+                            assert em.source.mtIteration != 3, \
+                                "NGLL must strip prefetch GR at MT=pgr=3"
+                        if em.opType == 'gr_inc':
+                            pytest.fail("NGLL must strip all gr_inc ops")
+                        if em.opType == 'wait_gr' and \
+                                em.source.wait_gr_counts is not None:
+                            wgr = em.source.wait_gr_counts
+                            assert (wgr.A, wgr.B, wgr.SA, wgr.SB) == (0, 0, 0, 0)

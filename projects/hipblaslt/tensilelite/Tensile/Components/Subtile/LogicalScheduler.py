@@ -187,7 +187,7 @@ class SchedulerConfig:
         return prefix
 
     def __post_init__(self):
-        assert self.pgr in (0, 1, 2), f"pgr must be 0, 1, or 2, got {self.pgr}"
+        assert 0 <= self.pgr <= 16, f"pgr must be in [0, 16], got {self.pgr}"
         mn_M = max((g.mn for g in (self.lrA, self.lrSA) if g is not None), default=1)
         mn_N = max((g.mn for g in (self.lrB, self.lrSB) if g is not None), default=1)
         self._partitionSizesM = self._normalize_partition_sizes(
@@ -304,7 +304,7 @@ class LRPlacement(Emittable):
 class GRPlacement(Emittable):
     """Global Read placement for one tensor in one subIterK slot."""
     tensor: str                # 'A', 'B', 'SA', 'SB'
-    mtIteration: int           # 0 = current MT, 1 = next MT, 2 = two MTs ahead
+    mtIteration: int           # 0 = current MT, k = k MTs ahead (range 0..pgr)
     tiles: MFMATileRange
     subIterK_slot: int         # which subIterK this GR is placed in
     partition: int = 0         # which partition this GR belongs to
@@ -480,6 +480,7 @@ class LogicalScheduler:
         self._emitted: Optional[List[List[EmittedModule]]] = None
         self._preloop_emitted: Optional[List[List[List[EmittedModule]]]] = None
         self._ngll_emitted: Optional[List[List[List[EmittedModule]]]] = None
+        self._ngll_phases: List[List[List[List[EmittedModule]]]] = []  # NGLL variants for PGR>=2
         self._nll_emitted: Optional[List[List[List[EmittedModule]]]] = None
 
     def _ensure_pass(self, *prerequisites: Pass) -> None:
@@ -893,16 +894,15 @@ class LogicalScheduler:
                         upper[key] = flat
         return lower, upper
 
-    @staticmethod
-    def _has_lr_conflict(lr_lower, tensor, mt_val, pi, subIterK,
+    def _has_lr_conflict(self, lr_lower, tensor, mt_val, pi, subIterK,
                          gr_k_start, gr_k_end):
         """Return True if placing GR(mt_val) at (pi, subIterK) conflicts.
 
-        GR(MT n+2) writes the same LDS buffer as MT n, so it conflicts
-        only if a later LR(MT n) in the same partition accesses an
-        overlapping subIterK range.
+        With an N-buffered LDS (N=pgr), GR(MT n+pgr) writes the same LDS
+        buffer as MT n, so it conflicts only if a later LR(MT n) in the
+        same partition accesses an overlapping subIterK range.
         """
-        if mt_val != 2:
+        if mt_val != self.config.pgr:
             return False
         for lr_slot, lr_ks, lr_ke in lr_lower.get((pi, tensor), []):
             if lr_slot > subIterK and gr_k_start < lr_ke and lr_ks < gr_k_end:
@@ -998,7 +998,16 @@ class LogicalScheduler:
                        for pi in range(self.config.numPartitions)]
 
         pgr = self.config.pgr
-        offsetMT = 0 if pgr == 0 else 1
+        # Mainloop prefetches MT (n + pgr). For pgr>=2 the partition-wrap math
+        # in _build_gr_list (with offsetPartition=1) shifts mt_val from
+        # offsetMT to offsetMT+1, so we set offsetMT=pgr-1 to land at MT pgr.
+        # pgr=1 has offsetPartition=0 (no wrap), so offsetMT=1 directly.
+        if pgr == 0:
+            offsetMT = 0
+        elif pgr == 1:
+            offsetMT = 1
+        else:
+            offsetMT = pgr - 1
         gr_list = self._build_gr_list(part_ranges, offsetMT, self.config.offsetPartition)
         gr_slot_bounds = self._build_gr_slot_bounds()
         self._distribute_grs(gr_list, gr_slot_bounds)
@@ -1158,10 +1167,15 @@ class LogicalScheduler:
                         lr.deps.append(Dep(
                             ref=gr, mt_offset=_mt_offset(pi, k, 'LR', gr, consumer=lr)))
 
-            # GR: depends on collision LR (LDS double-buffer)
-            # GR(n+x) collides with LR(n+x-2) — same buffer, period 2.
+            # GR: depends on collision LR (LDS N-buffer where N=pgr).
+            # GR(n+x) collides with LR(n+x-pgr) — same buffer, period pgr.
+            # For pgr<2, period falls back to 2 (legacy behavior; the dep is a
+            # no-op for buffer-collision purposes since single/double-buffer
+            # schemes don't have a real collision, but the mt_offset value is
+            # still consumed by downstream schedule decisions).
+            collision_period = max(self.config.pgr, 2)
             for gr in slot.grs:
-                target_data = gr.mtIteration - 2
+                target_data = gr.mtIteration - collision_period
                 for lr in lr_by_tensor.get(gr.tensor, []):
                     if _range_overlaps(lr.tiles, gr.tiles):
                         mt_off = target_data - lr.mtIteration
@@ -1933,17 +1947,12 @@ class LogicalScheduler:
             em.before = b
         return [em for em in emitted if em.moduleId not in removed_ids]
 
-    def build_ngll(self) -> List[List[List[EmittedModule]]]:
-        """NGLL (No Global Load Loop): mainloop without GR(n+2), GR_INC.
+    def _build_one_ngll(self) -> List[List[List[EmittedModule]]]:
+        """Build a single NGLL variant: mainloop with prefetch GRs stripped.
 
-        WaitGR inflight counts are zeroed since no new GRs are in flight.
+        Strips GRs whose mtIteration equals pgr (the prefetch target), all
+        gr_inc ops, and zeros wait_gr inflight counts.
         """
-        self._ensure_pass(Pass.EMIT)
-
-        if self.config.pgr in (0, 1):
-            self._ngll_emitted = [[[]]]
-            return self._ngll_emitted
-
         ngll = []
         for partition_emitted in self._emitted:
             part_ngll = []
@@ -1952,7 +1961,7 @@ class LogicalScheduler:
                 removed = set()
                 for em in new_emitted:
                     src = em.source
-                    if em.opType == 'gr' and src.mtIteration == 2:
+                    if em.opType == 'gr' and src.mtIteration == self.config.pgr:
                         removed.add(em.moduleId)
                     elif em.opType == 'gr_inc':
                         removed.add(em.moduleId)
@@ -1961,9 +1970,33 @@ class LogicalScheduler:
                             src.wait_gr_counts = WaitGRCounts()
                 part_ngll.append(self._rewire_before(new_emitted, removed))
             ngll.append(part_ngll)
-
-        self._ngll_emitted = ngll
         return ngll
+
+    def build_ngll(self) -> List[List[List[EmittedModule]]]:
+        """NGLL (No Global Load Loop): mainloop without prefetch GRs.
+
+        For PGR=N (N>=2), produces N-1 NGLL phase variants stored in
+        self._ngll_phases. Each phase is a deep-copy with prefetch GRs
+        stripped and wait_gr counts zeroed. The variants are currently
+        identical structurally — they exist so emitAllLoops can lay them
+        out in series with distinct skip labels (NGLL_{N-1} … NGLL_1).
+
+        Returns the innermost (NGLL_1) variant for backward-compat with
+        existing tests; for PGR<=1 returns [[[]]].
+        """
+        self._ensure_pass(Pass.EMIT)
+
+        if self.config.pgr in (0, 1):
+            self._ngll_emitted = [[[]]]
+            self._ngll_phases = []
+            return self._ngll_emitted
+
+        # Build N-1 phase variants. For PGR=2 this is just one variant.
+        num_phases = self.config.pgr - 1
+        self._ngll_phases = [self._build_one_ngll() for _ in range(num_phases)]
+        # _ngll_emitted = innermost (NGLL_1) variant for backward compat
+        self._ngll_emitted = self._ngll_phases[0]
+        return self._ngll_emitted
 
     def build_nll(self) -> List[List[List[EmittedModule]]]:
         """NLL (No Load Loop): mainloop without GR, LR(n+1), GR_INC, LR_INC,
@@ -2061,11 +2094,12 @@ class LogicalScheduler:
         """Create a BaseOp subclass instance for each tensor."""
         return [cls(tensor=tensor) for tensor in self.tensors]
 
-    def _make_preloop_mt1_grs(self) -> List[GRPlacement]:
-        """Create MT1 GRs for the PGR=2 preloop, ordered to match the mainloop.
+    def _make_preloop_mt_grs(self, mt: int) -> List[GRPlacement]:
+        """Create GRs for a given MT iteration in the preloop.
 
-        Covers partitions 0..offsetPartition-1 with proper deduplication.
-        Each unique (tensor, tile-range, k-range) appears exactly once.
+        For PGR=N, the preloop fills MT 1..N-1 ahead of the mainloop. Each MT's
+        GRs cover partitions 0..offsetPartition-1 with proper deduplication.
+        Each unique (tensor, tile-range, k-range) appears exactly once per MT.
         """
         self._ensure_pass(Pass.LR)
         cfg = self.config
@@ -2090,12 +2124,28 @@ class LogicalScheduler:
                     seen.add(key)
                     result.append(GRPlacement(
                         tensor=tensor,
-                        mtIteration=1,
+                        mtIteration=mt,
                         tiles=tr,
                         subIterK_slot=k,
                         partition=pi,
                     ))
         return result
+
+    # Backward-compat alias for PGR=2 callers / tests.
+    def _make_preloop_mt1_grs(self) -> List[GRPlacement]:
+        return self._make_preloop_mt_grs(1)
+
+    @staticmethod
+    def _ngll_target_label(phase: int, pgr: int) -> str:
+        """SkipOp target name for an NGLL phase.
+
+        For PGR=2, kept as bare 'NGLL' (single phase, preserves legacy label).
+        For PGR>=3, suffixed with the phase index: 'NGLL_1' is the innermost
+        (just before NLL), 'NGLL_{pgr-1}' is the first one after the mainloop.
+        """
+        if pgr <= 2:
+            return 'NGLL'
+        return f'NGLL_{phase}'
 
     def build_preloop(self) -> List[List[List[EmittedModule]]]:
         """Build preloop: pipeline initialization sequence before mainloop.
@@ -2107,12 +2157,14 @@ class LogicalScheduler:
           LR        — first partition, subIterK=0
           skip(LE 1, NLL)
 
-        PGR=2 sequence:
+        PGR=N (N>=2) sequence:
           GR(MT 0)  — all tensors, all tiles
           LR        — first partition, subIterK=0
           skip(LE 1, NLL)
-          GR(MT 1)  — first partition tiles
-          skip(LE 2, NGLL)
+          for i in 1..N-1:
+            GR(MT i)  — first partition tiles
+            skip(LE i+1, NGLL_i)        # NGLL_1 is innermost (before NLL).
+                                         # For PGR=2 the bare label 'NGLL' is used.
 
         Returns [1 partition][1 subIterK][EmittedModules] to match emit() shape.
         """
@@ -2144,16 +2196,23 @@ class LogicalScheduler:
                 SkipOp(compare='LE', value=1, target='NLL'),
             ])
         else:
-            emitted = self._to_emitted([
+            ops = [
                 *self._make_gr_all_tensors(0, all_tiles),
                 *self._make_depops_all_tensors(GRIncOp),
                 WaitGROp(wait_gr_counts=WaitGRCounts()),
                 SyncOp(),
                 *self._make_lr_all_tensors(lr_tiles),
                 SkipOp(compare='LE', value=1, target='NLL'),
-                *self._make_preloop_mt1_grs(),
-                SkipOp(compare='LE', value=2, target='NGLL'),
-            ])
+            ]
+            # For PGR=N: emit GR for MT 1..N-1, each followed by a skip to
+            # the matching NGLL phase. NGLL phase numbering: phase i is the
+            # variant that drains i more buffers. The skip after GR(MT i) goes
+            # to NGLL_i.
+            for mt in range(1, cfg.pgr):
+                ops.extend(self._make_preloop_mt_grs(mt))
+                ops.append(SkipOp(compare='LE', value=mt + 1,
+                                  target=self._ngll_target_label(mt, cfg.pgr)))
+            emitted = self._to_emitted(ops)
 
         self._preloop_emitted = [[emitted]]
         return self._preloop_emitted
@@ -2235,23 +2294,50 @@ class LogicalScheduler:
         hasNGLL = self.config.pgr >= 2
         endLabel = Label("SkipToEnd", "")
         module.add(Label("SkipMainloop", ""))
+
+        # NGLL phase labels: for PGR=2 the bare 'SkipToNGLL' label is kept
+        # (single phase). For PGR>=3 we use 'SkipToNGLL_{phase}' indexed labels
+        # matching the SkipOp targets emitted in build_preloop. Phase numbering:
+        # phase 1 is innermost (just before NLL); phase pgr-1 is the first one
+        # after mainloop fall-through.
+        pgr = self.config.pgr
+        num_phases = max(0, pgr - 1)
+
+        def _ngll_label(phase: int) -> str:
+            return "SkipToNGLL" if pgr <= 2 else f"SkipToNGLL_{phase}"
+
+        # First (outermost) phase label is what the mainloop falls into.
         if hasNGLL:
-            module.add(Label("SkipToNGLL", ""))
+            module.add(Label(_ngll_label(num_phases), ""))
 
         # _per_unroll[i] has tiles for unroll_iter=i.
         # After mainloop C{ui}, data in LDS/vgprs corresponds to
         # unroll_iter = (ui + pgr) % uf for NLL, (ui + 1) % uf for NGLL.
         # NLLEarly (preloop skip) needs unroll_iter=0, i.e. _nll_per_unroll[0].
         # We place SkipToNLL before whichever NLL block uses index 0.
-        pgr = self.config.pgr
         last = uf - 1
+
+        def _emit_ngll_chain(ui: int):
+            """Emit NGLL phases num_phases..1 for mainloop copy ui.
+
+            Inserts SkipToNGLL_{phase} label before each phase. For PGR=2 the
+            single phase already had its label emitted at chain entry, so we
+            only emit additional labels for phase < num_phases.
+            """
+            for phase in range(num_phases, 0, -1):
+                if phase < num_phases:
+                    module.add(Label(_ngll_label(phase), ""))
+                module.addComment0(f"NGLL_C{ui}_phase{phase}")
+                # ngll_per_unroll_phases[ui][phase_idx] where phase_idx=0 is
+                # the innermost (NGLL_1), so phase_idx = phase - 1.
+                ngll_data = self._ngll_per_unroll_phases[(ui + 1) % uf][phase - 1]
+                module.add(self._emitLoop(
+                    writer, kernel, f"NGLL_C{ui}_p{phase}", ngll_data))
 
         # Fall-through from last mainloop copy
         nll_ft = (last + pgr) % uf
         if hasNGLL:
-            module.addComment0(f"NGLL_C{last}")
-            module.add(self._emitLoop(writer, kernel, f"NGLL_C{last}",
-                                      self._ngll_per_unroll[(last + 1) % uf]))
+            _emit_ngll_chain(last)
         if nll_ft == 0:
             module.add(Label("SkipToNLL", ""))
         module.addComment0(f"NLL_C{last}")
@@ -2264,9 +2350,7 @@ class LogicalScheduler:
             nll_idx = (ui + pgr) % uf
             module.add(exitLabels[ui])
             if hasNGLL:
-                module.addComment0(f"NGLL_C{ui}")
-                module.add(self._emitLoop(writer, kernel, f"NGLL_C{ui}",
-                                          self._ngll_per_unroll[(ui + 1) % uf]))
+                _emit_ngll_chain(ui)
             if nll_idx == 0:
                 module.add(Label("SkipToNLL", ""))
             module.addComment0(f"NLL_C{ui}")
@@ -2406,6 +2490,9 @@ class LogicalScheduler:
 
         self._emitted_per_unroll = []
         self._ngll_per_unroll = []
+        # _ngll_per_unroll_phases[ui][phase] = populated NGLL variant for that
+        # unroll iter and phase. Phase index 0 = innermost (NGLL_1).
+        self._ngll_per_unroll_phases: List[List[List[List[List[EmittedModule]]]]] = []
         self._nll_per_unroll = []
         for ui in range(self.unroll_factor):
             em_copy = copy.deepcopy(self._emitted)
@@ -2415,6 +2502,13 @@ class LogicalScheduler:
             ngll_copy = copy.deepcopy(self._ngll_emitted)
             emitter.populate(ngll_copy, unroll_iter=ui)
             self._ngll_per_unroll.append(ngll_copy)
+
+            phases_copy = []
+            for phase in self._ngll_phases:
+                p_copy = copy.deepcopy(phase)
+                emitter.populate(p_copy, unroll_iter=ui)
+                phases_copy.append(p_copy)
+            self._ngll_per_unroll_phases.append(phases_copy)
 
             nll_copy = copy.deepcopy(self._nll_emitted)
             emitter.populate(nll_copy, unroll_iter=ui)
