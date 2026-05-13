@@ -286,7 +286,7 @@ BenchmarkProblems:
           - [16, 16, 128, 1,  1, 4, 4,  2, 2]  # MT 128x128
           - [16, 16, 128, 1,  1, 8, 8,  2, 2]  # MT 256x256
           - [16, 16, 128, 1,  1, 6, 4,  2, 2]  # MT 192x128 (odd M wavetile)
-        - PrefetchGlobalRead: [0]
+        - PrefetchGlobalRead: [0, 1, 2]
         - PrefetchLocalRead: [0]
         - DepthU: [256]
         - ScheduleIterAlg: [3]
@@ -407,7 +407,7 @@ BenchmarkProblems:
           # Odd M wavetile
           - [16, 16, 128, 1,  1, 6, 4,  2, 2]  # MT 192x128
           - [16, 16, 128, 1,  1, 6, 8,  2, 2]  # MT 192x256
-        - PrefetchGlobalRead: [0]
+        - PrefetchGlobalRead: [0, 1, 2]
         - PrefetchLocalRead: [0]
         - DepthU: [256]
         - ScheduleIterAlg: [3]
@@ -460,7 +460,7 @@ BenchmarkProblems:
           - [16, 16, 128, 1,  1, 4, 4,  2, 2]  # MT 128x128
           - [16, 16, 128, 1,  1, 8, 8,  2, 2]  # MT 256x256
           - [16, 16, 128, 1,  1, 6, 4,  2, 2]  # MT 192x128 (odd M wavetile)
-        - PrefetchGlobalRead: [0]
+        - PrefetchGlobalRead: [0, 1, 2]
         - PrefetchLocalRead: [0]
         - DepthU: [256]
         - ScheduleIterAlg: [3]
@@ -691,7 +691,7 @@ BenchmarkProblems:
           - [16, 16, 128, 1,  1, 2, 2,  1, 4]  # MT 32x128
           - [16, 16, 128, 1,  1, 4, 2,  1, 4]  # MT 64x128
           - [16, 16, 128, 1,  1, 4, 4,  1, 4]  # MT 64x256
-        - PrefetchGlobalRead: [2]
+        - PrefetchGlobalRead: [0, 1, 2]
         - PrefetchLocalRead: [1]
         - DepthU: [256]
         - ScheduleIterAlg: [3]
