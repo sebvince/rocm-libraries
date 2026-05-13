@@ -1194,10 +1194,33 @@ class LogicalScheduler:
         """
         self._ensure_pass(Pass.DEPS)
 
-        def _dep_exec_order(dep):
-            return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
-
         for tensor in self.tensors:
+            # Rank GRs within each (mtIteration, partition, subIterK_slot) by
+            # _gr_sort_key — the same order the wait emitter walks. Two GRs that
+            # share a slot collapse to one (mt_offset, partition, slot) key, so
+            # the rank is needed to keep them distinguishable: dropping a dep on
+            # the slot's last GR is unsafe even if a dep on an earlier-rank GR
+            # in the same slot is kept.
+            slot_members = {}
+            for slots in self._partitions:
+                for slot in slots:
+                    for gr in slot.grs:
+                        if gr.tensor == tensor:
+                            key = (gr.mtIteration, gr.partition, gr.subIterK_slot)
+                            slot_members.setdefault(key, []).append(gr)
+
+            gr_intra_rank = {}
+            for grs in slot_members.values():
+                for rank, gr in enumerate(sorted(grs, key=self._gr_sort_key)):
+                    gr_intra_rank[id(gr)] = rank
+
+            def _dep_exec_order(dep):
+                gr = dep.ref
+                return (dep.mt_offset,
+                        gr.partition,
+                        gr.subIterK_slot,
+                        gr_intra_rank[id(gr)])
+
             lr_with_gr_deps = []
             for pi, slots in enumerate(self._partitions):
                 for slot in slots:
@@ -1211,7 +1234,7 @@ class LogicalScheduler:
                 continue
 
             max_eo = max(_dep_exec_order(dep) for _, dep in lr_with_gr_deps)
-            max_guaranteed = (max_eo[0] - 1, max_eo[1], max_eo[2])
+            max_guaranteed = (max_eo[0] - 1, max_eo[1], max_eo[2], 0)
 
             for lr, dep in lr_with_gr_deps:
                 eo = _dep_exec_order(dep)

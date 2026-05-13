@@ -27,7 +27,7 @@ def makeTileInfo(tc, kernel):
     return TileInfo(_geo[tc], tc, None, kernel)
 
 
-def create_kernel(MT0=256, MT1=256, fp4=False, depthU=None):
+def create_kernel(MT0=256, MT1=256, fp4=False, depthU=None, waveGroup=(2, 2)):
     from unittest.mock import MagicMock
 
     mxblock = 32 if fp4 else 0
@@ -56,7 +56,7 @@ def create_kernel(MT0=256, MT1=256, fp4=False, depthU=None):
         "MatrixInstM": 16,
         "MatrixInstN": 16,
         "MatrixInstK": matrixInstK,
-        "MIWaveGroup": [2, 2],
+        "MIWaveGroup": list(waveGroup),
         "WavefrontSize": 64,
         "SourceSwap": False,
         "MIArchVgpr": False,
@@ -948,6 +948,107 @@ def test_128x128_bf16_pgr1():
     assert actual == EXPECTED_EMIT_DEP_ORDER_128x128_BF16_PGR1, (
         f"Emit dependency order mismatch.\n"
         f"--- Expected ---\n{EXPECTED_EMIT_DEP_ORDER_128x128_BF16_PGR1}\n"
+        f"--- Actual ---\n{actual}"
+    )
+
+
+def make_128x96_bf16_pgr1_wg4x1():
+    """MT128x96, MIWT 2x6, WG 4x1, DU=128, PGR1.
+
+    Mirrors subtile_bf16_failing.yaml. With this geometry, multiple GR_B
+    placements end up in the same subIterK slot (slot 2: ids [4-5] and
+    [0-5]). loadRatioGR_B > 1.0 so grB.mn = 2 (mirrors Kernel.py:1139-1140).
+    """
+    kernel = create_kernel(128, 96, fp4=False, depthU=128, waveGroup=(4, 1))
+    tiA = makeTileInfo('A', kernel)
+    tiB = makeTileInfo('B', kernel)
+    grA = ReadGranularity(mn=1, k=2) if tiA.loadRatioGR <= 1.0 else ReadGranularity(mn=2, k=2)
+    grB = ReadGranularity(mn=1, k=2) if tiB.loadRatioGR <= 1.0 else ReadGranularity(mn=2, k=2)
+    return SchedulerConfig(
+        numMFMATilesM=tiA.localMMATileGrid[0],
+        numMFMATilesN=tiB.localMMATileGrid[0],
+        numSubIterK=tiA.localMMATileGrid[1],
+        lrA=ReadGranularity(mn=1, k=1),
+        lrB=ReadGranularity(mn=1, k=1),
+        grA=grA,
+        grB=grB,
+        numPartitionsM=1,
+        numPartitionsN=1,
+        pgr=1,
+    )
+
+
+# Regression: pins the post-fix behavior of remove_unnecessary_gr_deps when
+# multiple GRs of the same tensor share a (mt_offset, partition, slot).
+# The pass used to collapse those into one key and drop deps on later-rank
+# GRs, leaving the surviving wait anchored on an earlier-rank GR — under-
+# counting in-flight loads and causing stale-LDS reads on the next iter.
+# Diff vs the buggy version: subIterK=1 wait_gr changes from
+# "wait_gr(A=2,B=3)" to "wait_gr(A=2)" (B-wait pushed to wrap-around).
+EXPECTED_EMIT_DEP_ORDER_128x96_BF16_PGR1_WG4x1 = """\
+MAINLOOP (dependency paths):
+  Partition 0:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [0-1] , B : [0-5] <- [4]
+      preMFMA path 0:
+        [ 4] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR A  (MT n, subIterK [1]) [0-1]
+        [ 2] lr         LR B  (MT n, subIterK [1]) [0-5]
+      path 1:
+        [ 5] gr_inc     gr_inc(A)
+        [ 3] gr         GR A (MT n+1, subIterK [0,1]) ids [0-1]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [0-1] , B : [0-5] <- [4]
+      preMFMA path 0:
+        [ 4] wait_lr    wait_lr
+      path 0:
+        [ 5] wait_gr    wait_gr(A=2)
+        [ 6] sync       sync
+        [ 1] lr         LR A  (MT n, subIterK [2]) [0-1]
+        [ 2] lr         LR B  (MT n, subIterK [2]) [0-5]
+      path 1:
+        [ 7] gr_inc     gr_inc(B)
+        [ 3] gr         GR B (MT n+1, subIterK [0,1]) ids [0-3]
+    subIterK=2:
+      MFMA: [ 0] MFMAs (MT n, subIterK 2  ) A : [0-1] , B : [0-5] <- [6]
+      preMFMA path 0:
+        [ 6] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR A  (MT n, subIterK [3]) [0-1]
+        [ 2] lr         LR B  (MT n, subIterK [3]) [0-5]
+      path 1:
+        [ 3] gr         GR B (MT n+1, subIterK [0,1]) ids [4-5]
+        [ 4] gr         GR A (MT n+1, subIterK [2,3]) ids [0-1]
+        [ 5] gr         GR B (MT n+1, subIterK [2,3]) ids [0-5]
+    subIterK=3:
+      MFMA: [ 0] MFMAs (MT n, subIterK 3  ) A : [0-1] , B : [0-5] <- [3]
+      preMFMA path 0:
+        [ 3] wait_lr    wait_lr
+      path 0:
+        [ 4] wait_gr    wait_gr(A=2,B=3)
+        [ 5] sync       sync
+        [ 6] lr_inc     lr_inc(A)
+        [ 7] lr_inc     lr_inc(B)
+        [ 1] lr         LR A  (MT n+1, subIterK [0]) [0-1]
+        [ 2] lr         LR B  (MT n+1, subIterK [0]) [0-5]
+"""
+
+
+def test_128x96_bf16_pgr1_wg4x1():
+    """Regression: multi-GR-per-slot anchoring in remove_unnecessary_gr_deps.
+
+    Mirrors subtile_bf16_failing.yaml. Pins the post-fix behavior so a future
+    change that re-collapses GRs sharing (mt_offset, partition, slot)
+    will diff against this expected output.
+    """
+    cfg = make_128x96_bf16_pgr1_wg4x1()
+    sched = LogicalScheduler(cfg)
+    sched.emit()
+    actual = sched.print_emit_dep_order()
+    assert actual == EXPECTED_EMIT_DEP_ORDER_128x96_BF16_PGR1_WG4x1, (
+        f"Emit dependency order mismatch.\n"
+        f"--- Expected ---\n{EXPECTED_EMIT_DEP_ORDER_128x96_BF16_PGR1_WG4x1}\n"
         f"--- Actual ---\n{actual}"
     )
 
