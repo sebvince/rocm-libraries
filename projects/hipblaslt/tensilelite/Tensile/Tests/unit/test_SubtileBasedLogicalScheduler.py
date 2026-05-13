@@ -54,7 +54,7 @@ def _mock_dtype(num_bytes=2):
     return mock
 
 
-def create_kernel(MT0=256, MT1=256, fp4=False, depthU=None):
+def create_kernel(MT0=256, MT1=256, fp4=False, depthU=None, waveGroup=(2, 2)):
     mxblock = 32 if fp4 else 0
     bpe = 0.5 if fp4 else 2
     matrixInstK = 128 if fp4 else 32
@@ -80,7 +80,7 @@ def create_kernel(MT0=256, MT1=256, fp4=False, depthU=None):
         "MatrixInstM": 16,
         "MatrixInstN": 16,
         "MatrixInstK": matrixInstK,
-        "MIWaveGroup": [2, 2],
+        "MIWaveGroup": list(waveGroup),
         "WavefrontSize": 64,
         "SourceSwap": False,
         "MIArchVgpr": False,
@@ -1650,163 +1650,82 @@ class TestIntegration:
 if __name__ == "__main__":
     import sys
     import io
+    import argparse
 
-    use_bf16 = "--bf16" in sys.argv
-    use_pgr0 = "--pgr0" in sys.argv
-    use_pgr1 = "--pgr1" in sys.argv
+    parser = argparse.ArgumentParser(
+        description="Visualize SubtileBased LogicalScheduler steps for a given kernel config.",
+    )
+    parser.add_argument("--mt0", type=int, default=256, help="MacroTile0 (default: 256)")
+    parser.add_argument("--mt1", type=int, default=256, help="MacroTile1 (default: 256)")
+    parser.add_argument("--du", type=int, default=None,
+                        help="DepthU (default: 64 for bf16, 512 for fp4)")
+    parser.add_argument("--dtype", choices=["bf16", "fp4"], default="bf16",
+                        help="Data type (default: bf16)")
+    parser.add_argument("--partition-m", type=int, default=1,
+                        help="numPartitionsM (default: 1)")
+    parser.add_argument("--partition-n", type=int, default=1,
+                        help="numPartitionsN (default: 1)")
+    parser.add_argument("--wg", type=str, default="2x2",
+                        help="MIWaveGroup as MxN (default: 2x2)")
+    parser.add_argument("--pgr", type=int, choices=[0, 1, 2], default=1,
+                        help="PrefetchGlobalRead level (default: 1)")
+    parser.add_argument("--interactive", "-i", action="store_true",
+                        help="Step through each phase interactively")
+    args = parser.parse_args()
 
-    if use_pgr0 or use_pgr1:
-        if use_pgr0:
-            cfg = make_cfg_bf16_pgr0()
-        elif use_bf16:
-            cfg = make_cfg_bf16_pgr1()
-        else:
-            _kernel_fp4_pgr1 = create_kernel(128, 128, fp4=True, depthU=512)
-            _tiA = TileInfo('A', _kernel_fp4_pgr1)
-            _tiB = TileInfo('B', _kernel_fp4_pgr1)
-            _scaleTiA = makeTileInfo('MXSA', _kernel_fp4_pgr1)
-            _scaleTiB = makeTileInfo('MXSB', _kernel_fp4_pgr1)
-            cfg = SchedulerConfig(
-                numMFMATilesM=_tiA.localMMATileGrid[0],
-                numMFMATilesN=_tiB.localMMATileGrid[0],
-                numSubIterK=_tiA.localMMATileGrid[1],
-                lrA=ReadGranularity(mn=1, k=1),
-                lrB=ReadGranularity(mn=1, k=1),
-                grA=ReadGranularity(mn=1, k=2),
-                grB=ReadGranularity(mn=1, k=2),
-                lrSA=ReadGranularity(mn=2, k=2),
-                lrSB=ReadGranularity(mn=2, k=2),
-                grSA=ReadGranularity(mn=_scaleTiA.localMMATileGrid[0], k=_scaleTiA.localMMATileGrid[1]),
-                grSB=ReadGranularity(mn=_scaleTiB.localMMATileGrid[0], k=_scaleTiB.localMMATileGrid[1]),
-                numPartitionsM=1,
-                numPartitionsN=1,
-                pgr=1,
-            )
+    fp4 = args.dtype == "fp4"
+    if args.du is None:
+        args.du = 512 if fp4 else 64
 
-        print(f"Config: numMFMATilesM={cfg.numMFMATilesM}, "
-              f"numMFMATilesN={cfg.numMFMATilesN}, "
-              f"numSubIterK={cfg.numSubIterK}, "
-              f"hasScale={cfg.hasScale}, pgr={cfg.pgr}, plr={cfg.plr}")
-        print()
+    wg_parts = args.wg.lower().split("x")
+    if len(wg_parts) != 2:
+        parser.error(f"--wg must be MxN (e.g. 2x2), got: {args.wg}")
+    waveGroup = (int(wg_parts[0]), int(wg_parts[1]))
 
-        sched = LogicalScheduler(cfg)
+    kernel = create_kernel(args.mt0, args.mt1, fp4=fp4, depthU=args.du,
+                           waveGroup=waveGroup)
+    tiA = makeTileInfo('A', kernel)
+    tiB = makeTileInfo('B', kernel)
+    scaleTiA = makeTileInfo('MXSA', kernel) if fp4 else None
+    scaleTiB = makeTileInfo('MXSB', kernel) if fp4 else None
 
-        interactive = "--interactive" in sys.argv or "-i" in sys.argv
+    # Mirror Kernel.py:1139-1140 — gr granularity widens to (2,2) when the
+    # tile's GR load ratio exceeds 1.0.
+    grA = ReadGranularity(mn=1, k=2) if tiA.loadRatioGR <= 1.0 else ReadGranularity(mn=2, k=2)
+    grB = ReadGranularity(mn=1, k=2) if tiB.loadRatioGR <= 1.0 else ReadGranularity(mn=2, k=2)
 
-        steps = [
-            ("Place LRs",                     lambda: (sched.place_LRs(), sched.print_lr())),
-            ("Assign VGPR tiles",             lambda: (sched.assign_vgpr_tiles(), sched.print_vgpr())),
-            ("Place GRs",                     lambda: (sched.place_GRs(), sched.print_gr())),
-            ("Annotate deps",                 lambda: (sched.annotate_deps(), sched.print_deps())),
-            ("Remove unnecessary GR deps",    lambda: (sched.remove_unnecessary_gr_deps(), sched.print_deps())),
-            ("Remove unnecessary LR deps",    lambda: (sched.remove_unnecessary_lr_deps(), sched.print_deps())),
-            ("Remove cross deps",             lambda: (sched.remove_cross_deps(), sched.print_remove_deps())),
-            ("Insert gr/lr inc",              lambda: (sched.insert_gr_lr_inc(), sched.print_group_lr_gr())),
-            ("Group LR/GR",                   lambda: (sched.group_lr_gr(), sched.print_group_lr_gr())),
-            ("Remove unnecessary wait_lr_sync", lambda: (sched.remove_unnecessary_wait_lr_sync(), sched.print_group_lr_gr())),
-            ("Emit",                          lambda: (sched.emit(), sched.print_emit())),
-            ("Emit (dependency order)",       lambda: (None, sched.print_emit_dep_order())),
-        ]
-
-        for i, (title, run) in enumerate(steps):
-            _, output = run()
-            print(f"{'=' * 60}")
-            print(f"  {title}")
-            print(f"{'=' * 60}")
-            print(output)
-            if interactive and i < len(steps) - 1:
-                input("Press Enter for next step...")
-
-        fp4 = use_pgr1 and not use_bf16
-        if fp4:
-            kernel = create_kernel(128, 128, fp4=True, depthU=512)
-        else:
-            kernel = create_kernel(256, 256, fp4=fp4)
-        writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = make_writer_and_tileinfos(kernel, fp4=fp4)
-
-        sched.allocVgprTiles(writer, tiA, tiB,
-                             scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
-
-        sched.populate_instructions(
-            writer, kernel,
-            tileInfoA=tiA, tileInfoB=tiB,
-            dtileInfo=dTileInfo,
-            scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
-        )
-
-        def _print_emitLoop(label, emitted_3d, schedule=True):
-            module = sched._emitLoop(writer, kernel, label, emitted_3d, schedule=schedule)
-            buf = io.StringIO()
-            for inst in module.flatitems():
-                buf.write(f"  {str(inst).rstrip()}\n")
-            return buf.getvalue()
-
-        loop_sections = [("MAINLOOP", sched._emitted_per_unroll[0])]
-        if use_pgr1:
-            loop_sections = [
-                ("PRELOOP",  sched._preloop_emitted, False),
-                ("MAINLOOP", sched._emitted_per_unroll[0]),
-                ("NGLL",     sched._ngll_per_unroll[0]),
-                ("NLL",      sched._nll_per_unroll[0]),
-            ]
-
-        for section in loop_sections:
-            label, emitted_3d = section[0], section[1]
-            schedule = section[2] if len(section) > 2 else True
-            print(f"{'=' * 60}")
-            print(f"  {label} (emitLoop)")
-            print(f"{'=' * 60}")
-            print(_print_emitLoop(label, emitted_3d, schedule=schedule))
-            if interactive:
-                input("Press Enter for next step...")
-
-        sched.deallocVgprTiles(writer)
-
-        sys.exit(0)
-
-    if use_bf16:
-        kernel = create_kernel(384, 256, fp4=False, depthU=64)
-        tiA = makeTileInfo('A', kernel)
-        tiB = makeTileInfo('B', kernel)
-        scaleTiA = None
-        scaleTiB = None
-
-        cfg = SchedulerConfig(
-            numMFMATilesM=tiA.localMMATileGrid[0],
-            numMFMATilesN=tiB.localMMATileGrid[0],
-            numSubIterK=tiA.localMMATileGrid[1],
-            lrA=ReadGranularity(mn=1, k=1),
-            lrB=ReadGranularity(mn=1, k=1),
-            grA=ReadGranularity(mn=1, k=2),
-            grB=ReadGranularity(mn=1, k=2),
-            numPartitionsM=2,
-            numPartitionsN=1,
-        )
-    else:
-        kernel = create_kernel(128, 128, fp4=True, depthU=512)
-        tiA = makeTileInfo('A', kernel)
-        tiB = makeTileInfo('B', kernel)
-        scaleTiA = makeTileInfo('MXSA', kernel)
-        scaleTiB = makeTileInfo('MXSB', kernel)
-
-        cfg = SchedulerConfig(
-            numMFMATilesM=tiA.localMMATileGrid[0],
-            numMFMATilesN=tiB.localMMATileGrid[0],
-            numSubIterK=tiA.localMMATileGrid[1],
-            lrA=ReadGranularity(mn=1, k=1),
-            lrB=ReadGranularity(mn=1, k=1),
-            grA=ReadGranularity(mn=1, k=2),
-            grB=ReadGranularity(mn=1, k=2),
+    cfg_kwargs = dict(
+        numMFMATilesM=tiA.localMMATileGrid[0],
+        numMFMATilesN=tiB.localMMATileGrid[0],
+        numSubIterK=tiA.localMMATileGrid[1],
+        lrA=ReadGranularity(mn=1, k=1),
+        lrB=ReadGranularity(mn=1, k=1),
+        grA=grA,
+        grB=grB,
+        numPartitionsM=args.partition_m,
+        numPartitionsN=args.partition_n,
+        pgr=args.pgr,
+    )
+    if fp4:
+        cfg_kwargs.update(
             lrSA=ReadGranularity(mn=2, k=2),
             lrSB=ReadGranularity(mn=2, k=2),
-            grSA=ReadGranularity(mn=scaleTiA.localMMATileGrid[0], k=scaleTiA.localMMATileGrid[1]),
-            grSB=ReadGranularity(mn=scaleTiB.localMMATileGrid[0], k=scaleTiB.localMMATileGrid[1]),
+            grSA=ReadGranularity(mn=scaleTiA.localMMATileGrid[0],
+                                 k=scaleTiA.localMMATileGrid[1]),
+            grSB=ReadGranularity(mn=scaleTiB.localMMATileGrid[0],
+                                 k=scaleTiB.localMMATileGrid[1]),
         )
+    cfg = SchedulerConfig(**cfg_kwargs)
 
-    print(f"Config: numMFMATilesM={cfg.numMFMATilesM}, "
+    print(f"Config: MT={args.mt0}x{args.mt1}, DU={args.du}, dtype={args.dtype}, "
+          f"WG={waveGroup[0]}x{waveGroup[1]}, "
+          f"partitions={args.partition_m}x{args.partition_n}, pgr={args.pgr}")
+    print(f"        numMFMATilesM={cfg.numMFMATilesM}, "
           f"numMFMATilesN={cfg.numMFMATilesN}, "
           f"numSubIterK={cfg.numSubIterK}, "
-          f"hasScale={cfg.hasScale}")
+          f"hasScale={cfg.hasScale}, plr={cfg.plr}")
+    print(f"        loadRatioGR(A,B)=({tiA.loadRatioGR:.3f}, {tiB.loadRatioGR:.3f}) "
+          f"-> grA=({grA.mn},{grA.k}) grB=({grB.mn},{grB.k})")
     print()
 
     sched = LogicalScheduler(cfg)
@@ -1826,16 +1745,57 @@ if __name__ == "__main__":
         ("Emit (dependency order)",       lambda: (None, sched.print_emit_dep_order())),
     ]
 
-    interactive = "--interactive" in sys.argv or "-i" in sys.argv
-
     for i, (title, run) in enumerate(steps):
         _, output = run()
         print(f"{'=' * 60}")
         print(f"  {title}")
         print(f"{'=' * 60}")
         print(output)
-        if interactive and i < len(steps) - 1:
+        if args.interactive and i < len(steps) - 1:
             input("Press Enter for next step...")
+
+    writer, tiA, tiB, scaleTiA, scaleTiB, dTileInfo = make_writer_and_tileinfos(kernel, fp4=fp4)
+
+    sched.allocVgprTiles(writer, tiA, tiB,
+                         scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB)
+
+    sched.populate_instructions(
+        writer, kernel,
+        tileInfoA=tiA, tileInfoB=tiB,
+        dtileInfo=dTileInfo,
+        scaleTileInfoA=scaleTiA, scaleTileInfoB=scaleTiB,
+    )
+
+    def _print_emitLoop(label, emitted_3d, schedule=True):
+        module = sched._emitLoop(writer, kernel, label, emitted_3d, schedule=schedule)
+        buf = io.StringIO()
+        for inst in module.flatitems():
+            buf.write(f"  {str(inst).rstrip()}\n")
+        return buf.getvalue()
+
+    if args.pgr >= 1:
+        loop_sections = [
+            ("PRELOOP",  sched._preloop_emitted, False),
+            ("MAINLOOP", sched._emitted_per_unroll[0]),
+            ("NGLL",     sched._ngll_per_unroll[0]),
+            ("NLL",      sched._nll_per_unroll[0]),
+        ]
+    else:
+        loop_sections = [("MAINLOOP", sched._emitted_per_unroll[0])]
+
+    for section in loop_sections:
+        label, emitted_3d = section[0], section[1]
+        schedule = section[2] if len(section) > 2 else True
+        print(f"{'=' * 60}")
+        print(f"  {label} (emitLoop)")
+        print(f"{'=' * 60}")
+        print(_print_emitLoop(label, emitted_3d, schedule=schedule))
+        if args.interactive:
+            input("Press Enter for next step...")
+
+    sched.deallocVgprTiles(writer)
+
+    sys.exit(0)
 
     sched.build_preloop()
     preloop_output = sched.print_emit(sched._preloop_emitted)
