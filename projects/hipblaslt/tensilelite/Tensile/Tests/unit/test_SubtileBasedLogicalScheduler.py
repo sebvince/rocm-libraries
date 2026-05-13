@@ -2123,8 +2123,8 @@ if __name__ == "__main__":
                         help="partitionSize as MxN in MFMA tiles (0 = full dim, default: 0x0)")
     parser.add_argument("--wg", type=str, default="2x2",
                         help="MIWaveGroup as MxN (default: 2x2)")
-    parser.add_argument("--pgr", type=int, choices=[0, 1, 2], default=1,
-                        help="PrefetchGlobalRead level (default: 1)")
+    parser.add_argument("--pgr", type=int, default=1,
+                        help="PrefetchGlobalRead level [0..16] (default: 1)")
     parser.add_argument("--interactive", "-i", action="store_true",
                         help="Step through each phase interactively")
     args = parser.parse_args()
@@ -2235,8 +2235,15 @@ if __name__ == "__main__":
         return buf.getvalue()
 
     if args.pgr >= 1:
+        print(f"{'=' * 60}")
+        print(f"  PRELOOP (print_emit)")
+        print(f"{'=' * 60}")
+        print(sched.print_emit(sched._preloop_emitted).replace("MAINLOOP:", "PRELOOP:"))
+        if args.interactive:
+            input("Press Enter for next step...")
+
+    if args.pgr >= 1:
         loop_sections = [
-            ("PRELOOP",  sched._preloop_emitted, False),
             ("MAINLOOP", sched._emitted_per_unroll[0]),
             ("NGLL",     sched._ngll_per_unroll[0]),
             ("NLL",      sched._nll_per_unroll[0]),
