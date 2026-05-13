@@ -2210,6 +2210,10 @@ class LogicalScheduler:
             # to NGLL_i.
             for mt in range(1, cfg.pgr):
                 ops.extend(self._make_preloop_mt_grs(mt))
+                # gr_inc for intermediate MTs sets up the next preloop GR.
+                # The last MT's gr_inc is deferred to the mainloop preop.
+                if mt < cfg.pgr - 1:
+                    ops.extend(self._make_depops_all_tensors(GRIncOp))
                 ops.append(SkipOp(compare='LE', value=mt + 1,
                                   target=self._ngll_target_label(mt, cfg.pgr)))
             emitted = self._to_emitted(ops)
