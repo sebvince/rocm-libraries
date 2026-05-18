@@ -203,24 +203,36 @@ class InstructionEmitter:
         return [SBarrier(comment="Barrier")]
 
     def emit_lr_inc(self, source):
-        """Emit localReadLDSBufferSwap for a single tensor."""
+        """Emit localReadLDSBufferSwap for a single tensor.
+
+        Returns top-level items of the swap module so that any nested
+        Module (e.g. LRSwapSccAtomic_{tc}) survives as a single placement
+        unit in the scheduler — preventing instructions from another path
+        being interleaved between the cmp and cmov that share SCC.
+        """
         tensor = source.tensor
         tc = {'A': 'A', 'B': 'B', 'SA': 'MXSA', 'SB': 'MXSB'}.get(tensor, tensor)
-        module = Module()
-        module.add(localReadLDSBufferSwap(tc, self.writer, self.kernel))
-        return list(module.flatitems())
+        swap_module = localReadLDSBufferSwap(tc, self.writer, self.kernel)
+        return list(swap_module.items())
 
     def emit_gr_inc(self, source):
-        """Emit globalReadPtrUpdates + globalReadLDSBufferSwap for a single tensor."""
+        """Emit globalReadPtrUpdates + globalReadLDSBufferSwap for a single tensor.
+
+        The SRD ptr update is (s_add Srd, s_addc Srd+1) — s_addc reads SCC
+        from s_add, so they must stay adjacent (no SCC-clobber in between).
+        We keep ptr_module as one atomic placement unit. swap_module is
+        iterated top-level so its nested SCC-atomic cmp+cmov block survives
+        as a single placement unit (other top-level items like the comment
+        and the [optional] MX-scale LWBA adjustments still spread normally).
+        """
         tensor = source.tensor
         tc = {'A': 'A', 'B': 'B', 'SA': 'MXSA', 'SB': 'MXSB'}.get(tensor, tensor)
-        module = Module()
         if tensor in ('SA', 'SB'):
-            module.add(globalReadScalePtrUpdates(tc, self.writer, self.kernel))
+            ptr_module = globalReadScalePtrUpdates(tc, self.writer, self.kernel)
         else:
-            module.add(globalReadPtrUpdates(tc, self.writer, self.kernel))
-        module.add(globalReadLDSBufferSwap(tc, self.writer, self.kernel))
-        return list(module.flatitems())
+            ptr_module = globalReadPtrUpdates(tc, self.writer, self.kernel)
+        swap_module = globalReadLDSBufferSwap(tc, self.writer, self.kernel)
+        return [ptr_module] + list(swap_module.items())
 
     def emit_skip(self, source):
         """Emit skip guard: compare LoopCounterL and branch."""

@@ -737,7 +737,8 @@ class KernelWriterAssembly(KernelWriter):
     if kernel["ProblemType"]["Sparse"] and not kernel["DirectToVgprSparseMetadata"]:
       module.add(self.defineSgpr("GlobalReadIncsMetadata", self.states.m.numSgprGlobalReadIncs))
     if self.states.IncLdsBufSwitch:
-      module.add(self.defineSgpr("LDSBufferReadInc", 1))
+      module.add(self.defineSgpr("LDSBufferReadIncA", 1))
+      module.add(self.defineSgpr("LDSBufferReadIncB", 1))
       module.add(self.defineSgpr("LDSBufferWriteInc", 1))
 
 
@@ -5312,7 +5313,7 @@ class KernelWriterAssembly(KernelWriter):
       # initialize inc register for LocalReadAddress
       if initSreg:
         module.add(SMovB32(
-          dst=sgpr("LDSBufferReadInc"), \
+          dst=sgpr(f"LDSBufferReadInc{tc}"), \
           src=0, \
           comment="init LRAddr inc Sgpr"))
       # 3 or more LDS block case, need to keep original LocalReadAddr
@@ -11871,24 +11872,23 @@ class KernelWriterAssembly(KernelWriter):
     if self.states.IncLdsBufSwitch:
       # IncLdsBufSwitch case, we do not use xor. Instead, use add and max check for round back
       # (numLDSBlk>=3 is for DTL (and LocalWriteUseSgpr) only)
-      is1st = tc == "A" # so far, A is always first
-      # LDSBufferReadInc is common for A and B. Add this only for the first one (tc=="A")
-      if is1st:
-        module.add(SAddU32(
-          dst=sgpr("LDSBufferReadInc"), \
-          src0="LdsOneBlockSize", \
-          src1=sgpr("LDSBufferReadInc"), \
-          comment="add LDS block size to incSgpr"))
-        module.add(SCmpEQU32(
-          src0=sgpr("LDSBufferReadInc"), \
-          src1="LdsBlockEndSize", \
-          comment="LDSBufferReadInc == End ?"))
-        module.add(SCMovB32(
-          dst=sgpr("LDSBufferReadInc"), \
-          src=0, comment="LDSBufferReadInc loop back to 0"))
+      # Per-tensor LDSBufferReadInc{tc}: bump/wrap independently at each tc's call.
+      incSgpr = f"LDSBufferReadInc{tc}"
+      module.add(SAddU32(
+        dst=sgpr(incSgpr), \
+        src0="LdsOneBlockSize", \
+        src1=sgpr(incSgpr), \
+        comment=f"{tc}: inc += LdsOneBlockSize"))
+      module.add(SCmpEQU32(
+        src0=sgpr(incSgpr), \
+        src1="LdsBlockEndSize", \
+        comment=f"{tc}: inc == End ?"))
+      module.add(SCMovB32(
+        dst=sgpr(incSgpr), \
+        src=0, comment=f"{tc}: wrap inc back to 0"))
       module.add(VAddU32(
         dst=vgpr("LocalReadAddr%s"%(tc)), \
-        src0=sgpr("LDSBufferReadInc"), \
+        src0=sgpr(incSgpr), \
         src1=vgpr("LocalReadAddrOrig%s"%(tc)), \
         comment="LocalReadAddr = Inc + Orig"))
     elif internalPointerSwap or kernel["StoreSwapAddr"]:

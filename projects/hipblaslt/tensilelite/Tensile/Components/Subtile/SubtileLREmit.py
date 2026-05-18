@@ -375,27 +375,33 @@ def _emitLRLDSSwap_1x2(tag, tile, ti, writer, kernel):
   """Toggle LR read offsets between LDS buffers.
 
   For NumLdsBlk == 2: XOR each sharedVgprLROffset with its swap mask.
-  For NumLdsBlk >= 3: bump shared LDSBufferReadInc by LdsOneBlockSize (wrap at
-    LdsBlockEndSize), then recompute sharedVgprLROffset[i] = Orig[i] + Inc.
-    The "Orig" backup lives in sharedVgprLROffsetSwap[i] (set at init time).
-    The SGPR bump is shared between A and B; emit only for tc == "A".
+  For NumLdsBlk >= 3: per-tensor inc SGPR LDSBufferReadInc{tc} — A and B
+    advance independently at each tc's own swap call (analogous to the GR
+    per-tensor refactor). Each call: bump inc{tc} by LdsOneBlockSize, wrap
+    at LdsBlockEndSize (cmp_eq works because inc is an offset starting at
+    0), then per-i v_add sharedVgprLROffset[i] = Orig[i] + inc{tc}. The
+    "Orig" backup lives in sharedVgprLROffsetSwap[i] (set at init time).
   """
   module = Module()
   tc = ti.tc
   module.addComment0("Emit code to swap %s LR vgpr offsets"%tc)
   if kernel.get("NumLdsBlk", 0) >= 3:
-    if tc == "A":
-      module.add(SAddU32(dst=sgpr("LDSBufferReadInc"),
-                 src0="LdsOneBlockSize", src1=sgpr("LDSBufferReadInc"),
-                 comment="add LDS block size to incSgpr"))
-      module.add(SCmpEQU32(src0=sgpr("LDSBufferReadInc"), src1="LdsBlockEndSize",
-                 comment="LDSBufferReadInc == End ?"))
-      module.add(SCMovB32(dst=sgpr("LDSBufferReadInc"), src=0,
-                 comment="LDSBufferReadInc loop back to 0"))
+    incSgpr = f"LDSBufferReadInc{tc}"
+    # SCC-atomic block: cmp + cmov must stay adjacent (no other s_cmp between)
+    # so the scheduler can't interleave the GR swap's s_cmp and clobber SCC.
+    atomic = Module(f"LRSwapSccAtomic_{tc}")
+    atomic.add(SAddU32(dst=sgpr(incSgpr),
+               src0="LdsOneBlockSize", src1=sgpr(incSgpr),
+               comment=f"{tc}: inc += LdsOneBlockSize"))
+    atomic.add(SCmpEQU32(src0=sgpr(incSgpr), src1="LdsBlockEndSize",
+               comment=f"{tc}: inc == End ?"))
+    atomic.add(SCMovB32(dst=sgpr(incSgpr), src=0,
+               comment=f"{tc}: wrap inc back to 0"))
+    module.add(atomic)
     for i in range(len(tile.sharedVgprLROffset)):
       vOff = tile.sharedVgprLROffset[i]
       vOrig = tile.sharedVgprLROffsetSwap[i]
-      module.add(VAddU32(dst=vgpr(vOff), src0=sgpr("LDSBufferReadInc"), src1=vgpr(vOrig),
+      module.add(VAddU32(dst=vgpr(vOff), src0=sgpr(incSgpr), src1=vgpr(vOrig),
                  comment=f"{tc}: LR addr = Orig + Inc"))
   else:
     for i in range(len(tile.sharedVgprLROffset)):
@@ -590,9 +596,10 @@ def localReadDTLInitCommonSwapVgpr(writer, kernel):
   btile = writer.states.b.tileInfo
 
   if kernel.get("NumLdsBlk", 0) >= 3:
-    # PGR>=3: sharedVgprLROffsetSwap[] becomes the "Orig" backup. Each lr_inc
-    # recomputes sharedVgprLROffset[i] = Orig[i] + LDSBufferReadInc.
-    module.add(SMovB32(dst=sgpr("LDSBufferReadInc"), src=0, comment="init LRAddr inc Sgpr"))
+    # PGR>=3: sharedVgprLROffsetSwap[] becomes the "Orig" backup. Each LR
+    # swap recomputes sharedVgprLROffset[i] = Orig[i] + LDSBufferReadInc{tc}.
+    module.add(SMovB32(dst=sgpr("LDSBufferReadIncA"), src=0, comment="A: init LR inc"))
+    module.add(SMovB32(dst=sgpr("LDSBufferReadIncB"), src=0, comment="B: init LR inc"))
     for i in range(len(atile.sharedVgprLROffset)):
       module.add(VMovB32(dst=vgpr(atile.sharedVgprLROffsetSwap[i]),
                  src=vgpr(atile.sharedVgprLROffset[i]),

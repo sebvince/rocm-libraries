@@ -24,7 +24,7 @@ from rocisa.container import DPPModifiers, EXEC, MUBUFModifiers, VCC, vgpr, sgpr
 from rocisa.enum import RegisterType
 from rocisa.instruction import (
     BufferLoadB128,
-    SAddCU32, SAddU32, SCmpEQU32, SCMovB32, SMovB32, SMovB64, SMulI32, SNop, SXorB32,
+    SAddCU32, SAddU32, SCmpEQU32, SCmpGeU32, SCMovB32, SMovB32, SMovB64, SMulI32, SNop, SXorB32,
     VAddU32, VAndB32, VCmpXEqU32,
     VLShiftLeftB32, VLShiftRightB32, VMovB32,
     VMulLOU32, VReadfirstlaneB32, VSubU32,
@@ -393,16 +393,10 @@ def _emitGR_TLU0(tag, tile, ti, writer, kernel):
       subtileOffset = int(math.ceil(legacyLoadRatio * legacySubtileSize)) if legacyLoadRatio else legacySubtileSize
       WriteBaseAddr = f"LocalWriteBaseAddr{tc}"
 
-      incLdsBufSwitch = kernel.get("NumLdsBlk", 0) >= 3
       for gr_idx in range(legacyTi.numGRPerSubtile):
         m0Offset = gr_idx * subtileOffset + (i + j * int(legacyTi.globalSubtileGrid[0])) * legacySubtileSize
-        if incLdsBufSwitch:
-          # m0 = LocalWriteBaseAddr + LDSBufferWriteInc + (m0Offset - offsetK)
-          module.add(SAddU32(dst=mgpr(0), src0=sgpr(WriteBaseAddr), src1=sgpr("LDSBufferWriteInc"),
-                     comment="m0 <- LDS write base + inc"))
-          module.add(SAddU32(dst=mgpr(0), src0=mgpr(0), src1=(m0Offset - offsetK)))
-        else:
-          module.add(SAddU32(dst=mgpr(0), src0=sgpr(WriteBaseAddr), src1=(m0Offset - offsetK)))
+        # LWBA{tc} is the running write pointer (for NumLdsBlk>=3 it already includes the LDS buffer offset).
+        module.add(SAddU32(dst=mgpr(0), src0=sgpr(WriteBaseAddr), src1=(m0Offset - offsetK)))
         mubuf = MUBUFModifiers(offen=True, offset12=offsetK, glc=isGlc, slc=isSlc, nt=isNT, lds=True)
 
         use_sgpr = rl.is_sgpr if len(rl) > 0 else True
@@ -491,22 +485,29 @@ def _emitGRLDSSwap_TLU0(tag, tile, ti, writer, kernel):
   """Toggle GR DTL write target between LDS buffers.
 
   For NumLdsBlk == 2: XOR LocalWriteBaseAddr with Swap to flip between halves.
-  For NumLdsBlk >= 3: increment LDSBufferWriteInc by LdsOneBlockSize and wrap
-    at LdsBlockEndSize. LDSBufferWriteInc is shared between A and B (interleaved
-    in one LDS buffer) so emit only for tc == "A".
+  For NumLdsBlk >= 3: LWBA{tc} is the running write pointer. Each tensor's
+    swap is independent — A's and B's swap calls are interleaved with each
+    other's GR loads, so we must advance + wrap per tensor at each tc's call
+    (not bundle them). The wrap test uses immediate LdsBlockEndSize: each
+    Orig{tc} < LdsOneBlockSize ⇒ LWBA{tc} < LdsBlockEndSize until the iter
+    that pushes it past, so a per-tensor s_cmp_ge against the kernel-constant
+    is exact. Swap{tc} holds Orig{tc} (the wrap reset target).
   """
   module = Module()
   tc = ti.tc
   module.addComment0("Emit code to swap %s GR m0 offsets"%tc)
   if kernel.get("NumLdsBlk", 0) >= 3:
-    if tc == "A":
-      module.add(SAddU32(dst=sgpr("LDSBufferWriteInc"),
-                 src0="LdsOneBlockSize", src1=sgpr("LDSBufferWriteInc"),
-                 comment="add LDS block size to incSgpr"))
-      module.add(SCmpEQU32(src0=sgpr("LDSBufferWriteInc"), src1="LdsBlockEndSize",
-                 comment="LDSBufferWriteInc == End ?"))
-      module.add(SCMovB32(dst=sgpr("LDSBufferWriteInc"), src=0,
-                 comment="LDSBufferWriteInc loop back to 0"))
+    # SCC-atomic block: cmp + cmov must stay adjacent (no other s_cmp between)
+    # so the scheduler can't interleave the LR swap's s_cmp and clobber SCC.
+    atomic = Module(f"GRSwapSccAtomic_{tc}")
+    atomic.add(SAddU32(dst=sgpr(f"LocalWriteBaseAddr{tc}"),
+               src0="LdsOneBlockSize", src1=sgpr(f"LocalWriteBaseAddr{tc}"),
+               comment=f"LWBA_{tc} += LdsOneBlockSize"))
+    atomic.add(SCmpGeU32(src0=sgpr(f"LocalWriteBaseAddr{tc}"), src1="LdsBlockEndSize",
+               comment=f"LWBA_{tc} >= LdsBlockEndSize ?"))
+    atomic.add(SCMovB32(dst=sgpr(f"LocalWriteBaseAddr{tc}"), src=sgpr(f"Swap{tc}"),
+               comment=f"wrap: LWBA_{tc} <- Orig{tc}"))
+    module.add(atomic)
   else:
     module.add(SXorB32(dst=sgpr(f"LocalWriteBaseAddr{tc}"),
                src0=sgpr(f"LocalWriteBaseAddr{tc}"), src1=sgpr(f"Swap{tc}"),
@@ -859,16 +860,10 @@ def emitSingleBufferLoad(tileInfo, kernel, sId0, sId1):
 
   subtileOffset = int(math.ceil(tileInfo.loadRatioGR*tileInfo.subtileSize))
   WriteBaseAddr = "LocalWriteBaseAddr%s"%tc
-  incLdsBufSwitch = kernel.get("NumLdsBlk", 0) >= 3
   for i in range(tileInfo.numGRPerSubtile):
     m0Offset = int(i * subtileOffset + (sId0 + sId1 * tileInfo.globalSubtileGrid[0]) * tileInfo.subtileSize)
-    if incLdsBufSwitch:
-      # m0 = LocalWriteBaseAddr + LDSBufferWriteInc + (m0Offset - offsetK)
-      module.add(SAddU32(dst=mgpr(0), src0=sgpr(WriteBaseAddr), src1=sgpr("LDSBufferWriteInc"),
-                 comment="m0 <- LDS write base + inc"))
-      module.add(SAddU32(dst=mgpr(0), src0=mgpr(0), src1=(m0Offset - offsetK)))
-    else:
-      module.add(SAddU32(dst=mgpr(0), src0=sgpr(WriteBaseAddr), src1=(m0Offset - offsetK)))
+    # LWBA{tc} is the running write pointer (for NumLdsBlk>=3 it already includes the LDS buffer offset).
+    module.add(SAddU32(dst=mgpr(0), src0=sgpr(WriteBaseAddr), src1=(m0Offset - offsetK)))
     mubuf = MUBUFModifiers(offen=True, offset12=offsetK, glc=isGlc, slc=isSlc, nt=isNT, lds=True)
 
     soffset = regList.ref(0) if len(regList) > 0 and useSgpr else 0
@@ -925,8 +920,10 @@ def _globalReadDTLInitCommonSgpr_legacy(writer, kernel):
   module.add(VReadfirstlaneB32(dst=sgpr("LocalWriteBaseAddrB"), src=vgpr(rowOffsetB), comment="Store base LDS offset, will be modified"))
   module.add(SAddU32(dst=sgpr("LocalWriteBaseAddrB"), src0=sgpr("LocalWriteBaseAddrB"), src1=hex(writer.ldsStartOffsetB), comment=""))
   if kernel.get("NumLdsBlk", 0) >= 3:
-    # PGR>=3: SwapA/SwapB XOR masks are unused; LDSBufferWriteInc carries the buffer offset.
-    module.add(SMovB32(dst=sgpr("LDSBufferWriteInc"), src=0, comment="init LWAddr inc Sgpr"))
+    # PGR>=3: per-tensor LWBA is the running pointer (advances by LdsOneBlockSize, wraps at LdsBlockEndSize).
+    # Repurpose Swap{tc} as the Orig{tc} backup used by the wrap cmov.
+    module.add(SMovB32(dst=sgpr("SwapA"), src=sgpr("LocalWriteBaseAddrA"), comment="OrigA = LWBA_A (wrap target)"))
+    module.add(SMovB32(dst=sgpr("SwapB"), src=sgpr("LocalWriteBaseAddrB"), comment="OrigB = LWBA_B (wrap target)"))
   else:
     module.add(SAddU32(dst=sgpr("SwapA"), src0=sgpr("LocalWriteBaseAddrA"), src1=writer.ldsTotalSize, comment=""))
     module.add(SXorB32(dst=sgpr("SwapA"), src0=sgpr("LocalWriteBaseAddrA"), src1=sgpr("SwapA"), comment=""))
