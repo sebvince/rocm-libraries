@@ -19,7 +19,7 @@ from rocisa.container import DSModifiers, EXEC, vgpr, sgpr
 from rocisa.enum import RegisterType
 from rocisa.instruction import (
     DSLoadB128,
-    SMovB32, SMovB64,
+    SAddU32, SCmpEQU32, SCMovB32, SMovB32, SMovB64,
     VAddU32, VAndB32, VMovB32, VXorB32,
     VLShiftLeftB32, VLShiftRightB32,
     VMulLOU32, VPermlane16SwapB32,
@@ -372,16 +372,36 @@ def _emitLRDTLInit_1x2(tag, tile, ti, writer, kernel):
 
 @_emitLRLDSBufferSwap.register(LRTag_1x2)
 def _emitLRLDSSwap_1x2(tag, tile, ti, writer, kernel):
-  """Toggle LR read offsets between double-buffer halves.
+  """Toggle LR read offsets between LDS buffers.
 
-  XOR each sharedVgprLROffset with its swap mask to flip to the other buffer.
+  For NumLdsBlk == 2: XOR each sharedVgprLROffset with its swap mask.
+  For NumLdsBlk >= 3: bump shared LDSBufferReadInc by LdsOneBlockSize (wrap at
+    LdsBlockEndSize), then recompute sharedVgprLROffset[i] = Orig[i] + Inc.
+    The "Orig" backup lives in sharedVgprLROffsetSwap[i] (set at init time).
+    The SGPR bump is shared between A and B; emit only for tc == "A".
   """
   module = Module()
-  module.addComment0("Emit code to swap %s LR vgpr offsets"%ti.tc)
-  for i in range(len(tile.sharedVgprLROffset)):
-    vOff  = tile.sharedVgprLROffset[i]
-    vSwap = tile.sharedVgprLROffsetSwap[i]
-    module.add(VXorB32(dst=vgpr(vOff), src0=vgpr(vOff), src1=vgpr(vSwap), comment=""))
+  tc = ti.tc
+  module.addComment0("Emit code to swap %s LR vgpr offsets"%tc)
+  if kernel.get("NumLdsBlk", 0) >= 3:
+    if tc == "A":
+      module.add(SAddU32(dst=sgpr("LDSBufferReadInc"),
+                 src0="LdsOneBlockSize", src1=sgpr("LDSBufferReadInc"),
+                 comment="add LDS block size to incSgpr"))
+      module.add(SCmpEQU32(src0=sgpr("LDSBufferReadInc"), src1="LdsBlockEndSize",
+                 comment="LDSBufferReadInc == End ?"))
+      module.add(SCMovB32(dst=sgpr("LDSBufferReadInc"), src=0,
+                 comment="LDSBufferReadInc loop back to 0"))
+    for i in range(len(tile.sharedVgprLROffset)):
+      vOff = tile.sharedVgprLROffset[i]
+      vOrig = tile.sharedVgprLROffsetSwap[i]
+      module.add(VAddU32(dst=vgpr(vOff), src0=sgpr("LDSBufferReadInc"), src1=vgpr(vOrig),
+                 comment=f"{tc}: LR addr = Orig + Inc"))
+  else:
+    for i in range(len(tile.sharedVgprLROffset)):
+      vOff  = tile.sharedVgprLROffset[i]
+      vSwap = tile.sharedVgprLROffsetSwap[i]
+      module.add(VXorB32(dst=vgpr(vOff), src0=vgpr(vOff), src1=vgpr(vSwap), comment=""))
   return module
 
 
@@ -568,6 +588,20 @@ def localReadDTLInitCommonSwapVgpr(writer, kernel):
 
   atile = writer.states.a.tileInfo
   btile = writer.states.b.tileInfo
+
+  if kernel.get("NumLdsBlk", 0) >= 3:
+    # PGR>=3: sharedVgprLROffsetSwap[] becomes the "Orig" backup. Each lr_inc
+    # recomputes sharedVgprLROffset[i] = Orig[i] + LDSBufferReadInc.
+    module.add(SMovB32(dst=sgpr("LDSBufferReadInc"), src=0, comment="init LRAddr inc Sgpr"))
+    for i in range(len(atile.sharedVgprLROffset)):
+      module.add(VMovB32(dst=vgpr(atile.sharedVgprLROffsetSwap[i]),
+                 src=vgpr(atile.sharedVgprLROffset[i]),
+                 comment="A: save LR offset as orig backup"))
+    for i in range(len(btile.sharedVgprLROffset)):
+      module.add(VMovB32(dst=vgpr(btile.sharedVgprLROffsetSwap[i]),
+                 src=vgpr(btile.sharedVgprLROffset[i]),
+                 comment="B: save LR offset as orig backup"))
+    return module
 
   stmp = writer.sgprPool.checkOut(1)
   module.add(SMovB32(dst=sgpr(stmp), src=writer.ldsTotalSize, comment="Store Total Lds Size for one buffer"))

@@ -2145,6 +2145,8 @@ if __name__ == "__main__":
 
     kernel = create_kernel(args.mt0, args.mt1, fp4=fp4, depthU=args.du,
                            miWaveGroup=list(waveGroup))
+    # Mirror Solution.py:4031-4033 — NumLdsBlk = PGR for PGR>=3 (no DtlPlusLdsBuf in standalone).
+    kernel["NumLdsBlk"] = args.pgr if args.pgr >= 3 else (2 if args.pgr >= 1 else 1)
     tiA = makeTileInfo('A', kernel)
     tiB = makeTileInfo('B', kernel)
     scaleTiA = makeTileInfo('MXSA', kernel) if fp4 else None
