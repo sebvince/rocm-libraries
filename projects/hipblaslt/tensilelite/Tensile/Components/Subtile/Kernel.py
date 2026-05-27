@@ -1263,7 +1263,6 @@ def mainLoop(writer, kernel, tensorParametersA, tensorParametersB):
     # (no-op outside UseSubtileImpl bf16 A/B).
     module.add(writer.computeTailLoopSrdLimit(kernel, tensorParametersA))
     module.add(writer.computeTailLoopSrdLimit(kernel, tensorParametersB))
-    module.add(Label("seb", ""))
     module.add(scheduler.emitTailLoop(writer, kernel))
     module.add(writer.closeLoop(
         kernel, tensorParametersA, tensorParametersB,
