@@ -833,12 +833,49 @@ class LogicalScheduler:
         group_to_pos = {t: {} for t in self.tensors}
         max_groups = {t: 0 for t in self.tensors}
 
+        # Single-buf ring metadata: only the partition the MFMA is reading and the
+        # partition the LR is writing are live at any one slot, so 2 ring slots
+        # suffice. Ring index for a group g at unrolled linear position
+        # linear=u*numP+pi is ring=linear%RING. Per-partition local positions
+        # avoid same-ring-slot collisions. Memorize owner_pi/local_pos per group
+        # and reconstruct the final tile id at MFMA/LR time.
+        # Falls back to global positions when RING*max_per_part >= sum_per_part
+        # (uneven partitions with few partitions: sum < ring*max).
+        RING = 2
+        single_buf_ring = set()
+        single_buf_owner_pi = {t: {} for t in self.tensors}
+        single_buf_local_pos = {t: {} for t in self.tensors}
+        single_buf_per_part = {t: 0 for t in self.tensors}
+
         # Single-buf tensors must use global positions so partition-disjoint
         # tiles never alias to the same physical vgpr within the lone set.
         for tensor in self.tensors:
             side = TENSOR_SIDE[tensor]
             gran = lr_grans[tensor]
-            tensor_global = use_global_pos or (tensor in single_buf_tensors)
+            if tensor in single_buf_tensors:
+                per_part_counts = []
+                for pi in range(numP):
+                    start, end = part_ranges[pi][side]
+                    groups = sorted(set(
+                        (t // gran.mn) * gran.mn for t in range(start, end)))
+                    per_part_counts.append(len(groups))
+                per_part_max = max(per_part_counts) if per_part_counts else 0
+                sum_groups = sum(per_part_counts)
+                use_ring = RING * per_part_max < sum_groups
+                if use_ring:
+                    single_buf_ring.add(tensor)
+                    for pi in range(numP):
+                        start, end = part_ranges[pi][side]
+                        groups = sorted(set(
+                            (t // gran.mn) * gran.mn for t in range(start, end)))
+                        for local, g in enumerate(groups):
+                            single_buf_owner_pi[tensor][g] = pi
+                            single_buf_local_pos[tensor][g] = local
+                    single_buf_per_part[tensor] = per_part_max
+                    max_groups[tensor] = RING * per_part_max
+                    continue
+                # Fall through to global-position path below.
+            tensor_global = use_global_pos
             for pi in range(numP):
                 start, end = part_ranges[pi][side]
                 groups = sorted(set(
@@ -883,7 +920,9 @@ class LogicalScheduler:
                         for tensor in self.tensors:
                             gran = lr_grans[tensor]
                             nkg = num_k_groups[tensor]
-                            if pgr0 or tensor in single_buf_tensors:
+                            is_single_buf = tensor in single_buf_tensors
+                            is_ring = tensor in single_buf_ring
+                            if pgr0 or is_single_buf:
                                 set_idx = 0
                             else:
                                 set_idx = (unroll_iter * nkg + k // gran.k) % 2
@@ -893,9 +932,16 @@ class LogicalScheduler:
                             tile_map = {}
                             for t in tileRange.tileId_list:
                                 group = (t // gran.mn) * gran.mn
-                                pos = group_to_pos[tensor][group]
-                                tile_map[group] = (set_idx * max_groups[tensor]
-                                                   + pos)
+                                if is_ring:
+                                    owner_pi = single_buf_owner_pi[tensor][group]
+                                    ring = (unroll_iter * numP + owner_pi) % RING
+                                    local = single_buf_local_pos[tensor][group]
+                                    tile_map[group] = (ring * single_buf_per_part[tensor]
+                                                       + local)
+                                else:
+                                    pos = group_to_pos[tensor][group]
+                                    tile_map[group] = (set_idx * max_groups[tensor]
+                                                       + pos)
                             slot.mfma.vgpr_tile_maps.setdefault(
                                 tensor, []).append(tile_map)
 
@@ -905,7 +951,9 @@ class LogicalScheduler:
                         nkg = num_k_groups[tensor]
                         target_mt = unroll_iter + lr.mtIteration
                         target_k = lr.tiles.subIterK_start
-                        if pgr0 or tensor in single_buf_tensors:
+                        is_single_buf = tensor in single_buf_tensors
+                        is_ring = tensor in single_buf_ring
+                        if pgr0 or is_single_buf:
                             set_idx = 0
                         else:
                             set_idx = (target_mt * nkg + target_k // gran.k) % 2
@@ -915,9 +963,16 @@ class LogicalScheduler:
                             group = (t // gran.mn) * gran.mn
                             if group in tile_map:
                                 continue
-                            pos = group_to_pos[tensor][group]
-                            tile_map[group] = (set_idx * max_groups[tensor]
-                                               + pos)
+                            if is_ring:
+                                owner_pi = single_buf_owner_pi[tensor][group]
+                                ring = (target_mt * numP + owner_pi) % RING
+                                local = single_buf_local_pos[tensor][group]
+                                tile_map[group] = (ring * single_buf_per_part[tensor]
+                                                   + local)
+                            else:
+                                pos = group_to_pos[tensor][group]
+                                tile_map[group] = (set_idx * max_groups[tensor]
+                                                   + pos)
                         lr.vgpr_tile_map.append(tile_map)
 
         # ── Record results ──

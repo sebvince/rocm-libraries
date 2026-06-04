@@ -28,6 +28,7 @@ from test_SubtileBasedSchedulerRef import (
     make_128x128_fp4_pgr1,
     make_256x256_fp8_partition_4x8,
     make_288x256_fp8_partition_5x8,
+    make_320x256_fp8_partition_2x8,
 )
 from Tensile.Components.Subtile.LogicalScheduler import LogicalScheduler
 
@@ -395,6 +396,64 @@ def test_vgpr_288x256_fp8_partition_5x8():
     _check(make_288x256_fp8_partition_5x8,
            EXPECTED_VGPR_288X256_FP8_PARTITION_5X8,
            expected_peaks={'A': 9, 'B': 16})
+
+
+EXPECTED_VGPR_320X256_FP8_PARTITION_2X8 = """\
+needsUnrolling: True, unrollFactor: 2
+vgprTiles: A: 4, B: 16
+MAINLOOP (unroll 0):
+  Partition 0:
+    subIterK=0:
+      MFMAs (MT n, subIterK 0  ) A : [0-1] , B : [0-7] A:{0: 0, 1: 1}, B:{0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7}
+      LR A  (MT n, subIterK [0]) [2-3] tiles:{2: 2, 3: 3}
+  Partition 1:
+    subIterK=0:
+      MFMAs (MT n, subIterK 0  ) A : [2-3] , B : [0-7] A:{2: 2, 3: 3}, B:{0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7}
+      LR A  (MT n, subIterK [0]) [4-5] tiles:{4: 0, 5: 1}
+  Partition 2:
+    subIterK=0:
+      MFMAs (MT n, subIterK 0  ) A : [4-5] , B : [0-7] A:{4: 0, 5: 1}, B:{0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7}
+      LR A  (MT n, subIterK [0]) [6-7] tiles:{6: 2, 7: 3}
+  Partition 3:
+    subIterK=0:
+      MFMAs (MT n, subIterK 0  ) A : [6-7] , B : [0-7] A:{6: 2, 7: 3}, B:{0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7}
+      LR A  (MT n, subIterK [0]) [8-9] tiles:{8: 0, 9: 1}
+  Partition 4:
+    subIterK=0:
+      MFMAs (MT n, subIterK 0  ) A : [8-9] , B : [0-7] A:{8: 0, 9: 1}, B:{0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7}
+      LR A  (MT n+1, subIterK [0]) [0-1] tiles:{0: 2, 1: 3}
+      LR B  (MT n+1, subIterK [0]) [0-7] tiles:{0: 8, 1: 9, 2: 10, 3: 11, 4: 12, 5: 13, 6: 14, 7: 15}
+MAINLOOP (unroll 1):
+  Partition 0:
+    subIterK=0:
+      MFMAs (MT n, subIterK 0  ) A : [0-1] , B : [0-7] A:{0: 2, 1: 3}, B:{0: 8, 1: 9, 2: 10, 3: 11, 4: 12, 5: 13, 6: 14, 7: 15}
+      LR A  (MT n, subIterK [0]) [2-3] tiles:{2: 0, 3: 1}
+  Partition 1:
+    subIterK=0:
+      MFMAs (MT n, subIterK 0  ) A : [2-3] , B : [0-7] A:{2: 0, 3: 1}, B:{0: 8, 1: 9, 2: 10, 3: 11, 4: 12, 5: 13, 6: 14, 7: 15}
+      LR A  (MT n, subIterK [0]) [4-5] tiles:{4: 2, 5: 3}
+  Partition 2:
+    subIterK=0:
+      MFMAs (MT n, subIterK 0  ) A : [4-5] , B : [0-7] A:{4: 2, 5: 3}, B:{0: 8, 1: 9, 2: 10, 3: 11, 4: 12, 5: 13, 6: 14, 7: 15}
+      LR A  (MT n, subIterK [0]) [6-7] tiles:{6: 0, 7: 1}
+  Partition 3:
+    subIterK=0:
+      MFMAs (MT n, subIterK 0  ) A : [6-7] , B : [0-7] A:{6: 0, 7: 1}, B:{0: 8, 1: 9, 2: 10, 3: 11, 4: 12, 5: 13, 6: 14, 7: 15}
+      LR A  (MT n, subIterK [0]) [8-9] tiles:{8: 2, 9: 3}
+  Partition 4:
+    subIterK=0:
+      MFMAs (MT n, subIterK 0  ) A : [8-9] , B : [0-7] A:{8: 2, 9: 3}, B:{0: 8, 1: 9, 2: 10, 3: 11, 4: 12, 5: 13, 6: 14, 7: 15}
+      LR A  (MT n+1, subIterK [0]) [0-1] tiles:{0: 0, 1: 1}
+      LR B  (MT n+1, subIterK [0]) [0-7] tiles:{0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7}
+"""
+
+
+def test_vgpr_320x256_fp8_partition_2x8():
+    """Disjoint A across 5 partitions of size 2: ring allocator (2 ring slots x 2
+    tiles per partition = 4 vgprs) beats the global per-group layout (10 vgprs)."""
+    _check(make_320x256_fp8_partition_2x8,
+           EXPECTED_VGPR_320X256_FP8_PARTITION_2X8,
+           expected_peaks={'A': 4, 'B': 16})
 
 
 @pytest.mark.parametrize(
