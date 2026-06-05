@@ -737,258 +737,135 @@ class LogicalScheduler:
     def assign_vgpr_tiles(self):
         """Assign physical vgprTileIds to all placements (A, B, SA, SB).
 
-        Deterministic double-buffer allocator.  Each tensor gets two sets
-        of vgprTiles, each of size max_groups.  The active set alternates
-        based on the K-group index and macro-tile iteration:
+        Per-tensor liveness-based linear-scan allocator. Walks the schedule
+        treating MFMAs as READs and LRs as WRITEs on (group, target_iter,
+        k_chunk) keys. A free-list with 2-stage deferred death reuses vgpr
+        ids as bindings die — the deferred stage enforces that an LR placed
+        between MFMA[i] and MFMA[i+1] cannot reuse ids MFMA[i] is reading.
 
-          set = (mt_iter * num_k_groups + k // gran.k) % 2
-
-        The position within a set depends on the number of K-chunks per tensor
-        (num_k_groups = numSubIterK // gran.k):
-
-        - Multi-K-chunk tensors (e.g. BF16, nkg≥2): per-partition positions.
-          Groups in each partition are indexed 0, 1, … locally; max_groups is
-          the largest partition group count.  Aliasing across partitions is safe
-          because the LR and MFMA in the same slot always use different set_idx.
-
-        - Single-K-chunk tensors (e.g. FP8, nkg=1) with multiple partitions:
-          global positions.  Every unique group across all partitions gets a
-          distinct position index.  This is required because every LR is a
-          "wrapping" LR (loads the next partition's tiles) and shares the same
-          set_idx as the MFMA in its slot; per-partition aliasing would map
-          the LR write onto the same VGPRs the MFMA is reading.
-
-        Unrolling (factor 2) is applied when num_k_groups is odd for any
-        tensor, because the set parity would flip across macro-tile boundaries.
-        PGR=0 suppresses unrolling and collapses to a single set.
-
-        Sets self.tile_peaks, self.needs_unrolling, self.unroll_factor.
+        Wrap LRs (mtIteration>0) prefer the id their group held one iter
+        earlier so the loop stabilizes after one revolution; if every group
+        binding repeats across iter 1 and iter 2, unroll_factor=1, else 2.
+        PGR=0 has no overlap across K-chunks — k_chunk is collapsed to 0.
         """
         self._ensure_pass(Pass.LR)
-
         cfg = self.config
-        numK = cfg.numSubIterK
-        numP = cfg.numPartitions
-
+        pgr0 = cfg.pgr == 0
         lr_grans = {'A': cfg.lrA, 'B': cfg.lrB}
         if cfg.hasScale:
             lr_grans['SA'] = cfg.lrSA
             lr_grans['SB'] = cfg.lrSB
 
-        # ── Precompute group mappings across partitions ──
-        part_ranges = [self._partition_tile_range(pi) for pi in range(numP)]
-
-        # When any tensor has exactly one K-chunk (e.g. FP8 with numSubIterK=1,
-        # gran.k=1 → nkg=1), every LR is a "wrapping" LR (is_wrap=True in
-        # _place_LRs_for_partition), so the LR in slot Pi always loads the next
-        # partition's tiles.  That LR and the MFMA in the same slot share the
-        # same set_idx, so per-partition aliasing (different partitions reusing
-        # position 0, 1, …) would map the next-partition LR data onto the same
-        # VGPR tile IDs as the current-partition MFMA data → silent corruption.
-        # Fix: use globally unique positions so the LR writes to different VGPRs.
-        #
-        # For tensors with multiple K-chunks (e.g. BF16, nkg≥2) the LR and MFMA
-        # in the same slot always differ in set_idx, so per-partition aliasing is
-        # safe and saves VGPRs — keep it for those cases.
-        # Only single-k-chunk tensors (nkg=1) can collide between an LR and the
-        # MFMA in its slot, because their set_idx is driven entirely by the
-        # macro-tile index.  A same-MT LR (mtIteration=0) shares set_idx with
-        # the slot's MFMA — global positions are required.  A wrapping LR that
-        # targets the next MT (mtIteration=1) flips set_idx → per-partition
-        # aliasing is safe.  Inspect the placed LRs to decide.
-        single_k_tensors = {
-            t for t in self.tensors if numK // lr_grans[t].k == 1}
-        has_same_mt_wrap = False
-        if single_k_tensors and numP > 1:
-            for slots in self._partitions:
-                for slot in slots:
-                    for lr in slot.lrs:
-                        if (lr.tensor in single_k_tensors
-                                and lr.mtIteration == 0):
-                            has_same_mt_wrap = True
-                            break
-                    if has_same_mt_wrap:
-                        break
-                if has_same_mt_wrap:
-                    break
-        use_global_pos = (numP > 1) and has_same_mt_wrap
-
-        # Collapse a tensor to one VGPR set when nkg=1 and its per-partition
-        # tile ranges are pairwise disjoint — free positions exist for the
-        # wrap LR to ping-pong into. Shared-range tensors need the 2nd set.
-        single_buf_tensors = set()
-        if cfg.pgr != 0 and numP > 1:
-            for tensor in self.tensors:
-                if numK // lr_grans[tensor].k != 1:
-                    continue
-                side = TENSOR_SIDE[tensor]
-                ranges = [part_ranges[pi][side] for pi in range(numP)]
-                disjoint = all(
-                    ranges[i][1] <= ranges[j][0] or ranges[j][1] <= ranges[i][0]
-                    for i in range(numP) for j in range(i + 1, numP))
-                if disjoint:
-                    single_buf_tensors.add(tensor)
-
-        # group_to_pos[tensor][group] = position (globally unique or local-within-partition)
-        group_to_pos = {t: {} for t in self.tensors}
-        max_groups = {t: 0 for t in self.tensors}
-
-        # Single-buf ring metadata: only the partition the MFMA is reading and the
-        # partition the LR is writing are live at any one slot, so 2 ring slots
-        # suffice. Ring index for a group g at unrolled linear position
-        # linear=u*numP+pi is ring=linear%RING. Per-partition local positions
-        # avoid same-ring-slot collisions. Memorize owner_pi/local_pos per group
-        # and reconstruct the final tile id at MFMA/LR time.
-        # Falls back to global positions when RING*max_per_part >= sum_per_part
-        # (uneven partitions with few partitions: sum < ring*max).
-        RING = 2
-        single_buf_ring = set()
-        single_buf_owner_pi = {t: {} for t in self.tensors}
-        single_buf_local_pos = {t: {} for t in self.tensors}
-        single_buf_per_part = {t: 0 for t in self.tensors}
-
-        # Single-buf tensors must use global positions so partition-disjoint
-        # tiles never alias to the same physical vgpr within the lone set.
+        # Phase 1: discover global unroll factor (no recording).
+        self.unroll_factor = 1
         for tensor in self.tensors:
-            side = TENSOR_SIDE[tensor]
-            gran = lr_grans[tensor]
-            if tensor in single_buf_tensors:
-                per_part_counts = []
-                for pi in range(numP):
-                    start, end = part_ranges[pi][side]
-                    groups = sorted(set(
-                        (t // gran.mn) * gran.mn for t in range(start, end)))
-                    per_part_counts.append(len(groups))
-                per_part_max = max(per_part_counts) if per_part_counts else 0
-                sum_groups = sum(per_part_counts)
-                use_ring = RING * per_part_max < sum_groups
-                if use_ring:
-                    single_buf_ring.add(tensor)
-                    for pi in range(numP):
-                        start, end = part_ranges[pi][side]
-                        groups = sorted(set(
-                            (t // gran.mn) * gran.mn for t in range(start, end)))
-                        for local, g in enumerate(groups):
-                            single_buf_owner_pi[tensor][g] = pi
-                            single_buf_local_pos[tensor][g] = local
-                    single_buf_per_part[tensor] = per_part_max
-                    max_groups[tensor] = RING * per_part_max
-                    continue
-                # Fall through to global-position path below.
-            tensor_global = use_global_pos
-            for pi in range(numP):
-                start, end = part_ranges[pi][side]
-                groups = sorted(set(
-                    (t // gran.mn) * gran.mn for t in range(start, end)))
-                if tensor_global:
-                    for g in groups:
-                        if g not in group_to_pos[tensor]:
-                            group_to_pos[tensor][g] = max_groups[tensor]
-                            max_groups[tensor] += 1
-                else:
-                    local_pos = 0
-                    for g in groups:
-                        if g not in group_to_pos[tensor]:
-                            group_to_pos[tensor][g] = local_pos
-                        local_pos += 1
-                    max_groups[tensor] = max(max_groups[tensor], local_pos)
-
-        # ── Compute per-tensor K-groups and unroll factor ──
-        num_k_groups = {}
+            _, uf = self._alloc_tensor(tensor, lr_grans[tensor], pgr0, False)
+            if uf > self.unroll_factor:
+                self.unroll_factor = uf
+        # Phase 2: record at the global unroll factor.
+        self.tile_peaks = {}
         for tensor in self.tensors:
-            num_k_groups[tensor] = numK // lr_grans[tensor].k
-
-        unroll_factor = 1
-        for tensor in self.tensors:
-            if num_k_groups[tensor] % 2 != 0:
-                unroll_factor = 2
-                break
-        # PGR=0 has no prefetch and no wrapping LRs — each K-group's data is
-        # fully consumed before the next LR overwrites it, so no double-buffering
-        # is needed.  Force a single set (set_idx=0) and one unroll body.
-        pgr0 = cfg.pgr == 0
-        if pgr0:
-            unroll_factor = 1
-
-        # ── Deterministic tile assignment ──
-        for unroll_iter in range(unroll_factor):
-            for pi, slots in enumerate(self._partitions):
-                for slot in slots:
-                    k = slot.subIterK
-
-                    if slot.mfma:
-                        for tensor in self.tensors:
-                            gran = lr_grans[tensor]
-                            nkg = num_k_groups[tensor]
-                            is_single_buf = tensor in single_buf_tensors
-                            is_ring = tensor in single_buf_ring
-                            if pgr0 or is_single_buf:
-                                set_idx = 0
-                            else:
-                                set_idx = (unroll_iter * nkg + k // gran.k) % 2
-                            side = TENSOR_SIDE[tensor]
-                            tileRange = (slot.mfma.tileA if side == 'A'
-                                         else slot.mfma.tileB)
-                            tile_map = {}
-                            for t in tileRange.tileId_list:
-                                group = (t // gran.mn) * gran.mn
-                                if is_ring:
-                                    owner_pi = single_buf_owner_pi[tensor][group]
-                                    ring = (unroll_iter * numP + owner_pi) % RING
-                                    local = single_buf_local_pos[tensor][group]
-                                    tile_map[group] = (ring * single_buf_per_part[tensor]
-                                                       + local)
-                                else:
-                                    pos = group_to_pos[tensor][group]
-                                    tile_map[group] = (set_idx * max_groups[tensor]
-                                                       + pos)
-                            slot.mfma.vgpr_tile_maps.setdefault(
-                                tensor, []).append(tile_map)
-
-                    for lr in slot.lrs:
-                        tensor = lr.tensor
-                        gran = lr_grans[tensor]
-                        nkg = num_k_groups[tensor]
-                        target_mt = unroll_iter + lr.mtIteration
-                        target_k = lr.tiles.subIterK_start
-                        is_single_buf = tensor in single_buf_tensors
-                        is_ring = tensor in single_buf_ring
-                        if pgr0 or is_single_buf:
-                            set_idx = 0
-                        else:
-                            set_idx = (target_mt * nkg + target_k // gran.k) % 2
-
-                        tile_map = {}
-                        for t in lr.tiles.tileId_list:
-                            group = (t // gran.mn) * gran.mn
-                            if group in tile_map:
-                                continue
-                            if is_ring:
-                                owner_pi = single_buf_owner_pi[tensor][group]
-                                ring = (target_mt * numP + owner_pi) % RING
-                                local = single_buf_local_pos[tensor][group]
-                                tile_map[group] = (ring * single_buf_per_part[tensor]
-                                                   + local)
-                            else:
-                                pos = group_to_pos[tensor][group]
-                                tile_map[group] = (set_idx * max_groups[tensor]
-                                                   + pos)
-                        lr.vgpr_tile_map.append(tile_map)
-
-        # ── Record results ──
-        # PGR=0: no prefetch — each K-group's LR data is consumed before the
-        #        next LR overwrites it, so only 1 VGPR tile set is needed.
-        # PGR≥1: next-iteration LRs are issued while current MFMAs run, so two
-        #        iterations' tile data coexist in VGPRs → 2 VGPR tile sets needed.
-        def _num_sets_for(t):
-            if pgr0 or t in single_buf_tensors:
-                return 1
-            return 2
-        self.tile_peaks = {t: _num_sets_for(t) * max_groups[t] for t in self.tensors}
-        self.unroll_factor = unroll_factor
-        self.needs_unrolling = unroll_factor > 1
-
+            peak, _ = self._alloc_tensor(tensor, lr_grans[tensor], pgr0,
+                                          True, self.unroll_factor)
+            self.tile_peaks[tensor] = peak
+        self.needs_unrolling = self.unroll_factor > 1
         self._completed.add(Pass.VGPR_TILES)
+
+    def _alloc_tensor(self, tensor, gran, pgr0, record, force_iters=None):
+        """Allocate vgpr ids for one tensor; returns (peak, unroll_factor)."""
+        side = TENSOR_SIDE[tensor]
+
+        def _groups(tr):
+            out, seen = [], set()
+            for t in tr.tileId_list:
+                g = (t // gran.mn) * gran.mn
+                if g not in seen:
+                    seen.add(g); out.append(g)
+            return out
+
+        def _events(num_iters):
+            """[(kind, ref, [(group, iter, kc), ...]), ...] in schedule order.
+            pgr=0 has no K-chunk overlap, so kc collapses to 0."""
+            ev = []
+            for ui in range(num_iters):
+                for slots in self._partitions:
+                    for slot in slots:
+                        if slot.mfma is not None:
+                            tr = slot.mfma.tileA if side == 'A' else slot.mfma.tileB
+                            kc = 0 if pgr0 else tr.subIterK_start // gran.k
+                            ev.append(('mfma', slot.mfma,
+                                       [(g, ui, kc) for g in _groups(tr)]))
+                        for lr in slot.lrs:
+                            if lr.tensor != tensor:
+                                continue
+                            kc = 0 if pgr0 else lr.tiles.subIterK_start // gran.k
+                            ev.append(('lr', lr,
+                                       [(g, ui + lr.mtIteration, kc)
+                                        for g in _groups(lr.tiles)]))
+            return ev
+
+        def _walk(num_iters, record):
+            events = _events(num_iters)
+            last_read = {k: i for i, (kind, _, ks) in enumerate(events)
+                         if kind == 'mfma' for k in ks}
+            live, free, prev_pend, next_pend = {}, [], [], []
+            past, peak = {}, 0
+
+            def alloc(prefer=None):
+                nonlocal peak
+                # When honoring a preference, also accept next_pend: that pool
+                # holds vgprs freed by the most recent MFMA, and no intervening
+                # LR has written to them yet. Allowing the preferred id from
+                # next_pend lets a wrap LR (target_iter=1) write to the very
+                # vgpr the next iter's MFMA[sIK=0] expects to read — preserving
+                # the cross-iteration invariant when the preferred id is still
+                # in next_pend at the wrap point.
+                for pool in ((free, prev_pend, next_pend)
+                             if prefer is not None else ()):
+                    if prefer in pool:
+                        pool.remove(prefer); return prefer
+                if free: return free.pop(0)
+                if prev_pend: return prev_pend.pop(0)
+                peak += 1; return peak - 1
+
+            for idx, (kind, ref, keys) in enumerate(events):
+                if kind == 'mfma':
+                    free.extend(prev_pend); prev_pend = next_pend; next_pend = []
+                    tm = {}
+                    for k in keys:
+                        if k not in live:
+                            live[k] = alloc(past.get(k)); past[k] = live[k]
+                        tm[k[0]] = live[k]
+                    if record:
+                        ref.vgpr_tile_maps.setdefault(tensor, []).append(tm)
+                    for k in keys:
+                        if last_read.get(k) == idx:
+                            # pgr=0: no LR/MFMA overlap, free immediately.
+                            (free if pgr0 else next_pend).append(live.pop(k))
+                else:  # lr
+                    tm = {}
+                    for k in keys:
+                        if k in live:
+                            tm[k[0]] = live[k]; continue
+                        g, t, kc = k
+                        live[k] = alloc(past.get((g, t - 1, kc)))
+                        past[k] = live[k]
+                        tm[k[0]] = live[k]
+                    if record:
+                        ref.vgpr_tile_map.append(tm)
+            return peak, past
+
+        # Stability: walk 3 iters; uf=1 iff iter-1 binding == iter-2 binding
+        # for every (g, kc) appearing in both. PGR=0 has no wrap LRs and is
+        # trivially stable.
+        _, past3 = _walk(3, record=False)
+        need_unroll = not pgr0 and any(
+            (g, 2, kc) in past3 and past3[(g, 2, kc)] != nid
+            for (g, t, kc), nid in past3.items() if t == 1)
+
+        iters = force_iters if force_iters is not None else (2 if need_unroll else 1)
+        peak, _ = _walk(iters, record=record)
+        return peak, (2 if need_unroll else 1)
 
     # ── Place GRs ─────────────────────────────────────────
 
