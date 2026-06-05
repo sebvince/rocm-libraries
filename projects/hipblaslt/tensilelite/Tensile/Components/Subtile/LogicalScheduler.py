@@ -1627,6 +1627,15 @@ class LogicalScheduler:
         """
         self._ensure_pass(Pass.DEPS)
 
+        if self.config.splitGRByWave:
+            # gfx1250 split-by-wave: GRs of the same tensor may live on
+            # different waves (different vmcnt queues). The "earlier LR's GR
+            # wait subsumes a later LR's GR wait" reasoning relies on a single
+            # ordered vmcnt — false across waves. Skip until inter-wave sync
+            # is wired up.
+            self._completed.add(Pass.REMOVE_GR_DEPS)
+            return
+
         for tensor in self.tensors:
             _dep_exec_order = self._make_gr_dep_exec_order(tensor)
 
@@ -1851,6 +1860,14 @@ class LogicalScheduler:
         """
         self._ensure_pass(Pass.REMOVE_LR_DEPS)
 
+        if self.config.splitGRByWave:
+            # gfx1250 split-by-wave: cross-subIterK wait conversion bakes in
+            # wait_gr_sync with per-tensor inflight counts on a single vmcnt
+            # — invalid when GRs of the same tensor live on a peer wave.
+            # Defer to inter-wave sync infrastructure.
+            self._completed.add(Pass.REMOVE_DEPS)
+            return
+
         for pi, slots in enumerate(self._partitions):
             for slot in slots:
                 # ── MFMA ──
@@ -1903,13 +1920,29 @@ class LogicalScheduler:
         """
         self._ensure_pass(Pass.REMOVE_DEPS)
 
-        last_lr_mt = {}  # tensor -> mtIteration for LR only
-        last_gr_mt = {}  # tensor -> mtIteration for GR only
-        first_lr = {}  # tensor -> first LR placement seen
-        last_lr = {}  # tensor -> last LR placement seen
-        lr_inc_tensors = set()  # tensors that already received lr_inc
+        for w in range(self.config.numWaves):
+            wave_slots = self._wave_partitions[w]
+            has_mfma = any(slot.mfma is not None
+                           for slots in wave_slots for slot in slots)
+            if not has_mfma:
+                continue
+            self._insert_gr_lr_inc_for_wave(wave_slots)
 
-        for pi, slots in enumerate(self._partitions):
+        self._completed.add(Pass.GR_INC)
+
+    def _insert_gr_lr_inc_for_wave(self, partitions: List[List[SubIterKSlot]]):
+        """Run insert_gr_lr_inc on one wave's partitions.
+
+        Each wave owns its own LR/GR pointer state, so the per-tensor mt
+        tracking and final lr_inc fallback are wave-local.
+        """
+        last_lr_mt = {}
+        last_gr_mt = {}
+        first_lr = {}
+        last_lr = {}
+        lr_inc_tensors = set()
+
+        for slots in partitions:
             for slot in slots:
                 for lr in slot.lrs:
                     tensor = lr.tensor
@@ -1924,10 +1957,7 @@ class LogicalScheduler:
                 for gr in slot.grs:
                     tensor = gr.tensor
                     mt = gr.mtIteration
-                    if tensor in last_gr_mt:
-                        prev_mt = last_gr_mt[tensor]
-                    else:
-                        prev_mt = 0
+                    prev_mt = last_gr_mt.get(tensor, 0)
                     if prev_mt != mt:
                         if gr.tiles.tileId_start == 0:
                             gr.preOps.append(GRIncOp(tensor=tensor))
@@ -1935,7 +1965,7 @@ class LogicalScheduler:
 
         if self.config.pgr == 0:
             last_gr_per_tensor = {}
-            for slots in self._partitions:
+            for slots in partitions:
                 for slot in slots:
                     for gr in slot.grs:
                         last_gr_per_tensor[gr.tensor] = gr
@@ -1948,8 +1978,6 @@ class LogicalScheduler:
             for tensor, lr in first_lr.items():
                 if tensor not in lr_inc_tensors:
                     lr.preOps.append(LRIncOp(tensor=tensor))
-
-        self._completed.add(Pass.GR_INC)
 
     # ── Group LR/GR chains ─────────────────────────────────────
 
