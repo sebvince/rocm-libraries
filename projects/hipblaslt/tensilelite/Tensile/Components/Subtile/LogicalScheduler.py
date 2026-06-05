@@ -41,23 +41,25 @@ class Pass(IntEnum):
     (each pass depends on the previous), except VGPR_TILES which forks off
     LR independently of GR.
     """
-    LR                  = 0
-    VGPR_TILES          = 1
-    GR                  = 2
-    DEPS                = 3
-    REMOVE_GR_DEPS      = 4
-    REMOVE_LR_DEPS      = 5
-    REMOVE_DEPS         = 6
-    GR_INC              = 7
-    GROUP_LR_GR         = 8
-    REMOVE_WAIT_LR_SYNC = 9
-    EMIT                = 10
-    BUILD               = 11
-    POPULATE            = 12
+    MFMA                = 0
+    LR                  = 1
+    VGPR_TILES          = 2
+    GR                  = 3
+    DEPS                = 4
+    REMOVE_GR_DEPS      = 5
+    REMOVE_LR_DEPS      = 6
+    REMOVE_DEPS         = 7
+    GR_INC              = 8
+    GROUP_LR_GR         = 9
+    REMOVE_WAIT_LR_SYNC = 10
+    EMIT                = 11
+    BUILD               = 12
+    POPULATE            = 13
 
 
 _PASS_PIPELINE = {
-    Pass.LR:                   ('place_LRs',                        []),
+    Pass.MFMA:                 ('place_MFMAs',                      []),
+    Pass.LR:                   ('place_LRs',                        [Pass.MFMA]),
     Pass.VGPR_TILES:           ('assign_vgpr_tiles',                [Pass.LR]),
     Pass.GR:                   ('place_GRs',                        [Pass.LR]),
     Pass.DEPS:                 ('annotate_deps',                    [Pass.GR]),
@@ -144,6 +146,18 @@ class SchedulerConfig:
     partitionSizeM: Union[int, List[int]] = 0  # partition size(s) in M dimension (0 = full dim)
     partitionSizeN: Union[int, List[int]] = 0  # partition size(s) in N dimension (0 = full dim)
     pgr: int = 2              # Prefetch Global Read
+    # Multi-wave codepath support (gfx1250). When numWaves > 1, the MFMA pass
+    # partitions the MFMA work across N waves using a 2D layout matching the
+    # C-matrix tiling. waveGroup is (waves_M, waves_N) with waves_M*waves_N == numWaves.
+    # When numWaves == 1, the scheduler behaves as a single-codepath scheduler
+    # (legacy behavior); tile ids are local within the single wave's region.
+    numWaves: int = 1
+    waveGroup: Optional[Tuple[int, int]] = None  # (waves_M, waves_N); defaults to (numWaves, 1) when not set
+    # gfx1250-only: split global reads across waves by tensor. The first column
+    # of waves (wN_idx==0) loads A; the rest load B. With waveGroup=(2,2):
+    # waves [0,1] load A, waves [2,3] load B. GR mn granularity controls atom
+    # size; atoms round-robin across the responsible wave set.
+    splitGRByWave: bool = False
 
     # Resolve a partition spec into per-partition sizes along one dimension.
     # spec is either:
@@ -190,6 +204,12 @@ class SchedulerConfig:
 
     def __post_init__(self):
         assert self.pgr in (0, 1, 2), f"pgr must be 0, 1, or 2, got {self.pgr}"
+        assert self.numWaves >= 1, f"numWaves must be >= 1, got {self.numWaves}"
+        if self.waveGroup is None:
+            self.waveGroup = (self.numWaves, 1)
+        wM, wN = self.waveGroup
+        assert wM * wN == self.numWaves, \
+            f"waveGroup {self.waveGroup} must multiply to numWaves={self.numWaves}"
         mn_M = max((g.mn for g in (self.lrA, self.lrSA) if g is not None), default=1)
         mn_N = max((g.mn for g in (self.lrB, self.lrSB) if g is not None), default=1)
         self._partitionSizesM = self._normalize_partition_sizes(
@@ -264,10 +284,18 @@ class Emittable:
 
 @dataclass
 class MFMAPlacement(Emittable):
-    """MFMA operation consuming data for one subIterK."""
+    """MFMA operation consuming data for one subIterK.
+
+    tileA/tileB tile ids are GLOBAL when the scheduler is in multi-wave mode
+    (numWaves > 1): each wave owns a specific region of the C output matrix,
+    and the MFMA's tile ids refer to absolute MFMA-tile positions in the full
+    macrotile. In single-wave mode (numWaves == 1) tile ids are local within
+    the wave's region (legacy behavior).
+    """
     subIterK: int
     tileA: MFMATileRange       # A tiles consumed
     tileB: MFMATileRange       # B tiles consumed
+    wave: int = 0              # which wave executes this MFMA (multi-codepath)
     deps: List['Dep'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     postOps: List['BaseOp'] = field(default_factory=list)    # populated by insert_gr_lr_inc()
@@ -289,6 +317,7 @@ class LRPlacement(Emittable):
     tiles: MFMATileRange
     subIterK_slot: int         # which subIterK this LR is placed in
     partition: int = 0         # which partition this LR belongs to
+    wave: int = 0              # which wave issues this LR (multi-codepath)
     deps: List['Dep'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     postOps: List['BaseOp'] = field(default_factory=list)    # populated by insert_gr_lr_inc()
@@ -310,6 +339,7 @@ class GRPlacement(Emittable):
     tiles: MFMATileRange
     subIterK_slot: int         # which subIterK this GR is placed in
     partition: int = 0         # which partition this GR belongs to
+    wave: int = 0              # which wave issues this GR (multi-codepath)
     deps: List['Dep'] = field(default_factory=list)      # populated by annotate_deps()
     preOps: List['BaseOp'] = field(default_factory=list)     # populated by remove_cross_deps()
     postOps: List['BaseOp'] = field(default_factory=list)    # populated by insert_gr_lr_inc()
@@ -533,6 +563,65 @@ class LogicalScheduler:
             if p not in self._completed:
                 getattr(self, _PASS_PIPELINE[p][0])()
 
+    # ── Wave layout (multi-codepath) ─────────────────────
+
+    def _wave_global_offset(self, wave: int) -> Tuple[int, int]:
+        """Return (M_offset, N_offset) in global MFMA-tile units for this wave.
+
+        Waves are laid out in column-major order over the C-matrix tiling, e.g.
+        for waveGroup=(2,2):
+            WAVE0  WAVE2
+            WAVE1  WAVE3
+        wave w → (wM_idx = w % wM, wN_idx = w // wM).
+        """
+        cfg = self.config
+        wM, _ = cfg.waveGroup
+        wM_idx = wave % wM
+        wN_idx = wave // wM
+        return (wM_idx * cfg.numMFMATilesM, wN_idx * cfg.numMFMATilesN)
+
+    def _partition_tile_range_wave(self, wave: int, pi: int) -> dict:
+        """Like _partition_tile_range but shifted to wave's global region."""
+        base = self._partition_tile_range(pi)
+        offM, offN = self._wave_global_offset(wave)
+        return {'A': (base['A'][0] + offM, base['A'][1] + offM),
+                'B': (base['B'][0] + offN, base['B'][1] + offN)}
+
+    # ── Pass 0: Place MFMAs (per-wave, global tile ids) ──
+
+    def place_MFMAs(self) -> List[List[List[SubIterKSlot]]]:
+        """Place MFMAs across waves using GLOBAL tile ids.
+
+        Produces self._wave_partitions: indexed [wave][partition][slot].
+        Each wave owns a region of the C matrix determined by waveGroup; the
+        SubIterKSlot.mfma.tileA/tileB carry global tile ids (offset by wave).
+
+        For single-wave mode (numWaves==1) the offset is zero, so global ids
+        coincide with the legacy local ids — fully backward compatible.
+
+        A wave may legitimately have 0 MFMAs in future configs (e.g. an
+        unbalanced split); for now we always emit numPartitions partitions per
+        wave with the standard per-partition slot layout.
+        """
+        cfg = self.config
+        wave_partitions: List[List[List[SubIterKSlot]]] = []
+        for w in range(cfg.numWaves):
+            per_wave: List[List[SubIterKSlot]] = []
+            for pi in range(cfg.numPartitions):
+                cur = self._partition_tile_range_wave(w, pi)
+                slots = self._create_partition_slots(cur)
+                for slot in slots:
+                    if slot.mfma is not None:
+                        slot.mfma.wave = w
+                per_wave.append(slots)
+            wave_partitions.append(per_wave)
+
+        self._wave_partitions = wave_partitions
+        # Maintain legacy single-codepath view as wave-0 partitions.
+        self._partitions = wave_partitions[0]
+        self._completed.add(Pass.MFMA)
+        return wave_partitions
+
     # ── Place LRs ─────────────────────────────────────────
 
     def _partition_tile_range(self, pi: int) -> dict:
@@ -548,57 +637,61 @@ class LogicalScheduler:
                 'B': (cfg._prefixN[piN], cfg._prefixN[piN + 1])}
 
     def place_LRs(self) -> List[List[SubIterKSlot]]:
-        """Place MFMAs and LRs based on read granularities.
+        """Place LRs based on read granularities, per wave.
 
-        Returns a list of partitions, each containing a list of SubIterKSlots.
+        Operates on slots produced by place_MFMAs (each wave already has its
+        MFMAs placed with global tile ids). For each wave with at least one
+        MFMA, runs the same LR placement logic but in the wave's global tile
+        coordinate frame.
 
-        Each LR prefetches data for the next subIterK group. Within-partition
-        prefetches use current partition tiles; cross-partition prefetches
-        (wrapping) use next partition tiles.
-
-        Two tracking mechanisms:
-        - loaded_ranges: tracks tile ranges in VGPR per side. Wrapping LRs
-          are only placed when the next partition's tiles aren't already loaded.
-        - placed: tracks (tensor, k-range, tile-range) of non-wrapping LRs
-          placed so far across partitions. Skips redundant K-prefetch when
-          the same data was already loaded by an earlier partition.
+        Returns wave-0's partitions for backward compatibility (single-wave
+        callers); the full multi-wave view lives in self._wave_partitions.
         """
+        self._ensure_pass(Pass.MFMA)
         if self.config.plr == 0:
             return self._place_LRs_PLR0()
 
         cfg = self.config
         numP = cfg.numPartitions
-        part_ranges = [self._partition_tile_range(pi) for pi in range(numP)]
 
-        # Track which tile ranges are currently loaded in VGPR (for wrapping decisions).
-        loaded_ranges = {'A': {part_ranges[0]['A']},
-                         'B': {part_ranges[0]['B']}}
+        for w in range(cfg.numWaves):
+            wave_slots = self._wave_partitions[w]
+            # Skip waves with no MFMAs (future support for unbalanced splits).
+            has_mfma = any(slot.mfma is not None
+                           for slots in wave_slots for slot in slots)
+            if not has_mfma:
+                continue
 
-        # Track placed K-prefetch LRs across partitions (for dedup).
-        placed = set()
+            part_ranges = [self._partition_tile_range_wave(w, pi)
+                           for pi in range(numP)]
 
-        partitions = []
-        for pi in range(numP):
-            cur, nxt = part_ranges[pi], part_ranges[(pi + 1) % numP]
-            is_last = (pi == numP - 1)
+            loaded_ranges = {'A': {part_ranges[0]['A']},
+                             'B': {part_ranges[0]['B']}}
+            placed = set()
 
-            load = {}
-            for side in ('A', 'B'):
-                load[side] = is_last or nxt[side] not in loaded_ranges[side]
+            for pi in range(numP):
+                cur, nxt = part_ranges[pi], part_ranges[(pi + 1) % numP]
+                is_last = (pi == numP - 1)
 
-            slots = self._place_LRs_for_partition(cur, nxt, is_last, load, placed)
-            for slot in slots:
-                for lr in slot.lrs:
-                    lr.partition = pi
-            partitions.append(slots)
+                load = {}
+                for side in ('A', 'B'):
+                    load[side] = is_last or nxt[side] not in loaded_ranges[side]
 
-            for side in ('A', 'B'):
-                if load[side]:
-                    loaded_ranges[side] = {cur[side], nxt[side]}
+                self._place_LRs_for_partition_in_slots(
+                    wave_slots[pi], cur, nxt, is_last, load, placed)
+                for slot in wave_slots[pi]:
+                    for lr in slot.lrs:
+                        lr.partition = pi
+                        lr.wave = w
 
-        self._partitions = partitions
+                for side in ('A', 'B'):
+                    if load[side]:
+                        loaded_ranges[side] = {cur[side], nxt[side]}
+
+        # Legacy single-wave view = wave 0.
+        self._partitions = self._wave_partitions[0]
         self._completed.add(Pass.LR)
-        return partitions
+        return self._partitions
 
     def _create_partition_slots(self, cur: dict) -> List[SubIterKSlot]:
         """Create SubIterKSlots with MFMAs placed for one partition."""
@@ -622,34 +715,40 @@ class LogicalScheduler:
         return tensors
 
     def _place_LRs_PLR0(self) -> List[List[SubIterKSlot]]:
-        """Place MFMAs and LRs for PLR=0: no prefetching.
+        """Place LRs for PLR=0: no prefetching.
 
         Each LR loads data for its own subIterK. All LRs have mtIteration=0.
         Single partition only (enforced by config validation).
         """
         cfg = self.config
         numK = cfg.numSubIterK
-        cur = self._partition_tile_range(0)
-        slots = self._create_partition_slots(cur)
 
-        for tensor, gran in self._lr_tensors():
-            side_key = 'A' if tensor in ('A', 'SA') else 'B'
-            ts, te = cur[side_key]
-            k_gran = gran.k
-            num_chunks = numK // k_gran
-            for chunk_idx in range(num_chunks):
-                lr_k_start = chunk_idx * k_gran
-                lr_k_end = lr_k_start + k_gran
-                slot_k = lr_k_start
-                lr = LRPlacement(
-                    tensor=tensor,
-                    mtIteration=0,
-                    tiles=MFMATileRange(lr_k_start, lr_k_end, ts, te),
-                    subIterK_slot=slot_k,
-                )
-                slots[slot_k].lrs.append(lr)
+        for w in range(cfg.numWaves):
+            wave_slots = self._wave_partitions[w]
+            slots = wave_slots[0]
+            has_mfma = any(s.mfma is not None for s in slots)
+            if not has_mfma:
+                continue
+            cur = self._partition_tile_range_wave(w, 0)
+            for tensor, gran in self._lr_tensors():
+                side_key = 'A' if tensor in ('A', 'SA') else 'B'
+                ts, te = cur[side_key]
+                k_gran = gran.k
+                num_chunks = numK // k_gran
+                for chunk_idx in range(num_chunks):
+                    lr_k_start = chunk_idx * k_gran
+                    lr_k_end = lr_k_start + k_gran
+                    slot_k = lr_k_start
+                    lr = LRPlacement(
+                        tensor=tensor,
+                        mtIteration=0,
+                        tiles=MFMATileRange(lr_k_start, lr_k_end, ts, te),
+                        subIterK_slot=slot_k,
+                        wave=w,
+                    )
+                    slots[slot_k].lrs.append(lr)
 
-        self._partitions = [slots]
+        self._partitions = self._wave_partitions[0]
         self._completed.add(Pass.LR)
         return self._partitions
 
@@ -657,12 +756,26 @@ class LogicalScheduler:
                                   is_last: bool,
                                   load: dict,
                                   placed: set) -> List[SubIterKSlot]:
-        """Place MFMAs and LRs for one partition."""
+        """Place MFMAs and LRs for one partition (legacy single-wave entry)."""
+        slots = self._create_partition_slots(cur)
+        self._place_LRs_for_partition_in_slots(slots, cur, nxt, is_last, load, placed)
+        return slots
+
+    def _place_LRs_for_partition_in_slots(self, slots: List[SubIterKSlot],
+                                          cur: tuple, nxt: tuple,
+                                          is_last: bool,
+                                          load: dict,
+                                          placed: set) -> None:
+        """Place LRs into pre-built slots (multi-wave entry).
+
+        Slots already carry their MFMA placements (with global tile ids).
+        LR tile ranges are taken from `cur`/`nxt`, which are caller-supplied
+        and already reflect the wave's global region.
+        """
         cfg = self.config
         numK = cfg.numSubIterK
         multi_part = cfg.numPartitions > 1
 
-        slots = self._create_partition_slots(cur)
         slot_mt = {}  # slot_k → lr_mt string, for MT-homogeneity enforcement
 
         all_tensors = self._lr_tensors()
@@ -730,8 +843,6 @@ class LogicalScheduler:
                         slots[slot_k].lrs.append(lr)
                         slot_mt[slot_k] = lr_mt
 
-        return slots
-
     # ── Assign VGPR tile IDs (free-list allocation) ──────
 
     def assign_vgpr_tiles(self):
@@ -765,7 +876,46 @@ class LogicalScheduler:
         Sets self.tile_peaks, self.needs_unrolling, self.unroll_factor.
         """
         self._ensure_pass(Pass.LR)
+        # Per-wave VGPR tile assignment: each wave owns disjoint registers,
+        # so the allocator runs independently per wave using that wave's
+        # global tile coordinate frame. For numWaves==1 this is identical
+        # to the legacy single-wave path.
+        cfg = self.config
+        # We track the maximum tile_peaks / unroll_factor across waves so that
+        # downstream consumers (register pool sizing, NLL copy count) see the
+        # worst case.
+        per_wave_results = []
+        for w in range(cfg.numWaves):
+            wave_slots = self._wave_partitions[w]
+            has_mfma = any(slot.mfma is not None
+                           for slots in wave_slots for slot in slots)
+            if not has_mfma:
+                continue
+            part_ranges = [self._partition_tile_range_wave(w, pi)
+                           for pi in range(cfg.numPartitions)]
+            res = self._assign_vgpr_tiles_for_partitions(wave_slots, part_ranges)
+            per_wave_results.append(res)
 
+        # Aggregate (waves share the same shape today; take max for safety).
+        tile_peaks = {t: 0 for t in self.tensors}
+        unroll_factor = 1
+        for tp, uf in per_wave_results:
+            for t, v in tp.items():
+                tile_peaks[t] = max(tile_peaks[t], v)
+            unroll_factor = max(unroll_factor, uf)
+
+        self.tile_peaks = tile_peaks
+        self.unroll_factor = unroll_factor
+        self.needs_unrolling = unroll_factor > 1
+        self._completed.add(Pass.VGPR_TILES)
+
+    def _assign_vgpr_tiles_for_partitions(self, partitions, part_ranges):
+        """Run the VGPR-tile allocator on one wave's partitions.
+
+        Returns (tile_peaks_dict, unroll_factor) for this wave so the caller
+        can aggregate across waves. Mutates `partitions` in place to populate
+        vgpr_tile_maps / vgpr_tile_map on MFMAs and LRs.
+        """
         cfg = self.config
         numK = cfg.numSubIterK
         numP = cfg.numPartitions
@@ -774,9 +924,6 @@ class LogicalScheduler:
         if cfg.hasScale:
             lr_grans['SA'] = cfg.lrSA
             lr_grans['SB'] = cfg.lrSB
-
-        # ── Precompute group mappings across partitions ──
-        part_ranges = [self._partition_tile_range(pi) for pi in range(numP)]
 
         # When any tensor has exactly one K-chunk (e.g. FP8 with numSubIterK=1,
         # gran.k=1 → nkg=1), every LR is a "wrapping" LR (is_wrap=True in
@@ -851,7 +998,7 @@ class LogicalScheduler:
 
         # ── Deterministic tile assignment ──
         for unroll_iter in range(unroll_factor):
-            for pi, slots in enumerate(self._partitions):
+            for pi, slots in enumerate(partitions):
                 for slot in slots:
                     k = slot.subIterK
 
@@ -896,15 +1043,12 @@ class LogicalScheduler:
         # PGR≥1: next-iteration LRs are issued while current MFMAs run, so two
         #        iterations' tile data coexist in VGPRs → 2 VGPR tile sets needed.
         num_sets = 1 if pgr0 else 2
-        self.tile_peaks = {t: num_sets * max_groups[t] for t in self.tensors}
-        self.unroll_factor = unroll_factor
-        self.needs_unrolling = unroll_factor > 1
-
-        self._completed.add(Pass.VGPR_TILES)
+        tile_peaks = {t: num_sets * max_groups[t] for t in self.tensors}
+        return tile_peaks, unroll_factor
 
     # ── Place GRs ─────────────────────────────────────────
 
-    def _build_gr_list(self, part_ranges, offsetMT, offsetPartition):
+    def _build_gr_list(self, partitions, part_ranges, offsetMT, offsetPartition):
         """Phase 1: Build ordered GR list from placed MFMAs.
 
         For each partition × subIterK, derive target partition/MT from
@@ -924,7 +1068,7 @@ class LogicalScheduler:
         gr_list = []
 
         for pi in range(numP):
-            partition_slots = self._partitions[pi]
+            partition_slots = partitions[pi]
 
             target_pi = (pi + offsetPartition) % numP
             wraps = (pi + offsetPartition) >= numP
@@ -967,7 +1111,7 @@ class LogicalScheduler:
 
         return gr_list
 
-    def _build_gr_slot_bounds(self):
+    def _build_gr_slot_bounds(self, partitions=None):
         """Build lower and upper slot bounds for GR placement.
 
         lower: (pi, tensor) -> [(subIterK, k_start, k_end)] for LR(mt=0).
@@ -979,7 +1123,9 @@ class LogicalScheduler:
         numK = self.config.numSubIterK
         lower = {}
         upper = {}
-        for pi, partition_slots in enumerate(self._partitions):
+        if partitions is None:
+            partitions = self._partitions
+        for pi, partition_slots in enumerate(partitions):
             for slot in partition_slots:
                 flat = pi * numK + slot.subIterK
                 for lr in slot.lrs:
@@ -1009,7 +1155,7 @@ class LogicalScheduler:
                 return True
         return False
 
-    def _distribute_grs(self, gr_list, gr_slot_bounds):
+    def _distribute_grs(self, partitions, gr_list, gr_slot_bounds, wave=0):
         """Phase 2: Distribute GR atoms across partition × subIterK slots.
 
         Explodes GR entries into atomic loads, distributes them into flat
@@ -1062,7 +1208,7 @@ class LogicalScheduler:
         for flat, bucket in enumerate(buckets):
             pi = flat // numK
             si = flat % numK
-            target_slot = self._partitions[pi][si]
+            target_slot = partitions[pi][si]
             for atom in bucket:
                 tensor, mt_val, ts, te, ks, ke = atom
                 if target_slot.grs:
@@ -1078,7 +1224,8 @@ class LogicalScheduler:
                     tensor=tensor, mtIteration=mt_val,
                     tiles=MFMATileRange(ks, ke, ts, te),
                     subIterK_slot=si,
-                    partition=pi))
+                    partition=pi,
+                    wave=wave))
 
     def place_GRs(self) -> List[SubIterKSlot]:
         """Place Global Reads by iterating MFMAs across partitions.
@@ -1094,17 +1241,163 @@ class LogicalScheduler:
         """
         self._ensure_pass(Pass.LR)
 
-        part_ranges = [self._partition_tile_range(pi)
-                       for pi in range(self.config.numPartitions)]
+        cfg = self.config
+        if cfg.splitGRByWave:
+            self._place_GRs_split_by_wave()
+            self._completed.add(Pass.GR)
+            return self._partitions[0]
 
-        pgr = self.config.pgr
+        pgr = cfg.pgr
         offsetMT = 0 if pgr == 0 else 1
-        gr_list = self._build_gr_list(part_ranges, offsetMT, self.config.offsetPartition)
-        gr_slot_bounds = self._build_gr_slot_bounds()
-        self._distribute_grs(gr_list, gr_slot_bounds)
+
+        for w in range(cfg.numWaves):
+            wave_slots = self._wave_partitions[w]
+            has_mfma = any(slot.mfma is not None
+                           for slots in wave_slots for slot in slots)
+            if not has_mfma:
+                continue
+            part_ranges = [self._partition_tile_range_wave(w, pi)
+                           for pi in range(cfg.numPartitions)]
+            gr_list = self._build_gr_list(wave_slots, part_ranges,
+                                          offsetMT, cfg.offsetPartition)
+            gr_slot_bounds = self._build_gr_slot_bounds(wave_slots)
+            self._distribute_grs(wave_slots, gr_list, gr_slot_bounds, wave=w)
 
         self._completed.add(Pass.GR)
         return self._partitions[0]
+
+    # ── Place GRs: gfx1250 split-by-wave variant ──────────
+
+    def _gr_loader_waves(self) -> Tuple[List[int], List[int]]:
+        """Return (waves_loading_A, waves_loading_B).
+
+        Layout convention: A-loaders are the first column of waves (wN_idx==0);
+        B-loaders are all other waves. With waveGroup=(2,2): A→[0,1], B→[2,3].
+        """
+        cfg = self.config
+        wM, wN = cfg.waveGroup
+        a_waves, b_waves = [], []
+        for w in range(cfg.numWaves):
+            wN_idx = w // wM
+            (a_waves if wN_idx == 0 else b_waves).append(w)
+        return a_waves, b_waves
+
+    def _place_GRs_split_by_wave(self) -> None:
+        """Place GRs with per-tensor wave responsibility (gfx1250).
+
+        - A is loaded only by the A-loader wave set (first wave-column).
+        - B is loaded only by the B-loader wave set.
+        - GR atoms span the *global* tensor M (for A) or N (for B); they are
+          NOT restricted to the issuing wave's own MFMA region.
+        - Atoms round-robin across the loader set so each wave issues a roughly
+          equal share. Within a wave, atoms are distributed across that wave's
+          (partition, subIterK) slots using the same balanced distribution as
+          the legacy GR pass.
+        """
+        cfg = self.config
+        pgr = cfg.pgr
+        offsetMT = 0 if pgr == 0 else 1
+        numK = cfg.numSubIterK
+        numP = cfg.numPartitions
+
+        # Global tile spans for the full macro tile.
+        global_ranges = []
+        for pi in range(numP):
+            base = self._partition_tile_range(pi)
+            # Promote the per-partition range to global M (A) / global N (B)
+            # by taking the full numMFMATilesM / numMFMATilesN per *wave-column*
+            # / per *wave-row*. With waveGroup=(wM, wN), global tile counts are
+            # numMFMATilesM*wM (M) and numMFMATilesN*wN (N).
+            wM, wN = cfg.waveGroup
+            globM = cfg.numMFMATilesM * wM
+            globN = cfg.numMFMATilesN * wN
+            # Scale the partition slice up to the global extent.
+            scaleM = globM / cfg.numMFMATilesM
+            scaleN = globN / cfg.numMFMATilesN
+            global_ranges.append({
+                'A': (int(base['A'][0] * scaleM), int(base['A'][1] * scaleM)),
+                'B': (int(base['B'][0] * scaleN), int(base['B'][1] * scaleN)),
+            })
+
+        a_waves, b_waves = self._gr_loader_waves()
+
+        for tensor, loader_waves, gr_gran in (
+            ('A', a_waves, cfg.grA),
+            ('B', b_waves, cfg.grB),
+        ):
+            if not loader_waves:
+                continue
+
+            # Build the full atom list (tensor-wide), in (partition, k) order.
+            atoms = []  # (mt_val, ts, te, ks, ke)
+            seen = set()
+            for pi in range(numP):
+                target_pi = (pi + cfg.offsetPartition) % numP
+                wraps = (pi + cfg.offsetPartition) >= numP
+                mt_val = offsetMT + (1 if wraps else 0)
+                t_start, t_end = global_ranges[target_pi][tensor]
+                for k in range(numK):
+                    tr = gr_gran.tile_range(k, t_start, t_end)
+                    key = (mt_val, tr.tileId_start, tr.tileId_end,
+                           tr.subIterK_start, tr.subIterK_end)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    mn = gr_gran.mn
+                    for pos in range(tr.tileId_start, tr.tileId_end, mn):
+                        atoms.append((mt_val, pos, pos + mn,
+                                      tr.subIterK_start, tr.subIterK_end))
+
+            # Cross-MT dedup: drop base-mt entries whose tile/k range also
+            # appears at a later mt — the later load makes the earlier one
+            # redundant.
+            n2_keys = {(ts, te, ks, ke)
+                       for mt, ts, te, ks, ke in atoms if mt != offsetMT}
+            atoms = [a for a in atoms
+                     if a[0] != offsetMT or
+                     (a[1], a[2], a[3], a[4]) not in n2_keys]
+
+            # Round-robin atoms across the loader waves.
+            for idx, atom in enumerate(atoms):
+                w = loader_waves[idx % len(loader_waves)]
+                self._append_gr_atom_to_wave(w, tensor, atom)
+
+    def _append_gr_atom_to_wave(self, wave: int, tensor: str, atom: tuple) -> None:
+        """Place one GR atom into a wave's least-loaded (partition, subIterK) slot.
+
+        Simple balancing: count existing GRs per slot in the wave, pick the
+        earliest slot with the minimum count. Merges with the previous GR in
+        that slot if contiguous (same tensor / mt / k-range, adjacent tile ids).
+        """
+        cfg = self.config
+        mt_val, ts, te, ks, ke = atom
+        wave_slots = self._wave_partitions[wave]
+
+        # Pick the slot with the fewest GRs so far (tiebreak: earliest).
+        best = None  # (count, pi, si)
+        for pi, slots in enumerate(wave_slots):
+            for slot in slots:
+                cnt = len(slot.grs)
+                if best is None or cnt < best[0]:
+                    best = (cnt, pi, slot.subIterK)
+        pi, si = best[1], best[2]
+        target = wave_slots[pi][si]
+
+        if target.grs:
+            prev = target.grs[-1]
+            if (prev.tensor == tensor and prev.mtIteration == mt_val and
+                    prev.tiles.subIterK_start == ks and
+                    prev.tiles.subIterK_end == ke and
+                    prev.tiles.tileId_end == ts):
+                prev.tiles = MFMATileRange(ks, ke, prev.tiles.tileId_start, te)
+                return
+
+        target.grs.append(GRPlacement(
+            tensor=tensor, mtIteration=mt_val,
+            tiles=MFMATileRange(ks, ke, ts, te),
+            subIterK_slot=si,
+            partition=pi,
+            wave=wave))
 
     # ── Annotate dependencies ─────────────────────────────
 
