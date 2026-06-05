@@ -1422,25 +1422,38 @@ class LogicalScheduler:
         cfg = self.config
         numK = cfg.numSubIterK
 
-        # Build global lr_by_data across all partitions (MFMA deps are cross-partition)
-        # lr_by_data[data_k][tensor] → list of LRPlacements loading subIterK=data_k
-        lr_by_data = [{} for _ in range(numK)]
-        # gr_by_tensor[tensor] → list of all GRPlacements (LR→GR deps are cross-partition)
-        gr_by_tensor = {}
-        # lr_by_tensor[tensor] → list of all LRPlacements (GR→LR collision is cross-partition)
-        lr_by_tensor = {}
-        for slots in self._partitions:
-            for slot in slots:
-                for lr in slot.lrs:
-                    for data_k in lr.tiles.subIterK_list:
-                        lr_by_data[data_k].setdefault(lr.tensor, []).append(lr)
-                    lr_by_tensor.setdefault(lr.tensor, []).append(lr)
-                for gr in slot.grs:
-                    gr_by_tensor.setdefault(gr.tensor, []).append(gr)
+        # Per-wave dep annotation:
+        # - MFMA→LR uses the wave's own LRs only (each wave has its own LR set).
+        # - LR→GR (data must be in LDS) is cross-wave: with splitGRByWave,
+        #   the GR that loaded a tile may live on a different wave.
+        # - GR→LR (LDS double-buffer collision) is cross-wave for the same
+        #   reason. We match on tile overlap (global ids) so partition+wave
+        #   bookkeeping handled by _annotate_deps_partition's ordering logic.
+        gr_by_tensor_global = {}
+        lr_by_tensor_global = {}
+        for w in range(cfg.numWaves):
+            for slots in self._wave_partitions[w]:
+                for slot in slots:
+                    for lr in slot.lrs:
+                        lr_by_tensor_global.setdefault(lr.tensor, []).append(lr)
+                    for gr in slot.grs:
+                        gr_by_tensor_global.setdefault(gr.tensor, []).append(gr)
 
-        for pi, slots in enumerate(self._partitions):
-            self._annotate_deps_partition(pi, slots, cfg, lr_by_data,
-                                          gr_by_tensor, lr_by_tensor)
+        for w in range(cfg.numWaves):
+            wave_slots = self._wave_partitions[w]
+            # Wave-local LR lookups for the MFMA→LR rule.
+            lr_by_data = [{} for _ in range(numK)]
+            for slots in wave_slots:
+                for slot in slots:
+                    for lr in slot.lrs:
+                        for data_k in lr.tiles.subIterK_list:
+                            lr_by_data[data_k].setdefault(lr.tensor, []).append(lr)
+            # LR→GR / GR→LR use cross-wave lookups so split-by-wave GR deps
+            # land on the correct loader.
+            for pi, slots in enumerate(wave_slots):
+                self._annotate_deps_partition(pi, slots, cfg, lr_by_data,
+                                              gr_by_tensor_global,
+                                              lr_by_tensor_global)
 
         self._completed.add(Pass.DEPS)
 

@@ -80,7 +80,7 @@ if __name__ == "__main__":
 
     sched = LogicalScheduler(cfg)
 
-    COL_W = 38  # width of each wave column body
+    COL_W = 40  # width of each wave column body
 
     def _wave_header(w):
         wave_slots = sched._wave_partitions[w]
@@ -94,7 +94,15 @@ if __name__ == "__main__":
         b = b_ranges[0] if b_ranges else "-"
         return f"Wave {w} : A{a}  B{b}"
 
-    def _cell_lines_for_slot(wave_slots, pi, slot_idx, show_vgpr=False):
+    def _fmt_dep(dep):
+        p = dep.ref
+        kind = type(p).__name__[:-len("Placement")]  # MFMA / LR / GR
+        mt = f" MT{dep.mt_offset:+d}" if dep.mt_offset != 0 else ""
+        wave = getattr(p, 'wave', 0)
+        return f"{kind} {p.tensor} @W{wave}P{p.partition}K{p.subIterK_slot}{mt}"
+
+    def _cell_lines_for_slot(wave_slots, pi, slot_idx, show_vgpr=False,
+                              show_deps=False):
         """Return list of strings (one per visual line) for one wave's slot."""
         slot = wave_slots[pi][slot_idx]
         lines = []
@@ -111,6 +119,9 @@ if __name__ == "__main__":
                     extra = " " + ", ".join(parts)
             lines.append(f"MFMA (MT n, subK[{m.subIterK}]) "
                          f"A{m.tileA.fmt_tiles()} B{m.tileB.fmt_tiles()}{extra}")
+            if show_deps:
+                for dep in m.deps:
+                    lines.append(f"   ← {_fmt_dep(dep)}")
         for lr in slot.lrs:
             mt = f"n+{lr.mtIteration}" if lr.mtIteration else "n"
             extra = ""
@@ -118,17 +129,23 @@ if __name__ == "__main__":
                 extra = f" tiles:{lr.vgpr_tile_map[0]}"
             lines.append(f"LR {lr.tensor:<2} (MT {mt}, subK{lr.tiles.fmt_k()}) "
                          f"{lr.tiles.fmt_tiles()}{extra}")
+            if show_deps:
+                for dep in lr.deps:
+                    lines.append(f"   ← {_fmt_dep(dep)}")
         for gr in slot.grs:
             mt = f"n+{gr.mtIteration}" if gr.mtIteration else "n"
             lines.append(f"GR {gr.tensor:<2} (MT {mt}, subK{gr.tiles.fmt_k()}) "
                          f"{gr.tiles.fmt_tiles()}")
+            if show_deps:
+                for dep in gr.deps:
+                    lines.append(f"   ← {_fmt_dep(dep)}")
         if not lines:
             lines.append("·")
         return lines
 
     LABEL_W = 11  # width of left label column ("subIterK=N")
 
-    def _print_waves(title, show_vgpr=False):
+    def _print_waves(title, show_vgpr=False, show_deps=False):
         sep_total = 2 + LABEL_W + 2 + (COL_W + 3) * cfg.numWaves
         print("=" * sep_total)
         print(f"  {title}")
@@ -149,7 +166,8 @@ if __name__ == "__main__":
             print(f"  ──{banner}" + "─" * max(0, pad))
             for k in range(numK):
                 per_wave = [_cell_lines_for_slot(sched._wave_partitions[w], pi, k,
-                                                 show_vgpr=show_vgpr)
+                                                 show_vgpr=show_vgpr,
+                                                 show_deps=show_deps)
                             for w in range(cfg.numWaves)]
                 max_lines = max(len(c) for c in per_wave)
                 for line_idx in range(max_lines):
@@ -194,6 +212,9 @@ if __name__ == "__main__":
                                         _print_waves_stacked("Assign VGPR tiles (per-wave)"))),
         ("Place GRs",          lambda: (sched.place_GRs(),
                                         _print_waves("Place GRs (per-wave)"))),
+        ("Annotate deps",      lambda: (sched.annotate_deps(),
+                                        _print_waves("Annotate deps (per-wave)",
+                                                     show_deps=True))),
     ]
 
     for i, (title, run) in enumerate(steps):
