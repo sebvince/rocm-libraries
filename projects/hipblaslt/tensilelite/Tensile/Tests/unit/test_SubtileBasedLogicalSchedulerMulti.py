@@ -101,8 +101,14 @@ if __name__ == "__main__":
         wave = getattr(p, 'wave', 0)
         return f"{kind} {p.tensor} @W{wave}P{p.partition}K{p.subIterK_slot}{mt}"
 
+    def _fmt_preops(placement):
+        return [f"   ↳ pre: {op}" for op in placement.preOps]
+
+    def _fmt_postops(placement):
+        return [f"   ↱ post: {op}" for op in placement.postOps]
+
     def _cell_lines_for_slot(wave_slots, pi, slot_idx, show_vgpr=False,
-                              show_deps=False):
+                              show_deps=False, show_preops=False):
         """Return list of strings (one per visual line) for one wave's slot."""
         slot = wave_slots[pi][slot_idx]
         lines = []
@@ -119,6 +125,10 @@ if __name__ == "__main__":
                     extra = " " + ", ".join(parts)
             lines.append(f"MFMA (MT n, subK[{m.subIterK}]) "
                          f"A{m.tileA.fmt_tiles()} B{m.tileB.fmt_tiles()}{extra}")
+            if show_preops:
+                lines.extend(_fmt_preops(m))
+            if show_preops:
+                lines.extend(_fmt_postops(m))
             if show_deps:
                 for dep in m.deps:
                     lines.append(f"   ← {_fmt_dep(dep)}")
@@ -129,6 +139,9 @@ if __name__ == "__main__":
                 extra = f" tiles:{lr.vgpr_tile_map[0]}"
             lines.append(f"LR {lr.tensor:<2} (MT {mt}, subK{lr.tiles.fmt_k()}) "
                          f"{lr.tiles.fmt_tiles()}{extra}")
+            if show_preops:
+                lines.extend(_fmt_preops(lr))
+                lines.extend(_fmt_postops(lr))
             if show_deps:
                 for dep in lr.deps:
                     lines.append(f"   ← {_fmt_dep(dep)}")
@@ -136,6 +149,9 @@ if __name__ == "__main__":
             mt = f"n+{gr.mtIteration}" if gr.mtIteration else "n"
             lines.append(f"GR {gr.tensor:<2} (MT {mt}, subK{gr.tiles.fmt_k()}) "
                          f"{gr.tiles.fmt_tiles()}")
+            if show_preops:
+                lines.extend(_fmt_preops(gr))
+                lines.extend(_fmt_postops(gr))
             if show_deps:
                 for dep in gr.deps:
                     lines.append(f"   ← {_fmt_dep(dep)}")
@@ -145,7 +161,7 @@ if __name__ == "__main__":
 
     LABEL_W = 11  # width of left label column ("subIterK=N")
 
-    def _print_waves(title, show_vgpr=False, show_deps=False):
+    def _print_waves(title, show_vgpr=False, show_deps=False, show_preops=False):
         sep_total = 2 + LABEL_W + 2 + (COL_W + 3) * cfg.numWaves
         print("=" * sep_total)
         print(f"  {title}")
@@ -167,7 +183,8 @@ if __name__ == "__main__":
             for k in range(numK):
                 per_wave = [_cell_lines_for_slot(sched._wave_partitions[w], pi, k,
                                                  show_vgpr=show_vgpr,
-                                                 show_deps=show_deps)
+                                                 show_deps=show_deps,
+                                                 show_preops=show_preops)
                             for w in range(cfg.numWaves)]
                 max_lines = max(len(c) for c in per_wave)
                 for line_idx in range(max_lines):
@@ -215,6 +232,13 @@ if __name__ == "__main__":
         ("Annotate deps",      lambda: (sched.annotate_deps(),
                                         _print_waves("Annotate deps (per-wave)",
                                                      show_deps=True))),
+        ("Remove cross deps",  lambda: (sched.remove_cross_deps(),
+                                        _print_waves("Remove cross deps (per-wave)",
+                                                     show_deps=True,
+                                                     show_preops=True))),
+        ("Insert gr/lr inc",   lambda: (sched.insert_gr_lr_inc(),
+                                        _print_waves("Insert gr/lr inc (per-wave)",
+                                                     show_preops=True))),
     ]
 
     for i, (title, run) in enumerate(steps):

@@ -1861,32 +1861,57 @@ class LogicalScheduler:
         self._ensure_pass(Pass.REMOVE_LR_DEPS)
 
         if self.config.splitGRByWave:
-            # gfx1250 split-by-wave: cross-subIterK wait conversion bakes in
-            # wait_gr_sync with per-tensor inflight counts on a single vmcnt
-            # — invalid when GRs of the same tensor live on a peer wave.
-            # Defer to inter-wave sync infrastructure.
+            # gfx1250 split-by-wave: wait_lr (MFMA→LR) and wait_lr_sync
+            # (GR→LR) are wave-local and stay correct. wait_gr_sync with
+            # per-tensor vmcnt counts is invalid when the GR producer is
+            # on a peer wave; we leave LR→GR deps as raw deps until the
+            # inter-wave sync mechanism is wired up.
+            for w in range(self.config.numWaves):
+                for pi, slots in enumerate(self._wave_partitions[w]):
+                    self._remove_cross_deps_for_partition(
+                        pi, slots, skip_wait_gr=True)
             self._completed.add(Pass.REMOVE_DEPS)
             return
 
         for pi, slots in enumerate(self._partitions):
-            for slot in slots:
-                # ── MFMA ──
-                if slot.mfma:
-                    same, cross = self._split_deps(slot.mfma.deps, pi, slot.subIterK)
-                    slot.mfma.deps = same
-                    slot.mfma.preOps = []
-                    has_lr_dep = any(
-                        isinstance(d.ref, LRPlacement) for d in same + cross)
-                    if has_lr_dep:
-                        slot.mfma.preOps.append(WaitLROp())
+            self._remove_cross_deps_for_partition(pi, slots, skip_wait_gr=False)
 
-                # ── LRs ──
-                for lr in slot.lrs:
-                    gr_deps = [d for d in lr.deps
-                               if isinstance(d.ref, GRPlacement)]
-                    same, cross = self._split_deps(lr.deps, pi, lr.subIterK_slot)
+        self._completed.add(Pass.REMOVE_DEPS)
+
+    def _remove_cross_deps_for_partition(self, pi: int,
+                                          slots: List[SubIterKSlot],
+                                          skip_wait_gr: bool = False):
+        """Convert cross-subIterK deps to wait preOps for one partition.
+
+        When skip_wait_gr is True (split-by-wave mode), LR→GR deps are LEFT
+        as raw deps instead of being converted to wait_gr_sync preOps, because
+        cross-wave GR producers do not share a single vmcnt with the consumer
+        wave. wait_lr / wait_lr_sync remain valid (wave-local).
+        """
+        for slot in slots:
+            # ── MFMA ──
+            if slot.mfma:
+                same, cross = self._split_deps(slot.mfma.deps, pi, slot.subIterK)
+                slot.mfma.deps = same
+                slot.mfma.preOps = []
+                has_lr_dep = any(
+                    isinstance(d.ref, LRPlacement) for d in same + cross)
+                if has_lr_dep:
+                    slot.mfma.preOps.append(WaitLROp())
+
+            # ── LRs ──
+            for lr in slot.lrs:
+                gr_deps = [d for d in lr.deps
+                           if isinstance(d.ref, GRPlacement)]
+                same, cross = self._split_deps(lr.deps, pi, lr.subIterK_slot)
+                lr.preOps = []
+                if skip_wait_gr:
+                    # Preserve LR→GR deps as raw (no wait_gr_sync). Keep
+                    # only the LR→LR same-partition deps in lr.deps.
+                    lr.deps = [d for d in lr.deps
+                               if isinstance(d.ref, GRPlacement) or d in same]
+                else:
                     lr.deps = same
-                    lr.preOps = []
                     if gr_deps:
                         dep = gr_deps[0]
                         cross_set = set(id(d) for d in cross)
@@ -1897,16 +1922,14 @@ class LogicalScheduler:
                                                   has_sync=True,
                                                   adjustVmcnt=is_cross))
 
-                # ── GRs ──
-                for gr in slot.grs:
-                    same, cross = self._split_deps(gr.deps, pi, gr.subIterK_slot)
-                    gr.deps = same
-                    has_lr_dep = any(
-                        isinstance(d.ref, LRPlacement)
-                        for d in same + cross)
-                    gr.preOps = [WaitLROp(has_sync=True)] if has_lr_dep else []
-
-        self._completed.add(Pass.REMOVE_DEPS)
+            # ── GRs ──
+            for gr in slot.grs:
+                same, cross = self._split_deps(gr.deps, pi, gr.subIterK_slot)
+                gr.deps = same
+                has_lr_dep = any(
+                    isinstance(d.ref, LRPlacement)
+                    for d in same + cross)
+                gr.preOps = [WaitLROp(has_sync=True)] if has_lr_dep else []
 
     def insert_gr_lr_inc(self):
         """Insert gr_inc/lr_inc preOps at MacroTile iteration transitions.
