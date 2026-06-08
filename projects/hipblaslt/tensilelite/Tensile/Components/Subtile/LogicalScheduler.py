@@ -392,9 +392,8 @@ class BaseOp(Emittable):
 
 @dataclass
 class WaitGROp(BaseOp):
-    """Wait for global reads to complete. Optionally includes a sync barrier."""
+    """Wait for global reads to complete. Intra-wave only."""
     wait_gr_counts: Optional[WaitGRCounts] = None
-    has_sync: bool = False
     adjustVmcnt: bool = True
 
     def __post_init__(self):
@@ -408,21 +407,22 @@ class WaitGROp(BaseOp):
 
 @dataclass
 class WaitLROp(BaseOp):
-    """Wait for local reads to complete. Optionally includes a sync barrier."""
-    has_sync: bool = False
+    """Wait for local reads to complete. Intra-wave only."""
 
     def __post_init__(self):
         self.kind = 'wait_lr'
 
-    def __str__(self):
-        return 'wait_lr_sync' if self.has_sync else 'wait_lr'
-
 
 @dataclass
 class SyncOp(BaseOp):
-    """Standalone sync barrier."""
+    """Inter-wave sync barrier. All waves carrying the same id rendezvous."""
+    id: int = 0
+
     def __post_init__(self):
         self.kind = 'sync'
+
+    def __str__(self):
+        return f"sync(id={self.id})"
 
 
 @dataclass
@@ -1773,13 +1773,19 @@ class LogicalScheduler:
         return n_tile * n_k
 
     def _compute_inflight_loads(self, consumer_pi: int, consumer_slot: int,
-                                tensor: str, dep_ref: Dep) -> WaitGRCounts:
+                                tensor: str, dep_ref: Dep,
+                                grid: Optional[List[List['SubIterKSlot']]] = None
+                                ) -> WaitGRCounts:
         """Count inflight GR atomic loads between a dep GR and the consumer.
 
-        Walks backward through the flattened schedule (all partitions x subIterK)
+        Walks backward through a flattened schedule grid (partitions x subIterK)
         from the consumer position, counting atomic GR loads for all tensors.
         Stops when reaching the dependency GR (dep_ref.ref) after accounting
         for mt_offset wraps.
+
+        When `grid` is None, uses `self._partitions` (single-wave / consumer-side
+        same-wave case). For producer-side cross-wave waits, pass the producer
+        wave's slot grid (`self._wave_partitions[producer.wave]`).
 
         Within a slot, GRs are walked in reverse _gr_sort_key order (matching
         hardware issue order: last emitted = most recent = walked first).
@@ -1788,16 +1794,18 @@ class LogicalScheduler:
 
         Returns per-tensor inflight load counts.
         """
-        numP = len(self._partitions)
-        numK = len(self._partitions[0])
+        if grid is None:
+            grid = self._partitions
+        numP = len(grid)
+        numK = len(grid[0])
         flat_len = numP * numK
 
         consumer_flat = consumer_pi * numK + consumer_slot
         wraps_needed = abs(dep_ref.mt_offset)
 
-        # Locate dep_flat: the flat position of the dependency GR in the schedule.
+        # Locate dep_flat: the flat position of the dependency GR in the grid.
         dep_flat = None
-        for p_idx, pslots in enumerate(self._partitions):
+        for p_idx, pslots in enumerate(grid):
             for k_idx, slot in enumerate(pslots):
                 if any(gr is dep_ref.ref for gr in slot.grs):
                     dep_flat = p_idx * numK + k_idx
@@ -1831,7 +1839,7 @@ class LogicalScheduler:
             pos = (pos - 1) % flat_len
             pi = pos // numK
             slot_k = pos % numK
-            slot = self._partitions[pi][slot_k]
+            slot = grid[pi][slot_k]
 
             # On the final step we are at dep's slot: stop when we reach the dep GR.
             # GRs emitted after the dep (encountered first in reverse order) are in-flight
@@ -1850,86 +1858,197 @@ class LogicalScheduler:
         return counts
 
     def remove_cross_deps(self):
-        """Replace cross-subIterK deps with wait preOps.
+        """Replace cross-subIterK deps with wait preOps; cross-wave deps with SyncOps.
 
-        For each placement, separates deps into same-subIterK (kept) and
-        cross-subIterK (converted to preOps):
-          - MFMA depending on LRs → single wait_lr
-          - GR depending on LRs   → single wait_lr_sync
-          - LR depending on GRs   → single wait_gr_sync with per-tensor inflight counts
+        Single-wave path: each cross-subIterK dep becomes a per-placement wait
+        preOp:
+          - MFMA depending on LRs → wait_lr
+          - GR depending on LRs   → wait_lr
+          - LR depending on GRs   → wait_gr with per-tensor inflight counts
+
+        Multi-wave path (splitGRByWave): pass 1 handles same-wave deps as
+        above. Pass 2 walks the remaining cross-wave deps; for each one a
+        fresh SyncOp(id=N) is placed on the consumer, and the producer wave
+        receives a matching wait_<kind> + SyncOp(id=N) — either piggybacked
+        onto an existing same-wave wait preOp or appended as postOps.
         """
         self._ensure_pass(Pass.REMOVE_LR_DEPS)
 
         if self.config.splitGRByWave:
-            # gfx1250 split-by-wave: wait_lr (MFMA→LR) and wait_lr_sync
-            # (GR→LR) are wave-local and stay correct. wait_gr_sync with
-            # per-tensor vmcnt counts is invalid when the GR producer is
-            # on a peer wave; we leave LR→GR deps as raw deps until the
-            # inter-wave sync mechanism is wired up.
-            for w in range(self.config.numWaves):
-                for pi, slots in enumerate(self._wave_partitions[w]):
-                    self._remove_cross_deps_for_partition(
-                        pi, slots, skip_wait_gr=True)
+            self._remove_cross_deps_multi_wave()
             self._completed.add(Pass.REMOVE_DEPS)
             return
 
         for pi, slots in enumerate(self._partitions):
-            self._remove_cross_deps_for_partition(pi, slots, skip_wait_gr=False)
+            self._remove_cross_deps_for_partition(pi, slots)
 
         self._completed.add(Pass.REMOVE_DEPS)
 
     def _remove_cross_deps_for_partition(self, pi: int,
-                                          slots: List[SubIterKSlot],
-                                          skip_wait_gr: bool = False):
+                                          slots: List[SubIterKSlot]):
         """Convert cross-subIterK deps to wait preOps for one partition.
 
-        When skip_wait_gr is True (split-by-wave mode), LR→GR deps are LEFT
-        as raw deps instead of being converted to wait_gr_sync preOps, because
-        cross-wave GR producers do not share a single vmcnt with the consumer
-        wave. wait_lr / wait_lr_sync remain valid (wave-local).
+        Single-wave (or per-wave, same-wave-only) lowering. Deps that resolve
+        to a producer on a different wave are left untouched here for the
+        multi-wave Pass 2 (`_place_cross_wave_syncs`) to convert into SyncOps.
         """
         for slot in slots:
             # ── MFMA ──
             if slot.mfma:
-                same, cross = self._split_deps(slot.mfma.deps, pi, slot.subIterK)
-                slot.mfma.deps = same
+                consumer_wave = getattr(slot.mfma, 'wave', 0)
+                same_wave = [d for d in slot.mfma.deps
+                             if d.ref.wave == consumer_wave]
+                cross_wave = [d for d in slot.mfma.deps
+                              if d.ref.wave != consumer_wave]
+                same, _ = self._split_deps(same_wave, pi, slot.subIterK)
+                slot.mfma.deps = same + cross_wave
                 slot.mfma.preOps = []
                 has_lr_dep = any(
-                    isinstance(d.ref, LRPlacement) for d in same + cross)
+                    isinstance(d.ref, LRPlacement) for d in same_wave)
                 if has_lr_dep:
                     slot.mfma.preOps.append(WaitLROp())
 
             # ── LRs ──
             for lr in slot.lrs:
-                gr_deps = [d for d in lr.deps
-                           if isinstance(d.ref, GRPlacement)]
-                same, cross = self._split_deps(lr.deps, pi, lr.subIterK_slot)
+                consumer_wave = getattr(lr, 'wave', 0)
+                same_wave = [d for d in lr.deps if d.ref.wave == consumer_wave]
+                cross_wave = [d for d in lr.deps if d.ref.wave != consumer_wave]
+                gr_deps_sw = [d for d in same_wave
+                              if isinstance(d.ref, GRPlacement)]
+                same, cross = self._split_deps(same_wave, pi, lr.subIterK_slot)
+                lr.deps = same + cross_wave
                 lr.preOps = []
-                if skip_wait_gr:
-                    # Preserve LR→GR deps as raw (no wait_gr_sync). Keep
-                    # only the LR→LR same-partition deps in lr.deps.
-                    lr.deps = [d for d in lr.deps
-                               if isinstance(d.ref, GRPlacement) or d in same]
-                else:
-                    lr.deps = same
-                    if gr_deps:
-                        dep = gr_deps[0]
-                        cross_set = set(id(d) for d in cross)
-                        is_cross = id(dep) in cross_set
-                        counts = self._compute_inflight_loads(
-                            pi, lr.subIterK_slot, dep.ref.tensor, dep)
-                        lr.preOps.append(WaitGROp(wait_gr_counts=counts,
-                                                  has_sync=True,
-                                                  adjustVmcnt=is_cross))
+                if gr_deps_sw:
+                    dep = gr_deps_sw[0]
+                    cross_set = set(id(d) for d in cross)
+                    is_cross = id(dep) in cross_set
+                    counts = self._compute_inflight_loads(
+                        pi, lr.subIterK_slot, dep.ref.tensor, dep)
+                    lr.preOps.append(WaitGROp(wait_gr_counts=counts,
+                                              adjustVmcnt=is_cross))
 
             # ── GRs ──
             for gr in slot.grs:
-                same, cross = self._split_deps(gr.deps, pi, gr.subIterK_slot)
-                gr.deps = same
+                consumer_wave = getattr(gr, 'wave', 0)
+                same_wave = [d for d in gr.deps if d.ref.wave == consumer_wave]
+                cross_wave = [d for d in gr.deps if d.ref.wave != consumer_wave]
+                same, _ = self._split_deps(same_wave, pi, gr.subIterK_slot)
+                gr.deps = same + cross_wave
                 has_lr_dep = any(
-                    isinstance(d.ref, LRPlacement)
-                    for d in same + cross)
-                gr.preOps = [WaitLROp(has_sync=True)] if has_lr_dep else []
+                    isinstance(d.ref, LRPlacement) for d in same_wave)
+                gr.preOps = [WaitLROp()] if has_lr_dep else []
+
+    def _remove_cross_deps_multi_wave(self):
+        """Two-pass cross-deps removal for the multi-wave codepath.
+
+        Pass 1: per wave, per partition — convert same-wave cross-subIterK
+        deps to wait preOps (plain WaitLROp / WaitGROp). Cross-wave deps stay
+        in `placement.deps` for Pass 2.
+
+        Pass 2: walk all placements; for each remaining cross-wave dep emit a
+        fresh SyncOp(id=N) preOp on the consumer and a matching wait + sync
+        on the producer wave. One id per producer (fan-out across all
+        dependent consumers).
+        """
+        # Pass 1
+        for w in range(self.config.numWaves):
+            for pi, slots in enumerate(self._wave_partitions[w]):
+                self._remove_cross_deps_for_partition(pi, slots)
+
+        # Pass 2
+        self._place_cross_wave_syncs()
+
+    def _place_cross_wave_syncs(self):
+        """Lower remaining cross-wave deps to SyncOp(id) pairs.
+
+        Allocates a fresh id per producer placement (fan-out: all consumer
+        waves of one producer share the same id). Producer side: if a
+        matching same-wave WaitLROp/WaitGROp already lives in the producer's
+        own preOps, attach SyncOp(id) right after it; otherwise append a
+        fresh wait + SyncOp(id) as postOps.
+        """
+        next_id = 0
+        producer_id: Dict[int, int] = {}  # id(producer placement) -> sync id
+        producer_handled: set = set()      # producer placements with side emitted
+
+        # Gather all placements with deps for a stable walk
+        def _walk():
+            for w in range(self.config.numWaves):
+                for pi, slots in enumerate(self._wave_partitions[w]):
+                    for slot in slots:
+                        if slot.mfma:
+                            yield slot.mfma
+                        for lr in slot.lrs:
+                            yield lr
+                        for gr in slot.grs:
+                            yield gr
+
+        for placement in _walk():
+            consumer_wave = getattr(placement, 'wave', 0)
+            cross_deps = [d for d in placement.deps
+                          if d.ref.wave != consumer_wave]
+            if not cross_deps:
+                continue
+            # Strip cross-wave deps; they become SyncOps.
+            placement.deps = [d for d in placement.deps
+                              if d.ref.wave == consumer_wave]
+
+            for dep in cross_deps:
+                prod = dep.ref
+                pkey = id(prod)
+                if pkey not in producer_id:
+                    producer_id[pkey] = next_id
+                    next_id += 1
+                sid = producer_id[pkey]
+
+                # Consumer side: SyncOp(id=sid) as preOp, placed after any
+                # same-wave wait preOp already present on this placement.
+                self._append_sync_after_wait(placement.preOps, sid)
+
+                if pkey in producer_handled:
+                    continue
+                producer_handled.add(pkey)
+
+                # Producer side. wait kind depends on producer type.
+                want_wait_lr = isinstance(prod, LRPlacement)
+                wait_cls = WaitLROp if want_wait_lr else WaitGROp
+
+                # Piggyback onto an existing matching wait in producer's preOps.
+                idx = self._find_wait_index(prod.preOps, wait_cls)
+                if idx is not None:
+                    prod.preOps.insert(idx + 1, SyncOp(id=sid))
+                    continue
+
+                # Otherwise append wait + SyncOp(id) as postOps.
+                if want_wait_lr:
+                    prod.postOps.append(WaitLROp())
+                else:
+                    # Producer-side wait_gr counts are computed against the
+                    # producer wave's own slot grid.
+                    grid = self._wave_partitions[prod.wave]
+                    fake_dep = Dep(ref=prod, mt_offset=0)
+                    counts = self._compute_inflight_loads(
+                        prod.partition, prod.subIterK_slot,
+                        prod.tensor, fake_dep, grid=grid)
+                    prod.postOps.append(
+                        WaitGROp(wait_gr_counts=counts, adjustVmcnt=True))
+                prod.postOps.append(SyncOp(id=sid))
+
+    @staticmethod
+    def _append_sync_after_wait(preOps: List['BaseOp'], sync_id: int) -> None:
+        """Insert SyncOp(id) into preOps, after the last wait_* op if any."""
+        last_wait_idx = -1
+        for i, op in enumerate(preOps):
+            if isinstance(op, (WaitGROp, WaitLROp)):
+                last_wait_idx = i
+        preOps.insert(last_wait_idx + 1, SyncOp(id=sync_id))
+
+    @staticmethod
+    def _find_wait_index(preOps: List['BaseOp'], wait_cls) -> Optional[int]:
+        for i, op in enumerate(preOps):
+            if isinstance(op, wait_cls):
+                return i
+        return None
 
     def insert_gr_lr_inc(self):
         """Insert gr_inc/lr_inc preOps at MacroTile iteration transitions.
@@ -2030,14 +2149,11 @@ class LogicalScheduler:
         (wait_lr_sync, wait_lr), and collects the rest.
         """
         wait_gr_ops_full = []
-        has_wait_gr_sync = False
         seen_wait_lr = False
         others = []
         for preops in all_preops:
             for op in preops:
                 if isinstance(op, WaitGROp) and op.wait_gr_counts:
-                    if op.has_sync:
-                        has_wait_gr_sync = True
                     wait_gr_ops_full.append(op)
                 elif isinstance(op, WaitLROp):
                     if not seen_wait_lr:
@@ -2053,7 +2169,6 @@ class LogicalScheduler:
                         min(getattr(op.wait_gr_counts, t) for op in wait_gr_ops_full))
             adjust = all(op.adjustVmcnt for op in wait_gr_ops_full)
             result.append(WaitGROp(wait_gr_counts=merged_counts,
-                                   has_sync=has_wait_gr_sync,
                                    adjustVmcnt=adjust))
         result.extend(others)
         return result
@@ -2114,16 +2229,15 @@ class LogicalScheduler:
                     # Check if any GR has same-subIterK deps
                     any_deps = any(gr.deps for gr in ordered_grs)
 
-                    # Remove redundant wait_lr_sync (keep only the first)
-                    seen_wait_lr_sync = False
+                    # Remove redundant wait_lr (keep only the first)
+                    seen_wait_lr = False
                     for gr in ordered_grs:
-                        if seen_wait_lr_sync:
+                        if seen_wait_lr:
                             gr.preOps = [
                                 op for op in gr.preOps
-                                if not (isinstance(op, WaitLROp) and op.has_sync)]
-                        elif any(isinstance(op, WaitLROp) and op.has_sync
-                                 for op in gr.preOps):
-                            seen_wait_lr_sync = True
+                                if not isinstance(op, WaitLROp)]
+                        elif any(isinstance(op, WaitLROp) for op in gr.preOps):
+                            seen_wait_lr = True
 
                     # First GR: if any GR had deps, point to last LR
                     if any_deps and last_lr is not None:
@@ -2175,22 +2289,18 @@ class LogicalScheduler:
         self._completed.add(Pass.GROUP_LR_GR)
 
     def remove_unnecessary_wait_lr_sync(self):
-        """Remove redundant wait_lr_sync from GRs after grouping.
-        Given that we always use wait_lr cnt=0, grouping can guarantee future wait_lr_sync.
+        """Remove redundant wait_lr from GRs after grouping.
 
-        A GR's wait_lr_sync is unnecessary when:
+        Given that we always use wait_lr cnt=0, grouping can guarantee future
+        wait_lr. A GR's wait_lr is unnecessary when:
           1. The GR has no same-subIterK deps (deps is empty after grouping)
-          2. The previous subIterK's GRs already have a wait_lr_sync
-          3. That previous wait_lr_sync is ordered after all LRs in the
-             previous subIterK (the GR has deps on the LR chain)
+          2. The previous subIterK's GRs already have a wait_lr
+          3. That previous wait_lr is ordered after all LRs in the previous
+             subIterK (the GR has deps on the LR chain)
 
-        In that case, all prior LR reads were already synced by the previous
-        subIterK's barrier, and the current GR doesn't conflict with any LRs
-        in its own subIterK, so the second wait_lr_sync is redundant.
-
-        Finally, any remaining wait_lr_sync on a GR with no deps is downgraded
-        to just sync — the wait_lr is already guaranteed by the MFMA op in the
-        same subIterK.
+        In that case, all prior LR reads were already drained by the previous
+        subIterK's wait_lr, and the current GR doesn't conflict with any LRs
+        in its own subIterK, so the second wait_lr is redundant.
         """
         self._ensure_pass(Pass.GROUP_LR_GR)
 
@@ -2199,9 +2309,9 @@ class LogicalScheduler:
                 if not slot.grs:
                     continue
                 first_gr = slot.grs[0]
-                has_wait_lr_sync = any(
-                    isinstance(op, WaitLROp) and op.has_sync for op in first_gr.preOps)
-                if not has_wait_lr_sync:
+                has_wait_lr = any(
+                    isinstance(op, WaitLROp) for op in first_gr.preOps)
+                if not has_wait_lr:
                     continue
                 has_deps = bool(first_gr.deps)
                 if has_deps:
@@ -2213,34 +2323,13 @@ class LogicalScheduler:
                 if not prev_slot.grs:
                     continue
                 prev_first_gr = prev_slot.grs[0]
-                prev_has_wait_lr_sync = any(
-                    isinstance(op, WaitLROp) and op.has_sync for op in prev_first_gr.preOps)
+                prev_has_wait_lr = any(
+                    isinstance(op, WaitLROp) for op in prev_first_gr.preOps)
                 prev_deps_on_lrs = bool(prev_first_gr.deps)
-                if prev_has_wait_lr_sync and prev_deps_on_lrs:
+                if prev_has_wait_lr and prev_deps_on_lrs:
                     first_gr.preOps = [
                         op for op in first_gr.preOps
-                        if not (isinstance(op, WaitLROp) and op.has_sync)]
-
-        # Downgrade remaining wait_lr_sync → sync on GRs with no LR deps.
-        # The MFMA in the same subIterK already ensures wait_lr.
-        for pi, slots in enumerate(self._partitions):
-            for slot in slots:
-                for gr in slot.grs:
-                    if not any(isinstance(op, WaitLROp) and op.has_sync for op in gr.preOps):
-                        continue
-                    has_lr_dep = False
-                    node = gr
-                    while node and node.deps:
-                        ref = node.deps[0].ref
-                        if isinstance(ref, LRPlacement):
-                            has_lr_dep = True
-                            break
-                        node = ref
-                    if has_lr_dep:
-                        continue
-                    gr.preOps = [
-                        SyncOp() if (isinstance(op, WaitLROp) and op.has_sync) else op
-                        for op in gr.preOps]
+                        if not isinstance(op, WaitLROp)]
 
         self._completed.add(Pass.REMOVE_WAIT_LR_SYNC)
 
@@ -2273,8 +2362,7 @@ class LogicalScheduler:
 
         The before-link topology:
           - wait_gr is standalone (no incoming before-link), but later deps chain from it
-          - WaitGROp with has_sync expands to two modules: wait_gr then sync
-          - WaitLROp with has_sync expands to two modules: wait_lr then sync
+          - SyncOp (cross-wave rendezvous) is emitted as its own module
           - Same-subIterK Dep deps become ordering constraints (no new module)
         """
         self._ensure_pass(Pass.REMOVE_WAIT_LR_SYNC)
@@ -2343,23 +2431,6 @@ class LogicalScheduler:
                             prevId = depId
                             if firstPreOpId is None:
                                 firstPreOpId = depId
-                            if preOp.has_sync:
-                                depId = add(SyncOp())
-                                setBefore(depId, prevId)
-                                prevId = depId
-                                lastDepId = depId
-                            continue
-                        elif isinstance(preOp, WaitLROp) and preOp.has_sync:
-                            depId = add(WaitLROp())
-                            setBefore(depId, prevId)
-                            prevId = depId
-                            lastDepId = depId
-                            if firstPreOpId is None:
-                                firstPreOpId = depId
-                            depId = add(SyncOp())
-                            setBefore(depId, prevId)
-                            prevId = depId
-                            lastDepId = depId
                             continue
                         else:
                             depId = add(preOp)
