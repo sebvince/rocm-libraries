@@ -51,10 +51,11 @@ class Pass(IntEnum):
     REMOVE_DEPS         = 7
     GR_INC              = 8
     GROUP_LR_GR         = 9
-    REMOVE_WAIT_LR_SYNC = 10
-    EMIT                = 11
-    BUILD               = 12
-    POPULATE            = 13
+    MERGE_SYNC          = 10
+    REMOVE_WAIT_LR_SYNC = 11
+    EMIT                = 12
+    BUILD               = 13
+    POPULATE            = 14
 
 
 _PASS_PIPELINE = {
@@ -68,7 +69,8 @@ _PASS_PIPELINE = {
     Pass.REMOVE_DEPS:          ('remove_cross_deps',                [Pass.REMOVE_LR_DEPS]),
     Pass.GR_INC:               ('insert_gr_lr_inc',                 [Pass.REMOVE_DEPS]),
     Pass.GROUP_LR_GR:          ('group_lr_gr',                      [Pass.GR_INC]),
-    Pass.REMOVE_WAIT_LR_SYNC:  ('remove_unnecessary_wait_lr_sync', [Pass.GROUP_LR_GR]),
+    Pass.MERGE_SYNC:           ('merge_sync',                       [Pass.GROUP_LR_GR]),
+    Pass.REMOVE_WAIT_LR_SYNC:  ('remove_unnecessary_wait_lr_sync', [Pass.MERGE_SYNC]),
     Pass.EMIT:                 ('emit',                             [Pass.REMOVE_WAIT_LR_SYNC]),
     Pass.BUILD:                ('build',                            [Pass.EMIT]),
     Pass.POPULATE:             ('populate_instructions',            []),
@@ -415,7 +417,12 @@ class WaitLROp(BaseOp):
 
 @dataclass
 class SyncOp(BaseOp):
-    """Inter-wave sync barrier. All waves carrying the same id rendezvous."""
+    """Inter-wave sync barrier. All waves carrying the same id rendezvous.
+
+    The id is purely logical — a SyncOp lowers to a bare workgroup s_barrier.
+    When merge_sync collapses several syncs into one barrier, it keeps the
+    lowest id.
+    """
     id: int = 0
 
     def __post_init__(self):
@@ -2492,6 +2499,191 @@ class LogicalScheduler:
                         slot.mfma.deps = other_deps + [
                             Dep(ref=last_lr, mt_offset=lr_deps[0].mt_offset)]
 
+    # ── Merge cross-wave syncs ─────────────────────────────────
+
+    def merge_sync(self):
+        """Coalesce cross-wave barriers within a (partition, subIterK).
+
+        A SyncOp lowers to a bare workgroup s_barrier (id dropped at emit), so
+        barriers pair across waves by program order: the K-th barrier each wave
+        executes at a subIterK rendezvouses with every other wave's K-th. After
+        grouping, one (wave, subIterK) slot can carry several syncs and different
+        waves carry different counts — which deadlocks. This pass merges syncs so
+        every wave ends with the same, aligned set of barriers per subIterK.
+
+        See _merge_sync_for_slot for the algorithm.
+        """
+        self._ensure_pass(Pass.GROUP_LR_GR)
+
+        # No cross-wave syncs exist in single-wave mode; nothing to merge.
+        if self.config.numWaves > 1:
+            numP = self.config.numPartitions
+            numK = self.config.numSubIterK
+            # Union-find over sync ids: collapsing ids within one wave's slot
+            # links them; ids linked transitively across waves form one class.
+            parent: dict = {}
+            for pi in range(numP):
+                for k in range(numK):
+                    self._merge_sync_for_slot(pi, k, parent)
+            # Relabel every surviving barrier to its class min so transitively
+            # linked rendezvous (e.g. 0-3 / 2-3 / 0-3-6 / 2-6 → {0,2,3,6})
+            # share a single id.
+            self._relabel_sync_ids(parent)
+
+        self._completed.add(Pass.MERGE_SYNC)
+
+    def _relabel_sync_ids(self, parent: dict) -> None:
+        """Rewrite every SyncOp.id to its union-find class representative."""
+        for w in range(self.config.numWaves):
+            for slots in self._wave_partitions[w]:
+                for slot in slots:
+                    placements = (([slot.mfma] if slot.mfma else [])
+                                  + list(slot.lrs) + list(slot.grs))
+                    for p in placements:
+                        for op in (p.preOps + p.postOps):
+                            if isinstance(op, SyncOp):
+                                op.id = self._uf_find(parent, op.id)
+
+    def _slot_at(self, wave: int, pi: int, subIterK: int):
+        """Return the SubIterKSlot for (wave, pi, subIterK), or None."""
+        for slot in self._wave_partitions[wave][pi]:
+            if slot.subIterK == subIterK:
+                return slot
+        return None
+
+    @staticmethod
+    def _slot_reachability(placements: list) -> dict:
+        """Transitive same-slot dep reachability, keyed by id().
+
+        reach[id(p)] = set of id()s of placements p (transitively) depends on.
+        Placement dataclasses are unhashable (eq=True), so we key by id().
+        """
+        pids = {id(p) for p in placements}
+        direct = {id(p): set() for p in placements}
+        for p in placements:
+            for d in p.deps:
+                if id(d.ref) in pids:
+                    direct[id(p)].add(id(d.ref))
+
+        def _dfs(start, acc):
+            for q in direct[start]:
+                if q not in acc:
+                    acc.add(q)
+                    _dfs(q, acc)
+
+        reach = {id(p): set() for p in placements}
+        for p in placements:
+            _dfs(id(p), reach[id(p)])
+        return reach
+
+    @staticmethod
+    def _strip_syncs(placements: list) -> None:
+        """Remove every SyncOp from all pre/postOps in the slot (in place)."""
+        for p in placements:
+            p.preOps = [op for op in p.preOps if not isinstance(op, SyncOp)]
+            p.postOps = [op for op in p.postOps if not isinstance(op, SyncOp)]
+
+    @staticmethod
+    def _uf_find(parent: dict, x: int) -> int:
+        root = x
+        while parent.get(root, root) != root:
+            root = parent[root]
+        while parent.get(x, x) != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def _uf_union(self, parent: dict, a: int, b: int) -> None:
+        ra, rb = self._uf_find(parent, a), self._uf_find(parent, b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)  # point to the smaller id
+
+    def _merge_sync_for_slot(self, pi: int, subIterK: int, parent: dict):
+        """Merge cross-wave syncs for one (partition, subIterK) across all waves.
+
+        A SyncOp lowers to a bare workgroup s_barrier (all waves participate in
+        every barrier), so correctness only needs equal barrier counts per
+        subIterK across waves. We collapse each wave's syncs in this slot into a
+        single barrier, and union the collapsed ids in `parent` so that ids
+        transitively linked across waves (e.g. 0-3 on W0, 2-3 on W1) end up in
+        one equivalence class, relabeled to the class min in a final pass.
+        """
+        for w in range(self.config.numWaves):
+            slot = self._slot_at(w, pi, subIterK)
+            if slot is not None:
+                self._merge_sync_in_wave_slot(slot, parent)
+
+    def _merge_sync_in_wave_slot(self, slot, parent: dict) -> None:
+        """Collapse all SyncOps in one wave's slot into a single barrier.
+
+        A SyncOp is a bare workgroup s_barrier, so one barrier per wave per
+        subIterK is both necessary (counts must match across waves) and
+        sufficient (a single workgroup rendezvous subsumes every pairwise sync).
+
+        Program order within a slot is MFMA, then LRs, then GRs, with each
+        placement's preOps before it and postOps after. Producers carry their
+        sync as a postOp (must follow the producing op); the lone consumer
+        carries its sync as a preOp (must precede the consuming op). The merged
+        barrier must sit after every producer and before the consumer —
+        realizable iff the consumer is ordered after all producers via slot
+        program order or a transitive same-slot dep.
+        """
+        placements = (([slot.mfma] if slot.mfma else [])
+                      + list(slot.lrs) + list(slot.grs))
+        order_idx = {id(p): i for i, p in enumerate(placements)}
+
+        producers = [p for p in placements
+                     if any(isinstance(op, SyncOp) for op in p.postOps)]
+        consumers = [p for p in placements
+                     if any(isinstance(op, SyncOp) for op in p.preOps)]
+
+        n_sync = sum(isinstance(op, SyncOp)
+                     for p in placements for op in (p.preOps + p.postOps))
+        if n_sync <= 1:
+            return  # nothing to merge
+
+        ids = sorted({op.id for p in placements
+                      for op in (p.preOps + p.postOps)
+                      if isinstance(op, SyncOp)})
+        # Union all ids collapsed here: a barrier merging them on this wave forces
+        # the same rendezvous on every wave carrying any of these ids.
+        for other in ids[1:]:
+            self._uf_union(parent, ids[0], other)
+        merged = SyncOp(id=ids[0])
+
+        if len(consumers) > 1:
+            raise NotImplementedError(
+                f"merge_sync: slot has {len(consumers)} consumer placements "
+                f"with preOp syncs; multi-consumer collapse not supported")
+
+        reach = self._slot_reachability(placements)
+
+        def _before(prod, cons) -> bool:
+            # prod precedes cons if it is earlier in slot program order or cons
+            # transitively depends on it.
+            return (order_idx[id(prod)] < order_idx[id(cons)]
+                    or id(prod) in reach[id(cons)])
+
+        if consumers:
+            host = consumers[0]
+            for prod in producers:
+                if prod is host or _before(prod, host):
+                    continue
+                raise NotImplementedError(
+                    "merge_sync: producer not ordered before consumer barrier "
+                    "in slot (cannot place a single barrier safely)")
+            self._strip_syncs(placements)
+            # Place after the last wait_* already in the host's preOps.
+            last_wait = -1
+            for i, op in enumerate(host.preOps):
+                if isinstance(op, (WaitGROp, WaitLROp)):
+                    last_wait = i
+            host.preOps.insert(last_wait + 1, merged)
+        else:
+            # Producers only: anchor on the last producer in program order.
+            host = max(producers, key=lambda p: order_idx[id(p)])
+            self._strip_syncs(placements)
+            host.postOps.append(merged)
+
     def remove_unnecessary_wait_lr_sync(self):
         """Remove redundant wait_lr from GRs after grouping.
 
@@ -2506,7 +2698,7 @@ class LogicalScheduler:
         subIterK's wait_lr, and the current GR doesn't conflict with any LRs
         in its own subIterK, so the second wait_lr is redundant.
         """
-        self._ensure_pass(Pass.GROUP_LR_GR)
+        self._ensure_pass(Pass.MERGE_SYNC)
 
         for pi, slots in enumerate(self._partitions):
             for si, slot in enumerate(slots):

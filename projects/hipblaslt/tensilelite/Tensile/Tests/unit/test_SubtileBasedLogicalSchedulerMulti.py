@@ -251,6 +251,10 @@ if __name__ == "__main__":
                                         _print_waves("Group LR/GR (per-wave)",
                                                      show_deps=True,
                                                      show_preops=True))),
+        ("Merge sync",         lambda: (sched.merge_sync(),
+                                        _print_waves("Merge sync (per-wave)",
+                                                     show_deps=True,
+                                                     show_preops=True))),
     ]
 
     for i, (title, run) in enumerate(steps):
