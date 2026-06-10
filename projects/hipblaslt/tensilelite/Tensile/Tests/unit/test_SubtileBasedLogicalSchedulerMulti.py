@@ -243,6 +243,10 @@ if __name__ == "__main__":
         ("Insert gr/lr inc",   lambda: (sched.insert_gr_lr_inc(),
                                         _print_waves("Insert gr/lr inc (per-wave)",
                                                      show_preops=True))),
+        ("Group LR/GR",        lambda: (sched.group_lr_gr(),
+                                        _print_waves("Group LR/GR (per-wave)",
+                                                     show_deps=True,
+                                                     show_preops=True))),
     ]
 
     for i, (title, run) in enumerate(steps):

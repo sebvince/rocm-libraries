@@ -2325,6 +2325,32 @@ class LogicalScheduler:
         result.extend(others)
         return result
 
+    @staticmethod
+    def _merge_chain_postops(lrs: List['LRPlacement']) -> None:
+        """Relocate cross-wave wait_lr/sync postOps onto the chain's last LR.
+
+        Only the producer-side collision ops (WaitLROp + SyncOp) migrate to the
+        tail (which executes last, so the barrier lands after every LR read);
+        the first WaitLROp is kept and later ones dropped as redundant. Other
+        postOps (e.g. tensor-specific lr_inc) stay on their own LR untouched.
+        """
+        moved: List['BaseOp'] = []
+        seen_wait_lr = False
+        for lr in lrs:
+            kept = []
+            for op in lr.postOps:
+                if isinstance(op, WaitLROp):
+                    if not seen_wait_lr:
+                        seen_wait_lr = True
+                        moved.append(op)
+                    # later wait_lr dropped (redundant)
+                elif isinstance(op, SyncOp):
+                    moved.append(op)
+                else:
+                    kept.append(op)
+            lr.postOps = kept
+        lrs[-1].postOps.extend(moved)
+
     def group_lr_gr(self):
         """Group LR and GR placements into chains within each subIterK.
 
@@ -2345,12 +2371,27 @@ class LogicalScheduler:
           into one: GR chain → LR chain (first LR points to last GR, LR's
           original GR dep is removed).  This avoids two nodes sharing the
           same parent.
+
+        Runs per wave; chaining is intra-slot/intra-wave only (no cross-wave
+        reasoning), so each wave's partition grid is grouped independently.
         """
         self._ensure_pass(Pass.GR_INC)
 
+        for w in range(self.config.numWaves):
+            wave_slots = self._wave_partitions[w]
+            has_mfma = any(slot.mfma is not None
+                           for slots in wave_slots for slot in slots)
+            if not has_mfma:
+                continue
+            self._group_lr_gr_for_wave(wave_slots)
+
+        self._completed.add(Pass.GROUP_LR_GR)
+
+    def _group_lr_gr_for_wave(self, partitions: List[List[SubIterKSlot]]):
+        """Run group_lr_gr's Phase 1-4 chaining on one wave's partition grid."""
         order = self._LR_GR_ORDER
 
-        for pi, slots in enumerate(self._partitions):
+        for pi, slots in enumerate(partitions):
             for slot in slots:
                 # ── Phase 1: LR chain ──
                 ordered_lrs = sorted(
@@ -2364,6 +2405,11 @@ class LogicalScheduler:
                     ordered_lrs[0].preOps = merged
                     for lr in ordered_lrs[1:]:
                         lr.preOps = []
+
+                    # Relocate cross-wave wait_lr/sync postOps onto the chain
+                    # tail (runs last, so the barrier lands after all LR reads);
+                    # tensor-specific postOps (lr_inc) stay on their own LR.
+                    self._merge_chain_postops(ordered_lrs)
 
                     # Build chain: each LR depends on the previous
                     for i in range(1, len(ordered_lrs)):
@@ -2437,8 +2483,6 @@ class LogicalScheduler:
                                       if id(d.ref) not in slot_lr_set]
                         slot.mfma.deps = other_deps + [
                             Dep(ref=last_lr, mt_offset=lr_deps[0].mt_offset)]
-
-        self._completed.add(Pass.GROUP_LR_GR)
 
     def remove_unnecessary_wait_lr_sync(self):
         """Remove redundant wait_lr from GRs after grouping.
