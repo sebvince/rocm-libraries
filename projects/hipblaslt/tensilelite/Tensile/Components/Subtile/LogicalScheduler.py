@@ -1441,25 +1441,32 @@ class LogicalScheduler:
 
         for w in range(cfg.numWaves):
             wave_slots = self._wave_partitions[w]
-            # Wave-local LR lookups for the MFMA→LR rule.
+            # Wave-local LR lookups for the MFMA→LR rule. MFMA producers are
+            # always same-wave by construction in the multi-wave layout, so
+            # restrict the lookup to this wave's LRs to avoid spurious
+            # cross-wave deps when another wave happens to load the same tiles.
             lr_by_data = [{} for _ in range(numK)]
+            lr_by_tensor_wave: Dict[str, list] = {}
             for slots in wave_slots:
                 for slot in slots:
                     for lr in slot.lrs:
                         for data_k in lr.tiles.subIterK_list:
                             lr_by_data[data_k].setdefault(lr.tensor, []).append(lr)
+                        lr_by_tensor_wave.setdefault(lr.tensor, []).append(lr)
             # LR→GR / GR→LR use cross-wave lookups so split-by-wave GR deps
             # land on the correct loader.
             for pi, slots in enumerate(wave_slots):
                 self._annotate_deps_partition(pi, slots, cfg, lr_by_data,
                                               gr_by_tensor_global,
-                                              lr_by_tensor_global)
+                                              lr_by_tensor_global,
+                                              lr_by_tensor_wave)
 
         self._completed.add(Pass.DEPS)
 
     def _annotate_deps_partition(self, pi: int, slots: List[SubIterKSlot],
                                  cfg: SchedulerConfig, lr_by_data: list,
-                                 gr_by_tensor: dict, lr_by_tensor: dict):
+                                 gr_by_tensor: dict, lr_by_tensor: dict,
+                                 lr_by_tensor_mfma: Optional[dict] = None):
         """Annotate deps for a single partition (in-place on placements)."""
         numK = len(slots)
 
@@ -1547,9 +1554,14 @@ class LogicalScheduler:
             # Uses lr_by_tensor (all LRs across partitions) so that a more recent
             # LR loading a different subIterK still subsumes older data deps.
             if slot.mfma:
+                # MFMA→LR: restrict to the MFMA's own wave when a wave-local
+                # lookup is provided. MFMA producers are always same-wave by
+                # construction, so a global lookup can pick a tied cross-wave
+                # LR and force a needless cross-wave sync.
+                mfma_lr_lookup = lr_by_tensor_mfma if lr_by_tensor_mfma is not None else lr_by_tensor
                 for t in self.tensors:
                     deps_for_t = []
-                    for lr in lr_by_tensor.get(t, []):
+                    for lr in mfma_lr_lookup.get(t, []):
                         if _tiles_overlap(slot.mfma, t, lr.tiles):
                             deps_for_t.append(Dep(
                                 ref=lr, mt_offset=_mt_offset(pi, k, 'MFMA', lr)))
@@ -1585,8 +1597,13 @@ class LogicalScheduler:
 
     # ── Remove unnecessary GR deps ────────────────────────
 
-    def _make_gr_dep_exec_order(self, tensor):
+    def _make_gr_dep_exec_order(self, tensor, grs):
         """Return a key fn ordering deps by (mt_offset, partition, slot, intra-slot rank).
+
+        `grs` is the set of candidate producer GRs to rank (the GRs that this
+        wave's LR deps may reference, plus the wave's own GRs). In split-by-wave
+        the producer of a dep may live on a different wave, so the caller passes
+        an explicit GR set rather than scanning a fixed partition grid.
 
         Two GRs sharing a (mtIteration, partition, subIterK_slot) collapse to one
         (mt_offset, partition, slot) key, so an intra-slot rank (by _gr_sort_key,
@@ -1595,16 +1612,17 @@ class LogicalScheduler:
         earlier-rank GR in the same slot is kept.
         """
         slot_members = {}
-        for slots in self._partitions:
-            for slot in slots:
-                for gr in slot.grs:
-                    if gr.tensor == tensor:
-                        key = (gr.mtIteration, gr.partition, gr.subIterK_slot)
-                        slot_members.setdefault(key, []).append(gr)
+        for gr in grs:
+            if gr.tensor == tensor:
+                # Group by wave too: GRs in different waves never co-reside in
+                # one slot, so they must not share an intra-slot rank even when
+                # their (mtIteration, partition, subIterK_slot) coincide.
+                key = (gr.wave, gr.mtIteration, gr.partition, gr.subIterK_slot)
+                slot_members.setdefault(key, []).append(gr)
 
         gr_intra_rank = {}
-        for grs in slot_members.values():
-            for rank, gr in enumerate(sorted(grs, key=self._gr_sort_key)):
+        for grs_in_slot in slot_members.values():
+            for rank, gr in enumerate(sorted(grs_in_slot, key=self._gr_sort_key)):
                 gr_intra_rank[id(gr)] = rank
 
         def _dep_exec_order(dep):
@@ -1618,29 +1636,45 @@ class LogicalScheduler:
     def remove_unnecessary_gr_deps(self):
         """Remove GR deps on LRs that are already guaranteed by an earlier LR's wait.
 
-        Per tensor, walks LR placements in execution order. If an earlier LR
-        already waits for a GR with equal or higher exec_order, the later LR's
-        dep is redundant and removed.
+        Run separately per wave. Each wave has its own instruction stream and
+        vmcnt queue, so the "earlier LR's GR wait subsumes a later LR's GR wait"
+        reasoning only holds within a single consumer wave — comparing LR deps
+        across waves would let a wait in one wave wrongly cancel a dep in another.
+        In split-by-wave the *producer* GR of a dep may live on a different wave,
+        but that doesn't break the argument: subsumption depends on the consumer
+        stream's ordering, not on which wave issued the load.
+        """
+        self._ensure_pass(Pass.DEPS)
+
+        # Rank all GRs globally so cross-wave producers (split-by-wave) are
+        # covered; the consumer-side walk is scoped per wave below.
+        all_grs = [gr
+                   for w in range(self.config.numWaves)
+                   for slots in self._wave_partitions[w]
+                   for slot in slots
+                   for gr in slot.grs]
+
+        for w in range(self.config.numWaves):
+            self._remove_unnecessary_gr_deps_for_wave(
+                self._wave_partitions[w], all_grs)
+
+        self._completed.add(Pass.REMOVE_GR_DEPS)
+
+    def _remove_unnecessary_gr_deps_for_wave(self, partitions, ranking_grs):
+        """Remove redundant LR→GR deps within one wave's partition grid.
+
+        Per tensor, walks the wave's LR placements in execution order. If an
+        earlier LR already waits for a GR with equal or higher exec_order, the
+        later LR's dep is redundant and removed.
 
         Wraps around: the first LR's dep is compared against the last from the
         previous MT iteration (max dep exec_order shifted by mt_offset -1).
         """
-        self._ensure_pass(Pass.DEPS)
-
-        if self.config.splitGRByWave:
-            # gfx1250 split-by-wave: GRs of the same tensor may live on
-            # different waves (different vmcnt queues). The "earlier LR's GR
-            # wait subsumes a later LR's GR wait" reasoning relies on a single
-            # ordered vmcnt — false across waves. Skip until inter-wave sync
-            # is wired up.
-            self._completed.add(Pass.REMOVE_GR_DEPS)
-            return
-
         for tensor in self.tensors:
-            _dep_exec_order = self._make_gr_dep_exec_order(tensor)
+            _dep_exec_order = self._make_gr_dep_exec_order(tensor, ranking_grs)
 
             lr_with_gr_deps = []
-            for pi, slots in enumerate(self._partitions):
+            for pi, slots in enumerate(partitions):
                 for slot in slots:
                     for lr in slot.lrs:
                         if lr.tensor == tensor and lr.deps:
@@ -1660,8 +1694,6 @@ class LogicalScheduler:
                     lr.deps.clear()
                 else:
                     max_guaranteed = eo
-
-        self._completed.add(Pass.REMOVE_GR_DEPS)
 
     # ── Remove unnecessary LR deps ────────────────────────
 
