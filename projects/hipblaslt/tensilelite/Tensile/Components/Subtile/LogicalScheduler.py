@@ -1917,13 +1917,18 @@ class LogicalScheduler:
         self._completed.add(Pass.REMOVE_DEPS)
 
     def _remove_cross_deps_for_partition(self, pi: int,
-                                          slots: List[SubIterKSlot]):
+                                          slots: List[SubIterKSlot],
+                                          wave: int = 0):
         """Convert cross-subIterK deps to wait preOps for one partition.
 
         Single-wave (or per-wave, same-wave-only) lowering. Deps that resolve
         to a producer on a different wave are left untouched here for the
         multi-wave Pass 2 (`_place_cross_wave_syncs`) to convert into SyncOps.
+
+        `wave` selects the grid used for inflight-load counts: a same-wave LR→GR
+        wait must be counted against the producer's own wave grid, not wave 0.
         """
+        grid = self._wave_partitions[wave]
         for slot in slots:
             # ── MFMA ──
             if slot.mfma:
@@ -1955,7 +1960,7 @@ class LogicalScheduler:
                     cross_set = set(id(d) for d in cross)
                     is_cross = id(dep) in cross_set
                     counts = self._compute_inflight_loads(
-                        pi, lr.subIterK_slot, dep.ref.tensor, dep)
+                        pi, lr.subIterK_slot, dep.ref.tensor, dep, grid=grid)
                     lr.preOps.append(WaitGROp(wait_gr_counts=counts,
                                               adjustVmcnt=is_cross))
 
@@ -1985,23 +1990,46 @@ class LogicalScheduler:
         # Pass 1
         for w in range(self.config.numWaves):
             for pi, slots in enumerate(self._wave_partitions[w]):
-                self._remove_cross_deps_for_partition(pi, slots)
+                self._remove_cross_deps_for_partition(pi, slots, wave=w)
 
         # Pass 2
         self._place_cross_wave_syncs()
 
+    def _mfma_at(self, wave: int, partition: int, subIterK: int):
+        """Return the MFMA placement at (wave, partition, subIterK), or None."""
+        for slot in self._wave_partitions[wave][partition]:
+            if slot.subIterK == subIterK and slot.mfma is not None:
+                return slot.mfma
+        return None
+
     def _place_cross_wave_syncs(self):
         """Lower remaining cross-wave deps to SyncOp(id) pairs.
 
-        Allocates a fresh id per producer placement (fan-out: all consumer
-        waves of one producer share the same id). Producer side: if a
-        matching same-wave WaitLROp/WaitGROp already lives in the producer's
-        own preOps, attach SyncOp(id) right after it; otherwise append a
-        fresh wait + SyncOp(id) as postOps.
+        A cross-wave dep (consumer C on its wave depending on producer P on
+        another wave) becomes a barrier rendezvous at the consumer's slot
+        (C.partition, C.subIterK_slot):
+          - Consumer side: SyncOp(id) as a preOp on the consuming placement
+            itself (the op that needs the data), after any same-wave wait.
+          - Producer side: wait (wait_gr for a GR producer, wait_lr for an LR
+            producer) + SyncOp(id) as postOps on the producer wave's MFMA at
+            the *same* (partition, subIterK) as the consumer.
+
+        The producer anchors on the MFMA because it is the only placement
+        guaranteed to exist exactly once per (wave, partition, subIterK), so
+        the producer's barrier lands at the same program point as the
+        consumer's. postOps carry no hard data edge, so a later per-subIterK
+        merge pass can coalesce/reorder the barriers.
+
+        One id per producer (fan-out across all consumers). The producer-side
+        wait+sync is emitted once per distinct rendezvous slot, since different
+        consumer waves of the same producer may rendezvous at different slots.
         """
         next_id = 0
         producer_id: Dict[int, int] = {}  # id(producer placement) -> sync id
-        producer_handled: set = set()      # producer placements with side emitted
+        # (id(prod), rendezvous_partition, rendezvous_subIterK) -> the producer
+        # WaitGROp emitted for that rendezvous (None for LR producers / no MFMA),
+        # so later consumers sharing it can min-merge their inflight counts.
+        producer_handled: Dict[tuple, Optional['WaitGROp']] = {}
 
         # Gather all placements with deps for a stable walk
         def _walk():
@@ -2025,6 +2053,11 @@ class LogicalScheduler:
             placement.deps = [d for d in placement.deps
                               if d.ref.wave == consumer_wave]
 
+            # Rendezvous slot = the consumer's (partition, subIterK).
+            rv_pi = placement.partition
+            rv_k = placement.subIterK_slot
+
+            seen_sids: set = set()  # dedup syncs on this consumer placement
             for dep in cross_deps:
                 prod = dep.ref
                 pkey = id(prod)
@@ -2033,38 +2066,59 @@ class LogicalScheduler:
                     next_id += 1
                 sid = producer_id[pkey]
 
-                # Consumer side: SyncOp(id=sid) as preOp, placed after any
-                # same-wave wait preOp already present on this placement.
-                self._append_sync_after_wait(placement.preOps, sid)
+                # ── Consumer side: SyncOp(id) as a preOp on the op that needs
+                #    the data, after any same-wave wait already present. ──
+                if sid not in seen_sids:
+                    seen_sids.add(sid)
+                    self._append_sync_after_wait(placement.preOps, sid)
 
-                if pkey in producer_handled:
+                # ── Producer side: wait + SyncOp(id) on the rendezvous-slot
+                #    MFMA of the producer wave (once per rendezvous slot). ──
+                phkey = (pkey, rv_pi, rv_k)
+                if phkey in producer_handled:
+                    # Same producer + rendezvous slot already has its barrier.
+                    # Multiple consumer waves share that one producer wait, so
+                    # it must satisfy the strongest (newest-data) consumer:
+                    # reconcile to the per-tensor MIN inflight count. A smaller
+                    # vlcnt drains more loads, so min == the tightest wait.
+                    prev_wait = producer_handled[phkey]
+                    if prev_wait is not None and not isinstance(prod, LRPlacement):
+                        counts = self._compute_inflight_loads(
+                            rv_pi, rv_k, prod.tensor, dep,
+                            grid=self._wave_partitions[prod.wave])
+                        self._min_merge_wait_gr(prev_wait.wait_gr_counts, counts)
                     continue
-                producer_handled.add(pkey)
 
-                # Producer side. wait kind depends on producer type.
-                want_wait_lr = isinstance(prod, LRPlacement)
-                wait_cls = WaitLROp if want_wait_lr else WaitGROp
-
-                # Piggyback onto an existing matching wait in producer's preOps.
-                idx = self._find_wait_index(prod.preOps, wait_cls)
-                if idx is not None:
-                    prod.preOps.insert(idx + 1, SyncOp(id=sid))
+                pmfma = self._mfma_at(prod.wave, rv_pi, rv_k)
+                if pmfma is None:
+                    producer_handled[phkey] = None
                     continue
 
-                # Otherwise append wait + SyncOp(id) as postOps.
-                if want_wait_lr:
-                    prod.postOps.append(WaitLROp())
+                wait_op = None
+                if isinstance(prod, LRPlacement):
+                    pmfma.postOps.append(WaitLROp())
                 else:
-                    # Producer-side wait_gr counts are computed against the
-                    # producer wave's own slot grid.
-                    grid = self._wave_partitions[prod.wave]
-                    fake_dep = Dep(ref=prod, mt_offset=0)
+                    # Count inflight GR atoms on the producer wave's grid,
+                    # walking from the rendezvous slot back to the producer GR.
                     counts = self._compute_inflight_loads(
-                        prod.partition, prod.subIterK_slot,
-                        prod.tensor, fake_dep, grid=grid)
-                    prod.postOps.append(
-                        WaitGROp(wait_gr_counts=counts, adjustVmcnt=True))
-                prod.postOps.append(SyncOp(id=sid))
+                        rv_pi, rv_k, prod.tensor, dep,
+                        grid=self._wave_partitions[prod.wave])
+                    wait_op = WaitGROp(wait_gr_counts=counts, adjustVmcnt=True)
+                    pmfma.postOps.append(wait_op)
+                pmfma.postOps.append(SyncOp(id=sid))
+                producer_handled[phkey] = wait_op
+
+    @staticmethod
+    def _min_merge_wait_gr(dst: 'WaitGRCounts', src: 'WaitGRCounts') -> None:
+        """Reconcile a shared producer wait_gr to the tightest consumer (in place).
+
+        One producer barrier serves all consumer waves at a rendezvous slot, so
+        its inflight count must satisfy the consumer needing the newest data.
+        A smaller vlcnt drains more loads, so the per-tensor MIN is the strongest
+        wait that still covers every consumer.
+        """
+        for t in ('A', 'B', 'SA', 'SB'):
+            setattr(dst, t, min(getattr(dst, t), getattr(src, t)))
 
     @staticmethod
     def _append_sync_after_wait(preOps: List['BaseOp'], sync_id: int) -> None:
@@ -2074,13 +2128,6 @@ class LogicalScheduler:
             if isinstance(op, (WaitGROp, WaitLROp)):
                 last_wait_idx = i
         preOps.insert(last_wait_idx + 1, SyncOp(id=sync_id))
-
-    @staticmethod
-    def _find_wait_index(preOps: List['BaseOp'], wait_cls) -> Optional[int]:
-        for i, op in enumerate(preOps):
-            if isinstance(op, wait_cls):
-                return i
-        return None
 
     def insert_gr_lr_inc(self):
         """Insert gr_inc/lr_inc preOps at MacroTile iteration transitions.
