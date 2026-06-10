@@ -1736,8 +1736,19 @@ class LogicalScheduler:
 
         Exec order: (mt_offset, partition, subIterK_slot). On wrap-around
         the mt_offset is shifted by -1.
+
+        Runs per wave: sync points live in a single wave's instruction stream,
+        so the "earlier sync already drained this LR" reasoning is wave-local.
         """
         self._ensure_pass(Pass.REMOVE_GR_DEPS)
+
+        for w in range(self.config.numWaves):
+            self._remove_unnecessary_lr_deps_for_wave(self._wave_partitions[w])
+
+        self._completed.add(Pass.REMOVE_LR_DEPS)
+
+    def _remove_unnecessary_lr_deps_for_wave(self, partitions):
+        """Remove GR→LR collision deps covered by an earlier sync, one wave."""
 
         def _dep_exec_order(dep):
             return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
@@ -1745,7 +1756,7 @@ class LogicalScheduler:
         # Step 1: collect one sync entry per sync slot.
         # Each entry: (pos, last_lr_by_tensor, [grs_to_check])
         sync_slots = []
-        for pi, slots in enumerate(self._partitions):
+        for pi, slots in enumerate(partitions):
             for slot in slots:
                 grs_with_lr = [
                     gr for gr in slot.grs
@@ -1774,7 +1785,6 @@ class LogicalScheduler:
                 sync_slots.append(((pi, slot.subIterK), last_lr, grs_with_lr))
 
         if not sync_slots:
-            self._completed.add(Pass.REMOVE_LR_DEPS)
             return
 
         sync_slots.sort(key=lambda x: x[0])
@@ -1810,8 +1820,6 @@ class LogicalScheduler:
 
                 if prev_eo is not None and prev_eo >= cur_eo:
                     gr.deps.clear()
-
-        self._completed.add(Pass.REMOVE_LR_DEPS)
 
     # ── Remove cross-subIterK deps ─────────────────────────
 
