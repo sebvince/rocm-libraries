@@ -1542,12 +1542,33 @@ class LogicalScheduler:
                     a.subIterK_start < b.subIterK_end and
                     a.subIterK_end > b.subIterK_start)
 
+        def _exec_order(dep):
+            return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
+
         def _dedup_deps(deps):
             if len(deps) <= 1:
                 return deps
-            def _exec_order(dep):
-                return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
             return [max(deps, key=_exec_order)]
+
+        def _dedup_deps_per_wave(deps):
+            """Keep the latest dep per producer wave.
+
+            For GR→LR collision deps: one logical tile lives in a single LDS
+            buffer but is read by every wave whose MFMA region overlaps it
+            (e.g. global A[0-3] is read by both W0 and W2 under splitGRByWave).
+            The GR may only overwrite that buffer once *all* those waves' LRs
+            are done, so we keep one dep (the latest) per producer wave rather
+            than collapsing across waves. Single-wave: all deps are wave 0, so
+            this reduces to _dedup_deps.
+            """
+            if len(deps) <= 1:
+                return deps
+            by_wave: Dict[int, Dep] = {}
+            for dep in deps:
+                w = getattr(dep.ref, 'wave', 0)
+                if w not in by_wave or _exec_order(dep) > _exec_order(by_wave[w]):
+                    by_wave[w] = dep
+            return [by_wave[w] for w in sorted(by_wave)]
 
         for k, slot in enumerate(slots):
             # MFMA: depends on the most recent LR per tensor (tile-overlapping).
@@ -1593,7 +1614,10 @@ class LogicalScheduler:
             for lr in slot.lrs:
                 lr.deps = _dedup_deps(lr.deps)
             for gr in slot.grs:
-                gr.deps = _dedup_deps(gr.deps)
+                # GR→LR collision deps must keep one dep per producer wave: a
+                # tile shared across waves' MFMA regions can't be overwritten
+                # until every reading wave's LR is done.
+                gr.deps = _dedup_deps_per_wave(gr.deps)
 
     # ── Remove unnecessary GR deps ────────────────────────
 
@@ -2053,6 +2077,16 @@ class LogicalScheduler:
             placement.deps = [d for d in placement.deps
                               if d.ref.wave == consumer_wave]
 
+            # ── GR consumer: LDS double-buffer collision (fan-in). ──
+            # A GR's cross-wave deps are the reading LRs on other waves that
+            # share its LDS buffer. The GR overwrites the buffer, so it must
+            # wait for every reading wave. One sync id for this consumer GR;
+            # each cross-wave reading LR signals via a postOp on itself.
+            if isinstance(placement, GRPlacement):
+                next_id = self._place_gr_collision_syncs(
+                    placement, cross_deps, next_id)
+                continue
+
             # Rendezvous slot = the consumer's (partition, subIterK).
             rv_pi = placement.partition
             rv_k = placement.subIterK_slot
@@ -2107,6 +2141,45 @@ class LogicalScheduler:
                     pmfma.postOps.append(wait_op)
                 pmfma.postOps.append(SyncOp(id=sid))
                 producer_handled[phkey] = wait_op
+
+    def _place_gr_collision_syncs(self, gr: 'GRPlacement',
+                                  cross_deps: List['Dep'], next_id: int) -> int:
+        """Lower a GR's cross-wave LDS-collision deps to one shared sync (fan-in).
+
+        The consumer GR shares an LDS double-buffer with reading LRs on other
+        waves; it may only overwrite the buffer once every reading wave's LR is
+        done. So:
+          - One sync id for this consumer GR.
+          - Consumer side: SyncOp(id) preOp on the GR, after any same-wave wait.
+          - Producer side: each cross-wave reading LR gets wait_lr + SyncOp(id)
+            as postOps on itself (the LR is the op holding the LDS data).
+
+        All producer LRs must share one subIterK so the sync lands at a single
+        program point on every participating wave; otherwise we cannot align a
+        single workgroup barrier — raise for now.
+
+        Returns the updated next_id.
+        """
+        sid = next_id
+        next_id += 1
+
+        prod_lrs = [d.ref for d in cross_deps]
+        slots = {p.subIterK_slot for p in prod_lrs}
+        if len(slots) > 1:
+            raise NotImplementedError(
+                f"GR {gr.tensor} collision sync: producer LRs span multiple "
+                f"subIterK slots {sorted(slots)}; cannot align a single "
+                f"cross-wave barrier yet")
+
+        # Consumer side: one sync on the GR itself.
+        self._append_sync_after_wait(gr.preOps, sid)
+
+        # Producer side: wait_lr + sync on each reading LR.
+        for lr in prod_lrs:
+            lr.postOps.append(WaitLROp())
+            lr.postOps.append(SyncOp(id=sid))
+
+        return next_id
 
     @staticmethod
     def _min_merge_wait_gr(dst: 'WaitGRCounts', src: 'WaitGRCounts') -> None:
