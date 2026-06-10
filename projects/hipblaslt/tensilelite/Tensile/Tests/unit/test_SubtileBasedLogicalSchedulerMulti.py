@@ -220,6 +220,20 @@ if __name__ == "__main__":
                         print(f"      {line}")
         print()
 
+    def _print_emit_dep_order():
+        """Per-wave dependency-order view of the emitted modules."""
+        sep = "=" * 100
+        print(sep)
+        print("  Emit (dependency order, per-wave)")
+        print(sep)
+        for w in range(cfg.numWaves):
+            print()
+            print(f"  ── Wave {w} {_wave_header(w)[7:]} " + "─" * 40)
+            text = sched.print_emit_dep_order(sched._wave_emitted[w])
+            for line in text.splitlines():
+                print(f"  {line}")
+        print()
+
     steps = [
         ("Place MFMAs",        lambda: (sched.place_MFMAs(),
                                         _print_waves("Place MFMAs (global tile ids)"))),
@@ -255,6 +269,8 @@ if __name__ == "__main__":
                                         _print_waves("Merge sync (per-wave)",
                                                      show_deps=True,
                                                      show_preops=True))),
+        ("Emit",               lambda: (sched.emit(), None)),
+        ("Emit (dependency order)", lambda: (None, _print_emit_dep_order())),
     ]
 
     for i, (title, run) in enumerate(steps):

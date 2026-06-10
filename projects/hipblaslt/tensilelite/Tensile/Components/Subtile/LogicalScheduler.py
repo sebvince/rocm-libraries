@@ -555,6 +555,7 @@ class LogicalScheduler:
         self._completed: set = set()   # tracks which passes have run (Pass enum members)
         self._partitions: Optional[List[List[SubIterKSlot]]] = None  # shared mutable state across passes
         self._emitted: Optional[List[List[EmittedModule]]] = None
+        self._wave_emitted: Optional[List[List[List[EmittedModule]]]] = None  # per-wave emit view
         self._preloop_emitted: Optional[List[List[List[EmittedModule]]]] = None
         self._ngll_emitted: Optional[List[List[List[EmittedModule]]]] = None
         self._nll_emitted: Optional[List[List[List[EmittedModule]]]] = None
@@ -2763,8 +2764,18 @@ class LogicalScheduler:
         """
         self._ensure_pass(Pass.REMOVE_WAIT_LR_SYNC)
 
+        # Emit every wave; keep wave 0 as self._emitted for backward compat and
+        # the full per-wave view in self._wave_emitted.
+        self._wave_emitted = [self._emit_partitions(self._wave_partitions[w])
+                              for w in range(self.config.numWaves)]
+        self._emitted = self._wave_emitted[0]
+        self._completed.add(Pass.EMIT)
+        return self._emitted
+
+    def _emit_partitions(self, partitions) -> List[List[EmittedModule]]:
+        """Emit one wave's partition grid to [partition][subIterK][EmittedModule]."""
         all_partitions = []
-        for pi, slots in enumerate(self._partitions):
+        for pi, slots in enumerate(partitions):
             partition_emitted = []
             for slot in slots:
                 emitted: List[EmittedModule] = []
@@ -2856,8 +2867,6 @@ class LogicalScheduler:
                 partition_emitted.append(emitted)
             all_partitions.append(partition_emitted)
 
-        self._emitted = all_partitions
-        self._completed.add(Pass.EMIT)
         return all_partitions
 
     def build(self):
