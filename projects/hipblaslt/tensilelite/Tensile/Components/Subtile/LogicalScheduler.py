@@ -2459,13 +2459,22 @@ class LogicalScheduler:
         from Tensile.Components.Subtile.InstructionScheduler import instructionSchedule
         from rocisa.code import Module
 
+        # gfx1250 (HasWmmaArbStallBit) experiment: wider scheduling window —
+        # 6 slots per MFMA interval and up to 2 ds_reads per interval.
+        isGfx1250 = writer.states.archCaps.get("HasWmmaArbStallBit", False)
+        slotsPerInterval = 6 if isGfx1250 else 2
+        maxDsReadsPerInterval = 2 if isGfx1250 else 1
+
         module = Module(label)
         module.addComment0(f"{label} start")
         for pi, partition_emitted in enumerate(emitted_3d):
             for k, em_list in enumerate(partition_emitted):
                 module.addComment0(f"partition={pi} subIterK={k}")
                 if schedule and em_list:
-                    scheduled = instructionSchedule(em_list)
+                    scheduled = instructionSchedule(
+                        em_list,
+                        slotsPerInterval=slotsPerInterval,
+                        maxDsReadsPerInterval=maxDsReadsPerInterval)
                     module.add(scheduled)
                 else:
                     for em in em_list:
