@@ -2449,6 +2449,7 @@ class LogicalScheduler:
         for interleaving. When schedule=False, emits instructions sequentially.
         """
         from Tensile.Components.Subtile.InstructionScheduler import instructionSchedule
+        from Tensile.Components.Subtile.WaitAluInsertion import insertLRSwapWaitAlu
         from rocisa.code import Module
 
         module = Module(label)
@@ -2464,6 +2465,9 @@ class LogicalScheduler:
                         for inst in em.instructions:
                             module.add(inst)
         module.addComment0(f"{label} end")
+        # SCHED_MODE 2: guard the LR offset-swap -> ds_read RAW hazard once, against
+        # the final post-schedule order (no-op on other archs).
+        module = insertLRSwapWaitAlu(module, writer, kernel)
         return module
 
     def emitMainAndExitLoops(self, writer, kernel):
