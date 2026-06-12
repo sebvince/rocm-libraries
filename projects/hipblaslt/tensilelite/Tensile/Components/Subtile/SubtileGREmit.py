@@ -998,6 +998,36 @@ def globalReadLDSBufferSwap(tc, writer, kernel):
 # TDM subtile functions (global offset, descriptor init, StreamK offset)
 ################################################################################
 
+def _tdmSegmentInterleaveWaveId(mod, wIdSgpr, scratchSgpr, numWaves):
+  """Permute wave->LDS-block so even waves fill the low block-half (LDS
+  segment 0) and odd waves fill the high half (segment 1).
+
+  blockId = (wId >> 1) + (wId & 1) * (numWaves // 2)
+    4 waves: w0->0, w1->2, w2->1, w3->3  =>  seg0={w0,w2}, seg1={w1,w3}
+
+  Applied identically to the global-read offset (tdmGlobalOffsetSubtile) and
+  the LDS-write offset (initTDMDescriptorSubtile), so the global->LDS identity
+  map (global row r -> LDS row r) is preserved -- only which wave writes which
+  contiguous block changes. This moves adjacent-id (co-issued) waves onto
+  distinct LDS segments to avoid TDM write-segment conflicts, without touching
+  the local-read consumer.
+
+  No-op unless numWaves is an even multiple >= 4 (otherwise the parity split
+  degenerates to identity).
+  """
+  if numWaves < 4 or numWaves % 2 != 0:
+    return
+  half = numWaves // 2
+  mod.add(SAndB32(dst=sgpr(scratchSgpr), src0=sgpr(wIdSgpr), src1=1,
+                  comment="segIL: parity = wId & 1"))
+  mod.add(SMulI32(dst=sgpr(scratchSgpr), src0=sgpr(scratchSgpr), src1=int(half),
+                  comment=f"segIL: parity * (numWaves/2={half})"))
+  mod.add(SLShiftRightB32(dst=sgpr(wIdSgpr), src=sgpr(wIdSgpr), shiftHex=hex(1),
+                          comment="segIL: wId >> 1"))
+  mod.add(SAddU32(dst=sgpr(wIdSgpr), src0=sgpr(wIdSgpr), src1=sgpr(scratchSgpr),
+                  comment="segIL: blockId = (wId>>1) + parity*half"))
+
+
 def tdmGlobalOffsetSubtile(writer, kernel, tP):
   """Per-wave global address for subtile TDM.
 
@@ -1032,6 +1062,7 @@ def tdmGlobalOffsetSubtile(writer, kernel, tP):
       mod.add(VReadfirstlaneB32(dst=sgpr(waveOff), src=vgpr("Serial"), comment="first tId"))
       mod.add(SLShiftRightB32(dst=sgpr(waveOff), src=sgpr(waveOff),
                                shiftHex=hex(int(ceil(log2(wavelen)))), comment=f"wId = tId / {wavelen}"))
+      _tdmSegmentInterleaveWaveId(mod, waveOff, tmp + 1, numWaves)
       tileStrideSep = writer.strideRef(tc, 3) if tlu else writer.strideRef(tc, ti)
       mod.add(SMulI32(dst=sgpr(waveOff), src0=sgpr(waveOff), src1=int(mt // numWaves * bpe),
                        comment=f"waveOff = waveId * {mt // numWaves} * {bpe}"))
@@ -1106,10 +1137,11 @@ def initTDMDescriptorSubtile(writer, kernel, tP):
   mod.add(comp.setDataType(dtype, descSgprName(1)))
   mod.add(comp.setGlobalAddr(descSgprName(0), f"Address{tc}"))
 
-  with writer.allocTmpSgpr(1) as tmpSgprRes:
+  with writer.allocTmpSgpr(2) as tmpSgprRes:
     waveOffsetSgprIdx = tmpSgprRes.idx
     mod.add(VReadfirstlaneB32(sgpr(waveOffsetSgprIdx), vgpr("Serial"), "first tId"))
     mod.add(SLShiftRightB32(sgpr(waveOffsetSgprIdx), ceil(log2(wavelen)), sgpr(waveOffsetSgprIdx), "wId=fTid // wavelen"))
+    _tdmSegmentInterleaveWaveId(mod, waveOffsetSgprIdx, waveOffsetSgprIdx + 1, numWaves)
     # Each wave writes its mt/numWaves rows to a distinct LDS region,
     # matching the cooperative full-wave global split in
     # tdmGlobalOffsetSubtile. The union over all waves covers the whole
