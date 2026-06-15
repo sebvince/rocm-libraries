@@ -288,6 +288,75 @@ def test_256x256_bf16_gfx1250_tdm_partition_1x1():
     )
 
 
+def make_256x256_bf16_gfx1250_tdm_fused():
+    """Fused A/B variant of make_256x256_bf16_gfx1250_tdm.
+
+    Equivalent CLI: --arch gfx1250 --mt0 256 --mt1 256 --du 64 --dtype bf16
+                    --pgr 2 --wg 2x2 --partition-size 0x0  (fused A/B GR)
+
+    fuseGRAB=True: even waves load A, odd waves load B from a single
+    tensor_load_to_lds per wave. Fusion is emission-only — the scheduler still
+    places both A and B GRs (so dependency/ordering stays per-tensor), but the
+    B GR contributes zero in-flight loads.
+    """
+    cfg = make_256x256_bf16_gfx1250_tdm()
+    cfg.fuseGRAB = True
+    return cfg
+
+
+# Identical to the non-fused TDM baseline EXCEPT the wait_gr count: under
+# fusion the B GR emits no instruction and counts zero in-flight loads, so the
+# wait collapses from wait_gr(A=8,B=8) to wait_gr(A=8). The A/B GR placements
+# and both gr_inc ops remain (fusion is applied at emission, not in the
+# scheduler's dependency graph).
+EXPECTED_EMIT_DEP_ORDER_256x256_BF16_GFX1250_TDM_FUSED = """\
+MAINLOOP (dependency paths):
+  Partition 0:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [0-7] , B : [0-7] <- [5]
+      preMFMA path 0:
+        [ 5] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR A  (MT n, subIterK [1]) [0-7]
+        [ 2] lr         LR B  (MT n, subIterK [1]) [0-7]
+        [ 6] wait_lr    wait_lr
+        [ 7] sync       sync
+        [ 8] gr_inc     gr_inc(A)
+        [ 3] gr         GR A (MT n+2, subIterK [0,1]) ids [0-7]
+        [ 9] gr_inc     gr_inc(B)
+        [ 4] gr         GR B (MT n+2, subIterK [0,1]) ids [0-7]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [0-7] , B : [0-7] <- [3]
+      preMFMA path 0:
+        [ 3] wait_lr    wait_lr
+      path 0:
+        [ 4] wait_gr    wait_gr(A=8)
+        [ 5] sync       sync
+        [ 6] lr_inc     lr_inc(A)
+        [ 7] lr_inc     lr_inc(B)
+        [ 1] lr         LR A  (MT n+1, subIterK [0]) [0-7]
+        [ 2] lr         LR B  (MT n+1, subIterK [0]) [0-7]
+"""
+
+
+def test_256x256_bf16_gfx1250_tdm_fused_partition_1x1():
+    """Exact check of emit dep order for fused A/B (gfx1250+TDM), 1x1 partition.
+
+    Highlights the fused GR: vs the non-fused TDM baseline the only change is
+    the wait_gr count — wait_gr(A=8,B=8) becomes wait_gr(A=8) because the B GR
+    is emission-suppressed and counts zero in-flight tensor_load_to_lds loads.
+    """
+    cfg = make_256x256_bf16_gfx1250_tdm_fused()
+    sched = LogicalScheduler(cfg)
+    sched.emit()
+    actual = sched.print_emit_dep_order()
+    assert actual == EXPECTED_EMIT_DEP_ORDER_256x256_BF16_GFX1250_TDM_FUSED, (
+        f"Emit dependency order mismatch.\n"
+        f"--- Expected ---\n{EXPECTED_EMIT_DEP_ORDER_256x256_BF16_GFX1250_TDM_FUSED}\n"
+        f"--- Actual ---\n{actual}"
+    )
+
+
 def make_320x320_bf16():
     kernel = create_kernel(320, 320, fp4=False, depthU=64)
     tiA = makeTileInfo('A', kernel)
