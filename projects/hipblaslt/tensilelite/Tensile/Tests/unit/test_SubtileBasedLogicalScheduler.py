@@ -3022,3 +3022,34 @@ class TestFuseGRAB:
                             assert counts['B'] == 0, \
                                 f"fused wait_gr must have B=0, got {counts}"
         assert saw_wait_gr, "expected at least one wait_gr preOp to inspect"
+
+    def test_ab_grs_colocated_under_multipartition(self):
+        """Regression: fused A and B GRs must share one partition/slot under
+        multi-partition so the single shared load serves both, placed at the
+        conflict-safe (max) slot to avoid premature double-buffer overwrite."""
+        base = make_cfg_bf16(MT0=256, MT1=256, depthU=64)
+        # Partition count is derived in __post_init__, so partitionSizeM must be
+        # set at construction. Use TDM full-grid GR + fusion, forced to >1 part.
+        cfg = SchedulerConfig(
+            numMFMATilesM=base.numMFMATilesM,
+            numMFMATilesN=base.numMFMATilesN,
+            numSubIterK=base.numSubIterK,
+            lrA=ReadGranularity(mn=1, k=1),
+            lrB=ReadGranularity(mn=1, k=1),
+            grA=ReadGranularity(mn=base.numMFMATilesM, k=base.numSubIterK),
+            grB=ReadGranularity(mn=base.numMFMATilesN, k=base.numSubIterK),
+            grPlacement=GRPlacementStrategy.BUNCHED,
+            partitionSizeM=4,
+            fuseGRAB=True,
+        )
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        assert len(sched._partitions) > 1, "test requires multi-partition"
+        # locate every GR and assert A and B share exactly one partition
+        gr_parts = {}
+        for pi, pslots in enumerate(sched._partitions):
+            for slot in pslots:
+                for gr in slot.grs:
+                    gr_parts.setdefault(gr.tensor, set()).add(pi)
+        assert gr_parts.get('A') == gr_parts.get('B') and len(gr_parts['A']) == 1, \
+            f"fused A/B GRs not co-located: {gr_parts}"

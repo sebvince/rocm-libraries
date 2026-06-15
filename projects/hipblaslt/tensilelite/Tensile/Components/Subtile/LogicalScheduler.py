@@ -1083,6 +1083,7 @@ class LogicalScheduler:
         total_weight = weight_prefix[numSlots]
         slot_boundaries = [p * nAtoms for p in weight_prefix[1:]]
 
+        atom_slots = []
         for i, (tensor, mt_val, ts, te, ks, ke, last) in enumerate(atoms):
             if cfg.grPlacement == GRPlacementStrategy.BUNCHED:
                 # TDM: pin every GR atom to partition 0, subIterK 0.
@@ -1094,7 +1095,28 @@ class LogicalScheduler:
                    self._has_lr_conflict(lower, tensor, mt_val,
                                          slot, ts, te, ks, ke)):
                 slot += 1
-            buckets[slot].append((tensor, mt_val, ts, te, ks, ke))
+            atom_slots.append(slot)
+
+        # Fused A/B: the A and B GRs are a SINGLE shared tensor_load_to_lds
+        # (emitted by the A GR; B emits nothing), so they must be co-located in
+        # one slot. Place them at the MAX of their individually conflict-safe
+        # slots: the conflict-advance places GR(n+2) after the LR(n) reads of
+        # that tensor's double-buffer half (avoiding premature overwrite); the
+        # max is >= each, so it is safe for BOTH halves the shared load writes.
+        # (Forcing slot 0 instead would overwrite a buffer still being read
+        # later in the iteration; splitting them across partitions would leave
+        # the real load after some consumers -> stale data. Both corrupt under
+        # multi-partition.)
+        if cfg.fuseGRAB:
+            slot_by_mt = {}
+            for i, atom in enumerate(atoms):
+                mt_val = atom[1]
+                slot_by_mt[mt_val] = max(slot_by_mt.get(mt_val, 0), atom_slots[i])
+            for i, atom in enumerate(atoms):
+                atom_slots[i] = slot_by_mt[atom[1]]
+
+        for i, (tensor, mt_val, ts, te, ks, ke, last) in enumerate(atoms):
+            buckets[atom_slots[i]].append((tensor, mt_val, ts, te, ks, ke))
 
         # 2c. Remerge consecutive atoms and place into partitions
         for flat, bucket in enumerate(buckets):
