@@ -109,6 +109,7 @@ from .SubtileGREmit import (
     emitSingleBufferLoad, emitSubtileBufferLoad, globalReadDoSubtile,
     globalReadDTLInitCommonSgpr, globalReadLDSBufferSwap, globalReadPtrUpdates,
     tdmGlobalOffsetSubtile, initTDMDescriptorSubtile, tdmApplyStreamKOffsetSubtile,
+    tdmFusedParityMerge,
 )
 from .SubtileLREmit import (
     _emitLocalReadOffset, _emitLocalRead,
@@ -1236,10 +1237,51 @@ def preLoop(writer, kernel):
 # Subroutine entry point for main loop
 #
 #
+def shouldFuseGRAB(kernel):
+  """Eligibility for the fused A/B global read (single TDM per wave).
+
+  Internal gate (no YAML knob): enabled only for the gfx1250 TDM subtile dense
+  same-dtype case that the fused descriptor path supports. Anything else keeps
+  the existing cooperative per-wave load (2 TDMs/wave). This is the "restrict"
+  half of restrict+assert; tdmFusedParityMerge asserts the wave-count invariant.
+
+  Out of scope (first cut), so excluded here:
+    - mixed A/B dtype (descriptor data_size/stride would need per-field parity)
+    - MX scales / sparse (extra operands break the even/odd parity split)
+    - TDMSplit (fused implies exactly one mt/2 load per wave)
+    - StreamK (tdmApplyStreamKOffsetSubtile mutates Address{A,B} post-merge)
+    - odd wave counts (cannot split evenly into A-waves and B-waves)
+  """
+  if not (kernel.get("enableTDMA") and kernel.get("enableTDMB")):
+    return False
+  if not kernel.get("UseSubtileImpl"):
+    return False
+  numWaves = math.prod(kernel["MIWaveGroup"])
+  if numWaves < 2 or (numWaves % 2) != 0:
+    return False
+  pt = kernel["ProblemType"]
+  if pt.get("DataTypeA") != pt.get("DataTypeB"):
+    return False
+  if pt.get("Sparse"):
+    return False
+  if pt.get("MXBlockA") or pt.get("MXBlockB"):
+    return False
+  if kernel.get("TDMSplit"):
+    return False
+  if kernel.get("StreamK"):
+    return False
+  return True
+
+
 def mainLoop(writer, kernel):
   module = Module()
   tensorParametersA = writer.tPA
   tensorParametersB = writer.tPB
+  # Internal gate for fused A/B global read; consumed by the descriptor init
+  # (KernelWriter.kernelBodySubtile), emit_gr / emit_gr_inc, and the ptr update.
+  # kernelBodySubtile sets this before us; recompute defensively for standalone
+  # mainLoop callers (e.g. unit tests).
+  kernel["_fuseGRAB"] = shouldFuseGRAB(kernel)
 
   pgr = kernel["PrefetchGlobalRead"]
   assert pgr in (0, 1, 2), "SubtileBasedKernel only supports PGR=0, PGR=1, and PGR=2, got PGR=%d" % pgr
@@ -1295,6 +1337,7 @@ def mainLoop(writer, kernel):
           partitionSizeN=partSizeN,
           pgr=schedulerPgr,
           grPlacement=grPlacement,
+          fuseGRAB=kernel.get("_fuseGRAB", False),
       )
 
       scheduler = LogicalScheduler(cfg)

@@ -261,3 +261,80 @@ class TestGfx1250SubtileCodegen:
         module = emitSingleBufferLoad(ti, kernel, 0, 0)
         asm = str(module)
         assert "tensor_load_to_lds" in asm
+
+
+# ---------------------------------------------------------------------------
+# Fused A/B global read (single TDM per wave)
+# ---------------------------------------------------------------------------
+
+from contextlib import contextmanager
+
+
+def _add_alloc_tmp_sgpr(writer):
+    """Give the mock writer a minimal allocTmpSgpr context manager."""
+    @contextmanager
+    def _allocTmpSgpr(n, *args, **kwargs):
+        base = writer.sgprPool.checkOut(n, preventOverflow=False)
+        try:
+            yield SimpleNamespace(idx=base)
+        finally:
+            writer.sgprPool.checkIn(base)
+    writer.allocTmpSgpr = _allocTmpSgpr
+
+
+class TestGfx1250FusedGRAB:
+    """Codegen tests for the fused A/B global read path."""
+
+    def test_should_fuse_grab_gating(self):
+        """shouldFuseGRAB enables only the supported gfx1250 dense same-dtype case."""
+        from Tensile.Components.Subtile.Kernel import shouldFuseGRAB
+
+        # Eligible: TDM + subtile + even wave count + same dtype.
+        kernel = _create_gfx1250_kernel(64, 64, mi_wave_group=[2, 2])
+        assert shouldFuseGRAB(kernel) is True
+
+        # Single wave (<2): not eligible.
+        assert shouldFuseGRAB(_create_gfx1250_kernel(64, 64, mi_wave_group=[1, 1])) is False
+
+        # Odd wave count: not eligible.
+        assert shouldFuseGRAB(_create_gfx1250_kernel(64, 64, mi_wave_group=[3, 1])) is False
+
+        # Mixed dtype: not eligible.
+        k_mixed = _create_gfx1250_kernel(64, 64, mi_wave_group=[2, 2])
+        k_mixed["ProblemType"]["DataTypeB"] = _mock_dtype(1)
+        assert shouldFuseGRAB(k_mixed) is False
+
+        # TDMSplit: not eligible (fused implies a single mt/2 load).
+        k_split = _create_gfx1250_kernel(64, 64, mi_wave_group=[2, 2])
+        k_split["TDMSplit"] = True
+        assert shouldFuseGRAB(k_split) is False
+
+        # Non-TDM: not eligible.
+        k_notdm = _create_gfx1250_kernel(64, 64, mi_wave_group=[2, 2])
+        k_notdm["enableTDMA"] = False
+        assert shouldFuseGRAB(k_notdm) is False
+
+    def test_parity_merge_emits_cselect(self):
+        """tdmFusedParityMerge parity-selects all descriptor words + LDS state."""
+        _init_rocisa_gfx1250()
+        from Tensile.Components.Subtile.SubtileGREmit import tdmFusedParityMerge
+        kernel = _create_gfx1250_kernel(64, 64, mi_wave_group=[2, 2])
+        writer, tiA, tiB = _create_writer_gfx1250(kernel)
+        _setup_sgprs(writer)
+        _add_alloc_tmp_sgpr(writer)
+
+        asm = str(tdmFusedParityMerge(writer, kernel))
+        # 4 group0 + 8 group1 + ldsAddr + swapMask = 14 parity selects.
+        assert asm.count("s_cselect_b32") == 14, asm
+        assert "parity = waveId & 1" in asm
+
+    def test_parity_merge_asserts_on_odd_waves(self):
+        """restrict+assert: parity merge rejects an odd wave count."""
+        _init_rocisa_gfx1250()
+        from Tensile.Components.Subtile.SubtileGREmit import tdmFusedParityMerge
+        kernel = _create_gfx1250_kernel(64, 64, mi_wave_group=[3, 1])
+        writer, tiA, tiB = _create_writer_gfx1250(kernel)
+        _setup_sgprs(writer)
+        _add_alloc_tmp_sgpr(writer)
+        with pytest.raises(AssertionError):
+            tdmFusedParityMerge(writer, kernel)

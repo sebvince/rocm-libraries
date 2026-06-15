@@ -25,7 +25,7 @@ from rocisa.enum import RegisterType
 from rocisa.instruction import (
     BufferLoadB128,
     SAddCU32, SAddU32, SAddU64, SAndB32, SMovB32, SMovB64, SMulI32, SNop, SOrB32, SXorB32,
-    SCBranchSCC1, SCmpEQU32, SEndpgm,
+    SCBranchSCC1, SCmpEQU32, SCSelectB32, SEndpgm,
     SLShiftLeftB64, SLShiftRightB32,
     VAddU32, VAndB32, VCmpXEqU32,
     VLShiftLeftB32, VLShiftRightB32, VMovB32,
@@ -523,6 +523,22 @@ def _emitGRLDSSwap_TLU0(tag, tile, ti, writer, kernel):
 def _emitGRPtrUpdate_TLU0(tag, tile, ti, writer, kernel):
   """Advance SRD base pointer by one depthU iteration (depthU * bpe bytes)."""
   tc = ti.tc
+  # Fused A/B: the shared descriptor (tdmAGroup0) holds a per-wave parity-
+  # selected base (A on even waves, B on odd). We cannot re-sync from a single
+  # Address{tc} tracker without clobbering the other parity's base, so advance
+  # the descriptor address in place. Same-dtype scope => depthUBytes is equal
+  # for A and B, so a uniform increment is correct for every wave. The B GR inc
+  # is skipped upstream (InstructionEmitter.emit_gr_inc).
+  if kernel.get("_fuseGRAB", False) and kernel.get("enableTDM%s" % tc, False):
+    module = Module(f"TDM GR Ptr Update fused ({tc})")
+    inc = int(ti.depthUBytes)
+    group0 = "tdm%sGroup0" % tc
+    module.addComment0("TDM fused addr update: %s descriptor += %u" % (tc, inc))
+    module.add(SAddU32(dst=sgpr("%s+2" % group0), src0=sgpr("%s+2" % group0), src1=inc,
+               comment="advance descriptor global addr (lo)"))
+    module.add(SAddCU32(dst=sgpr("%s+3" % group0), src0=sgpr("%s+3" % group0), src1=0,
+               comment="carry (type field bits 31:30 preserved)"))
+    return module
   # TDM path: advance Address{tc} and sync the TDM descriptor instead of SRD.
   if kernel.get("enableTDM%s" % tc, False):
     module = Module(f"TDM GR Ptr Update ({tc})")
@@ -998,7 +1014,7 @@ def globalReadLDSBufferSwap(tc, writer, kernel):
 # TDM subtile functions (global offset, descriptor init, StreamK offset)
 ################################################################################
 
-def tdmGlobalOffsetSubtile(writer, kernel, tP):
+def tdmGlobalOffsetSubtile(writer, kernel, tP, fused=False):
   """Per-wave global address for subtile TDM.
 
   All waves cooperatively load the tile: wave w covers M-rows
@@ -1008,6 +1024,11 @@ def tdmGlobalOffsetSubtile(writer, kernel, tP):
   The LDS tile end-state (identity map global-row r -> LDS-row r) is
   unchanged; the barrier before local reads (WaitGROp has_sync) makes
   every wave's rows visible to all consumers.
+
+  fused=True (gfx1250 fused A/B): only half the waves load this tensor, so
+  the tile is split across numWaves/2 waves and the per-wave half index is
+  waveId>>1 (waves {0,2} -> A halves, {1,3} -> B halves). The caller computes
+  both A and B addresses and parity-selects the live descriptor afterwards.
   """
   tc = tP["tensorChar"]
   ti = tP["idx"]
@@ -1016,7 +1037,10 @@ def tdmGlobalOffsetSubtile(writer, kernel, tP):
   mt = kernel[f"MacroTile{ti}"]
   wavelen = kernel["WavefrontSize"]
   numWaves = prod(kernel["MIWaveGroup"])
-  mod = Module(f"TDM Global Offset Subtile {tc}")
+  # Fused A/B: this tensor is loaded by half the waves, each covering a larger
+  # (mt / (numWaves/2)) row slice indexed by half = waveId>>1.
+  tensorWaves = numWaves // 2 if fused else numWaves
+  mod = Module(f"TDM Global Offset Subtile {tc}{' fused' if fused else ''}")
 
   with writer.allocTmpSgpr(3) as tmpSgprRes:
     tmp = tmpSgprRes.idx
@@ -1032,9 +1056,13 @@ def tdmGlobalOffsetSubtile(writer, kernel, tP):
       mod.add(VReadfirstlaneB32(dst=sgpr(waveOff), src=vgpr("Serial"), comment="first tId"))
       mod.add(SLShiftRightB32(dst=sgpr(waveOff), src=sgpr(waveOff),
                                shiftHex=hex(int(ceil(log2(wavelen)))), comment=f"wId = tId / {wavelen}"))
+      if fused:
+        # half = waveId >> 1: waves {0,1}->half 0, {2,3}->half 1.
+        mod.add(SLShiftRightB32(dst=sgpr(waveOff), src=sgpr(waveOff),
+                                 shiftHex=hex(1), comment="fused A/B: half = waveId >> 1"))
       tileStrideSep = writer.strideRef(tc, 3) if tlu else writer.strideRef(tc, ti)
-      mod.add(SMulI32(dst=sgpr(waveOff), src0=sgpr(waveOff), src1=int(mt // numWaves * bpe),
-                       comment=f"waveOff = waveId * {mt // numWaves} * {bpe}"))
+      mod.add(SMulI32(dst=sgpr(waveOff), src0=sgpr(waveOff), src1=int(mt // tensorWaves * bpe),
+                       comment=f"waveOff = {'half' if fused else 'waveId'} * {mt // tensorWaves} * {bpe}"))
       mod.add(SMulI32(dst=sgpr(waveOff), src0=sgpr(waveOff), src1=tileStrideSep,
                        comment="waveOff *= stride"))
       mod.add(SAddU32(dst=sgpr(tmp), src0=sgpr(tmp), src1=sgpr(waveOff), comment="+= waveOff"))
@@ -1058,14 +1086,20 @@ def tdmGlobalOffsetSubtile(writer, kernel, tP):
   return mod
 
 
-def initTDMDescriptorSubtile(writer, kernel, tP):
-  """Subtile variant of initTDMDescriptor()."""
+def initTDMDescriptorSubtile(writer, kernel, tP, fused=False):
+  """Subtile variant of initTDMDescriptor().
+
+  fused=True (gfx1250 fused A/B): this tensor is loaded by numWaves/2 waves,
+  each covering mt/(numWaves/2) rows indexed by half = waveId>>1. The
+  descriptor is built into its own tdm{tc}Group SGPRs; tdmFusedParityMerge
+  then copies the odd-wave (B) descriptor onto the live A descriptor.
+  """
   from ...Components.TensorDataMover import TensorDataMoverLoad
   comp = TensorDataMoverLoad.find(writer)
   tc = tP['tensorChar']
   ti = tP["idx"]
   tileChar = tP["tileChar"]
-  mod = Module(f"Init TDM Descriptor Subtile {tc}")
+  mod = Module(f"Init TDM Descriptor Subtile {tc}{' fused' if fused else ''}")
 
   def descSgprName(idx):
     assert idx < 2
@@ -1083,6 +1117,8 @@ def initTDMDescriptorSubtile(writer, kernel, tP):
   du = kernel["DepthU"]
   bpe = tP["bpeGR"]
   numWaves = prod(kernel["MIWaveGroup"])
+  # Fused A/B: this tensor is cooperatively loaded by half the waves.
+  tensorWaves = numWaves // 2 if fused else numWaves
   wavelen = kernel["WavefrontSize"]
 
   # Use subtile LDS offsets from writer state (not kernel["LdsOffset{tc}"])
@@ -1110,18 +1146,21 @@ def initTDMDescriptorSubtile(writer, kernel, tP):
     waveOffsetSgprIdx = tmpSgprRes.idx
     mod.add(VReadfirstlaneB32(sgpr(waveOffsetSgprIdx), vgpr("Serial"), "first tId"))
     mod.add(SLShiftRightB32(sgpr(waveOffsetSgprIdx), ceil(log2(wavelen)), sgpr(waveOffsetSgprIdx), "wId=fTid // wavelen"))
-    # Each wave writes its mt/numWaves rows to a distinct LDS region,
-    # matching the cooperative full-wave global split in
-    # tdmGlobalOffsetSubtile. The union over all waves covers the whole
-    # mt-row tile (identity map global-row r -> LDS-row r).
+    if fused:
+      # half = waveId >> 1 (matches tdmGlobalOffsetSubtile fused split).
+      mod.add(SLShiftRightB32(sgpr(waveOffsetSgprIdx), 1, sgpr(waveOffsetSgprIdx), "fused A/B: half = waveId >> 1"))
+    # Each wave writes its mt/tensorWaves rows to a distinct LDS region,
+    # matching the cooperative split in tdmGlobalOffsetSubtile. The union
+    # over all waves covers the whole mt-row tile (identity map global-row
+    # r -> LDS-row r).
     if padIntervalBytes != 0 and padAmountBytes != 0:
-      tileBytes = round(mt // numWaves * du * bpe)
+      tileBytes = round(mt // tensorWaves * du * bpe)
       padBytes = tileBytes // padIntervalBytes * padAmountBytes
       mod.add(SMulI32(sgpr(waveOffsetSgprIdx), sgpr(waveOffsetSgprIdx), tileBytes + padBytes,
-              f"woffset = wId * ({tileBytes}+{padBytes})"))
+              f"woffset = {'half' if fused else 'wId'} * ({tileBytes}+{padBytes})"))
     else:
-      mod.add(SMulI32(sgpr(waveOffsetSgprIdx), sgpr(waveOffsetSgprIdx), round(mt // numWaves * du * bpe),
-              "woffset = wId * (mt // numWaves * du * bpe)"))
+      mod.add(SMulI32(sgpr(waveOffsetSgprIdx), sgpr(waveOffsetSgprIdx), round(mt // tensorWaves * du * bpe),
+              f"woffset = {'half' if fused else 'wId'} * (mt // tensorWaves * du * bpe)"))
     mod.add(SAddU32(sgpr(waveOffsetSgprIdx), sgpr(waveOffsetSgprIdx), ldsConstOffset,
             f"ldsOffset = woffset + {ldsConstOffset} (subtile LDS offset for {tc})"))
     mod.add(comp.setLdsAddr(descSgprName(0), sgpr(waveOffsetSgprIdx)))
@@ -1144,8 +1183,55 @@ def initTDMDescriptorSubtile(writer, kernel, tP):
 
   sizeShifterTile = sizeShifter
   mod.add(comp.setTensorTile0(descSgprName(1), sizeTile0, writer, sizeShifterTile))
-  mod.add(comp.setTensorTile1(descSgprName(1), sizeTile1 // numWaves, writer))
+  mod.add(comp.setTensorTile1(descSgprName(1), sizeTile1 // tensorWaves, writer))
   mod.add(comp.setTensorStride0(descSgprName(1), strideRefName(), sizeShifterTile))
+  return mod
+
+
+def tdmFusedParityMerge(writer, kernel):
+  """Collapse the two fused A/B descriptors into the single live A descriptor.
+
+  Prereq: initTDMDescriptorSubtile(..., fused=True) was called for BOTH A and B,
+  populating tdmAGroup0/1 with A's per-wave (half-split) descriptor and
+  tdmBGroup0/1 with B's. Each wave issues exactly one tensor_load_to_lds against
+  tdmAGroup0/1, so on odd waves we overwrite the A descriptor (and its LDS swap
+  bookkeeping) with B's values. Even waves keep A's. waveId parity therefore
+  selects the tensor: waves {0,2} load A, waves {1,3} load B.
+  """
+  # restrict+assert: shouldFuseGRAB() already restricted enablement to the
+  # supported case; assert the load-bearing invariants here so a mis-derived
+  # flag fails loudly instead of emitting a silently-wrong descriptor.
+  numWaves = prod(kernel["MIWaveGroup"])
+  assert numWaves >= 2 and numWaves % 2 == 0, \
+      f"fused A/B GR requires an even wave count >= 2, got {numWaves}"
+  pt = kernel["ProblemType"]
+  assert pt.get("DataTypeA") == pt.get("DataTypeB"), \
+      "fused A/B GR requires matching A/B data types"
+  assert not kernel.get("TDMSplit"), "fused A/B GR is incompatible with TDMSplit"
+  mod = Module("TDM Fused A/B Parity Merge")
+  wavelen = kernel["WavefrontSize"]
+  with writer.allocTmpSgpr(2) as tmpSgprRes:
+    waveId = tmpSgprRes.idx
+    parity = tmpSgprRes.idx + 1
+    mod.add(VReadfirstlaneB32(dst=sgpr(waveId), src=vgpr("Serial"), comment="first tId"))
+    mod.add(SLShiftRightB32(dst=sgpr(waveId), src=sgpr(waveId),
+                            shiftHex=hex(int(ceil(log2(wavelen)))), comment="waveId = tId / wavelen"))
+    mod.add(SAndB32(dst=sgpr(parity), src0=sgpr(waveId), src1=1, comment="parity = waveId & 1"))
+    mod.add(SCmpEQU32(src0=sgpr(parity), src1=1, comment="SCC = (odd wave -> load B)"))
+
+    # SCSelectB32(dst, src0, src1) = SCC ? src0 : src1  -> odd ? B : A.
+    def _sel(dstName, bName, aName, comment):
+      mod.add(SCSelectB32(dst=sgpr(dstName), src0=sgpr(bName), src1=sgpr(aName), comment=comment))
+
+    for i in range(4):
+      _sel(f"tdmAGroup0+{i}", f"tdmBGroup0+{i}", f"tdmAGroup0+{i}",
+           f"fused: descriptor group0[{i}] = odd ? B : A")
+    for i in range(8):
+      _sel(f"tdmAGroup1+{i}", f"tdmBGroup1+{i}", f"tdmAGroup1+{i}",
+           f"fused: descriptor group1[{i}] = odd ? B : A")
+    # LDS double-buffer bookkeeping used by globalReadLDSBufferSwap (tc='A').
+    _sel("tdmLdsAddrA", "tdmLdsAddrB", "tdmLdsAddrA", "fused: LDS addr tracker = odd ? B : A")
+    _sel("tdmLdsSwapMaskA", "tdmLdsSwapMaskB", "tdmLdsSwapMaskA", "fused: LDS swap mask = odd ? B : A")
   return mod
 
 

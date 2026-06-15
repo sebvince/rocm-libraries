@@ -4570,6 +4570,10 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # slots can serve as temps during those phases.
     if kernel.get("UseSubtileImpl"):
       module.addModuleAsFlatItems(self.defineTdmSgprs(kernel))
+    # Decide fused A/B global read before the TDM descriptor init below; the
+    # scheduler (mainLoop) reads the same flag. shouldFuseGRAB is exported from
+    # Components.Subtile.Kernel via `import *`.
+    kernel["_fuseGRAB"] = shouldFuseGRAB(kernel)
     module.add(self.removeGROffsetsVariableSgprsFromPool(kernel))
     #self.removeSgprVarFromPool("SrdD")
     #self.removeSgprVarFromPool("SrdC")
@@ -4639,7 +4643,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
       module.addComment("Allocating v%s for %s LR"%(str(tileInfo.sharedVgprLROffset), tileInfo.tc))
       module.addComment("Allocating v%s for %s LR Swap"%(str(tileInfo.sharedVgprLROffsetSwap), tileInfo.tc))
 
-    if hasTDM:
+    if hasTDM and kernel.get("_fuseGRAB", False):
+      # Fused A/B: build both half-split descriptors, then parity-merge B onto
+      # the single live A descriptor so each wave issues one tensor_load_to_lds
+      # (even waves -> A, odd waves -> B).
+      module.add(tdmGlobalOffsetSubtile(self, kernel, tensorParametersA, fused=True))
+      module.add(initTDMDescriptorSubtile(self, kernel, tensorParametersA, fused=True))
+      module.add(tdmGlobalOffsetSubtile(self, kernel, tensorParametersB, fused=True))
+      module.add(initTDMDescriptorSubtile(self, kernel, tensorParametersB, fused=True))
+      module.add(tdmFusedParityMerge(self, kernel))
+    elif hasTDM:
       module.add(tdmGlobalOffsetSubtile(self, kernel, tensorParametersA))
       module.add(initTDMDescriptorSubtile(self, kernel, tensorParametersA))
       module.add(tdmGlobalOffsetSubtile(self, kernel, tensorParametersB))

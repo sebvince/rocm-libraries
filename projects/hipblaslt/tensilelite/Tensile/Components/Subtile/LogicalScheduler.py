@@ -165,6 +165,11 @@ class SchedulerConfig:
     partitionSizeN: Union[int, List[int]] = 0  # partition size(s) in N dimension (0 = full dim)
     pgr: int = 2              # Prefetch Global Read
     grPlacement: GRPlacementStrategy = GRPlacementStrategy.SPREAD
+    # Fused A/B global read (gfx1250 TDM subtile): even waves load A, odd waves
+    # load B from a single tensor_load_to_lds per wave. The B GR placement is
+    # kept for dependency/ordering bookkeeping but emits no instruction and
+    # counts zero in-flight loads (the shared A load covers both halves).
+    fuseGRAB: bool = False
 
     # Resolve a partition spec into per-partition sizes along one dimension.
     # spec is either:
@@ -1484,6 +1489,11 @@ class LogicalScheduler:
 
     def _count_gr_atoms(self, gr: GRPlacement) -> int:
         """Count the number of atomic loads for a single GR placement."""
+        # Fused A/B: the B GR emits no instruction (the shared A load on odd
+        # waves covers B), so it contributes zero in-flight tensor_load_to_lds.
+        # Keeping the placement preserves LR(B)->GR(B) ordering/barrier deps.
+        if self.config.fuseGRAB and gr.tensor == 'B':
+            return 0
         gr_gran = self._gr_granularity(gr.tensor)
         tiles = gr.tiles
         n_tile = (tiles.tileId_end - tiles.tileId_start) // gr_gran.mn

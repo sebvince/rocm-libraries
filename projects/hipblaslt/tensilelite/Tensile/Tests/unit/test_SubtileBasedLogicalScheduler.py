@@ -2957,3 +2957,68 @@ class TestBuildTailloopPGR0:
 
         finally:
             sched.deallocVgprTiles(writer)
+
+
+# ══════════════════════════════════════════════════════════════
+# Fused A/B global read (gfx1250 TDM): single TDM per wave
+# ══════════════════════════════════════════════════════════════
+
+class TestFuseGRAB:
+    """Scheduler-level behavior of the fused A/B global read.
+
+    The fused path keeps both A and B GR placements (so per-tensor
+    dependency/ordering/barrier logic is unchanged) but the B GR emits no
+    instruction and must count zero in-flight tensor_load_to_lds loads.
+    """
+
+    def _build(self, fuse):
+        cfg = make_cfg_bf16(MT0=256, MT1=256, depthU=64)
+        cfg.fuseGRAB = fuse
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        return sched
+
+    @staticmethod
+    def _all_grs(sched):
+        return [gr for pslots in sched._partitions
+                for slot in pslots for gr in slot.grs]
+
+    def test_both_ab_grs_still_present(self):
+        """Fusion is emit-only: the scheduler still places A and B GRs."""
+        sched = self._build(fuse=True)
+        tensors = {gr.tensor for gr in self._all_grs(sched)}
+        assert 'A' in tensors, "A GR placement must remain under fusion"
+        assert 'B' in tensors, "B GR placement must remain under fusion"
+
+    def test_b_atoms_zero_when_fused(self):
+        """Fused B GR counts zero in-flight loads; A keeps its real count."""
+        sched = self._build(fuse=True)
+        for gr in self._all_grs(sched):
+            n = sched._count_gr_atoms(gr)
+            if gr.tensor == 'B':
+                assert n == 0, f"fused B GR must count 0 atoms, got {n}"
+            elif gr.tensor == 'A':
+                assert n > 0, f"fused A GR must count >0 atoms, got {n}"
+
+    def test_b_atoms_nonzero_without_fusion(self):
+        """Baseline: without fusion, B GR counts its real (>0) atoms."""
+        sched = self._build(fuse=False)
+        b_atoms = [sched._count_gr_atoms(gr)
+                   for gr in self._all_grs(sched) if gr.tensor == 'B']
+        assert b_atoms and all(n > 0 for n in b_atoms), \
+            f"non-fused B GR must count >0 atoms, got {b_atoms}"
+
+    def test_wait_gr_counts_exclude_b_when_fused(self):
+        """Any wait_gr preOp must report B=0 under fusion (the shared A load
+        is the only in-flight tensor op per wave)."""
+        sched = self._build(fuse=True)
+        saw_wait_gr = False
+        for pslots in sched._partitions:
+            for slot in pslots:
+                for placement in list(slot.lrs) + list(slot.grs):
+                    for kind, _has_sync, counts in _preop_kinds(placement):
+                        if kind == 'wait_gr' and counts is not None:
+                            saw_wait_gr = True
+                            assert counts['B'] == 0, \
+                                f"fused wait_gr must have B=0, got {counts}"
+        assert saw_wait_gr, "expected at least one wait_gr preOp to inspect"

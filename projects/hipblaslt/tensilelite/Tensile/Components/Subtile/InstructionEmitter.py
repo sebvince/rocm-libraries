@@ -185,6 +185,11 @@ class InstructionEmitter:
         """Emit GR (buffer_load) instructions from GRPlacement."""
         module = Module()
         tensor = placement.tensor
+        # Fused A/B: the single shared tensor_load_to_lds is emitted by the A
+        # GR (its descriptor is parity-configured A-on-even / B-on-odd waves).
+        # The B GR emits nothing.
+        if self.kernel.get("_fuseGRAB", False) and tensor == 'B':
+            return list(module.flatitems())
         if tensor in ('A', 'B'):
             ti = self.tileInfoMap[tensor]
             grGran = self.config.grA if tensor == 'A' else self.config.grB
@@ -249,6 +254,10 @@ class InstructionEmitter:
         tensor = source.tensor
         tc = {'A': 'A', 'B': 'B', 'SA': 'MXSA', 'SB': 'MXSB'}.get(tensor, tensor)
         module = Module()
+        # Fused A/B: pointer advance + LDS buffer swap act on the single shared
+        # descriptor (driven by the A GR inc). The B GR inc emits nothing.
+        if self.kernel.get("_fuseGRAB", False) and tensor == 'B':
+            return list(module.flatitems())
         if tensor in ('SA', 'SB'):
             module.add(globalReadScalePtrUpdates(tc, self.writer, self.kernel))
         else:
