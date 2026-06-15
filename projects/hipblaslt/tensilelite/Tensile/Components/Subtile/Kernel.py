@@ -1275,30 +1275,35 @@ def shouldFuseGRAB(kernel):
   return True
 
 
-def shouldSplitLdsSegmentsA(kernel, a0_end, a1_start, seg=65536):
+def shouldSplitLdsSegmentsA(kernel, a0_base, a1_base, seg=65536):
   """Eligibility for the A0-B-A1 LDS layout (gfx1250 segment-conflict avoidance).
 
-  Splits A so SIMDPair0 (A0) and SIMDPair1 (A1) never share a 64KB LDS segment.
-  Builds on fused A/B GR (the A write destination is parity-routed there).
+  Splits A so SIMDPair0 (reads A0) and SIMDPair1 (reads A1) never touch the same
+  64KB LDS segment IN THE SAME CYCLE. Builds on fused A/B GR (the A write
+  destination is parity-routed there).
 
-  First-cut scope (restrict): fused GR on, MIWaveGroup==[2,2], and the gap
-  between A0's end and A1's start spans at least one full 64KB segment:
+  Conflict model: both SIMDPairs read A with the *same per-cycle offset* (one
+  ds_read stream; only the partition base differs). So the two simultaneously
+  live addresses are always exactly delta = a1_base - a0_base apart. Two
+  addresses delta apart share a 64KB segment for some offset iff delta < seg;
+  if delta >= seg they are NEVER co-resident in a segment, for any offset or
+  buffer base. Hence static byte-range overlap of A0 and A1 is fine (the shared
+  bytes are accessed at different cycles) -- only the base-to-base distance
+  matters, and it is buffer-invariant (both halves shift by +ldsTotalSize in
+  buffer 1, leaving delta unchanged).
 
-      a1_start - a0_end >= seg
+  First-cut scope (restrict): fused GR on, MIWaveGroup==[2,2], and:
 
-  Two bytes >= seg apart always fall in different 64KB segments regardless of
-  the buffer's base offset, so this guarantees A0/A1 segment-disjointness in
-  BOTH double buffers (base 0 and base +ldsTotalSize) without requiring
-  ldsTotalSize itself to be segment-aligned (it isn't, once row padding is on).
+      a1_base - a0_base >= seg
 
-  a0_end   : byte offset one past A0 (== A0 content size; A0 base is 0)
-  a1_start : byte offset of A1's base (B sits in [a0_end .. a1_start))
+  a0_base : LDS byte base of A0 (A's region base; 0 in the subtile layout)
+  a1_base : LDS byte base of A1
   """
   if not shouldFuseGRAB(kernel):
     return False
   if list(kernel.get("MIWaveGroup", [])) != [2, 2]:
     return False
-  if (a1_start - a0_end) < seg:
+  if (a1_base - a0_base) < seg:
     return False
   return True
 

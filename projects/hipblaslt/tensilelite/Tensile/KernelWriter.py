@@ -6419,7 +6419,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
       a1Content = aContent - a0Content
       ldsTotalSplit = int(((ldsA1BaseSplit + a1Content + readSize - 1) // readSize) * readSize) \
                       + sizeMXSA + sizeMXSB
-      if shouldSplitLdsSegmentsA(kernel, a0Content, ldsA1BaseSplit):
+      if shouldSplitLdsSegmentsA(kernel, self.ldsStartOffsetA, ldsA1BaseSplit):
         self.ldsStartOffsetB = ldsBBaseSplit
         self.ldsA1Base = ldsA1BaseSplit
         self.ldsTotalSize = ldsTotalSplit
