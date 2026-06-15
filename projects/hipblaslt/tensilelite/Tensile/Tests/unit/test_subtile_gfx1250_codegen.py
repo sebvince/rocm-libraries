@@ -309,6 +309,12 @@ class TestGfx1250FusedGRAB:
         k_split["TDMSplit"] = True
         assert shouldFuseGRAB(k_split) is False
 
+        # StreamK: eligible -- tdmApplyStreamKOffsetSubtile is a no-op assert
+        # (StreamKLocalStart==0), so it composes with the fused descriptor.
+        k_streamk = _create_gfx1250_kernel(64, 64, mi_wave_group=[2, 2])
+        k_streamk["StreamK"] = 3
+        assert shouldFuseGRAB(k_streamk) is True
+
         # Non-TDM: not eligible.
         k_notdm = _create_gfx1250_kernel(64, 64, mi_wave_group=[2, 2])
         k_notdm["enableTDMA"] = False

@@ -1249,8 +1249,12 @@ def shouldFuseGRAB(kernel):
     - mixed A/B dtype (descriptor data_size/stride would need per-field parity)
     - MX scales / sparse (extra operands break the even/odd parity split)
     - TDMSplit (fused implies exactly one mt/2 load per wave)
-    - StreamK (tdmApplyStreamKOffsetSubtile mutates Address{A,B} post-merge)
     - odd wave counts (cannot split evenly into A-waves and B-waves)
+
+  StreamK IS supported: for the subtile TDM path tdmApplyStreamKOffsetSubtile is
+  a no-op runtime assert (StreamK=3 Two-Tile aligns WG starts to tile
+  boundaries, so StreamKLocalStart==0 and Address{A,B}/the descriptor are never
+  offset post-merge), so it composes with the fused descriptor build.
   """
   if not (kernel.get("enableTDMA") and kernel.get("enableTDMB")):
     return False
@@ -1267,8 +1271,6 @@ def shouldFuseGRAB(kernel):
   if pt.get("MXBlockA") or pt.get("MXBlockB"):
     return False
   if kernel.get("TDMSplit"):
-    return False
-  if kernel.get("StreamK"):
     return False
   return True
 
