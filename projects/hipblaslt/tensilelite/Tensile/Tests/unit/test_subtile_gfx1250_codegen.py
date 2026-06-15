@@ -344,3 +344,47 @@ class TestGfx1250FusedGRAB:
         _add_alloc_tmp_sgpr(writer)
         with pytest.raises(AssertionError):
             tdmFusedParityMerge(writer, kernel)
+
+
+class TestGfx1250LdsSegmentSplit:
+    """Gate predicate for the A0-B-A1 segment-conflict layout."""
+
+    SEG = 65536  # 64KB gfx1250 LDS segment
+
+    def test_eligible_gap_spans_segment(self):
+        from Tensile.Components.Subtile.Kernel import shouldSplitLdsSegmentsA
+        k = _create_gfx1250_kernel(256, 256, mi_wave_group=[2, 2], depth_u=128)
+        # Padded case from the real kernel: A0 ends ~34K, A1 starts ~104K -> gap ~70K >= 64K.
+        assert shouldSplitLdsSegmentsA(k, 34816, 104448) is True
+
+    def test_reject_gap_below_segment(self):
+        from Tensile.Components.Subtile.Kernel import shouldSplitLdsSegmentsA
+        k = _create_gfx1250_kernel(256, 256, mi_wave_group=[2, 2], depth_u=128)
+        # B between A0 and A1 is only 32K -> gap < 64K, A0/A1 may share a segment.
+        assert shouldSplitLdsSegmentsA(k, 32768, 65536) is False
+
+    def test_eligible_gap_independent_of_total_alignment(self):
+        """Gap-based gate ignores ldsTotalSize alignment (padding breaks 64K multiples)."""
+        from Tensile.Components.Subtile.Kernel import shouldSplitLdsSegmentsA
+        k = _create_gfx1250_kernel(256, 256, mi_wave_group=[2, 2], depth_u=128)
+        # gap = 96K-32K? no: a0_end=32K, a1_start=98K -> gap 66K >= 64K, regardless of total.
+        assert shouldSplitLdsSegmentsA(k, 32768, 98304) is True
+
+    def test_reject_non_2x2(self):
+        from Tensile.Components.Subtile.Kernel import shouldSplitLdsSegmentsA
+        k = _create_gfx1250_kernel(128, 32, mi_wave_group=[4, 1], depth_u=128)
+        assert shouldSplitLdsSegmentsA(k, 34816, 104448) is False
+
+    def test_reject_when_fusion_off(self):
+        from Tensile.Components.Subtile.Kernel import shouldSplitLdsSegmentsA
+        k = _create_gfx1250_kernel(256, 256, mi_wave_group=[2, 2], depth_u=128)
+        k["enableTDMA"] = False  # disables fused GR eligibility
+        assert shouldSplitLdsSegmentsA(k, 34816, 104448) is False
+
+    def test_a0_a1_land_in_distinct_segments(self):
+        """When eligible, A0 base (0) and A1 base sit in different 64KB segments."""
+        from Tensile.Components.Subtile.Kernel import shouldSplitLdsSegmentsA
+        a0_base, a1_base = 0, 104448
+        k = _create_gfx1250_kernel(256, 256, mi_wave_group=[2, 2], depth_u=128)
+        assert shouldSplitLdsSegmentsA(k, 34816, a1_base) is True
+        assert a0_base // self.SEG != a1_base // self.SEG

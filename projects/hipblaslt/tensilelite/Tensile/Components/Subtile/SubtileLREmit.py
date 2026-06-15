@@ -460,6 +460,11 @@ def _applyWavePartitionLROffset(module, writer, kernel, tileInfo):
     # LDS offset per wave = waveId_axis * (mt / numWavesThisAxis * (du*bpe + pad))
     rowBytes = int(du * bpe) + int(getattr(tileInfo, "ldsRowPadBytes", 0))
     ldsPerWave = int(mt // numWavesThisAxis) * rowBytes
+    # A0-B-A1 segment split: A1 (waveIdM==1) lives past B, not contiguous with
+    # A0, so the per-wave stride is ldsA1Base (== waveIdM * ldsA1Base for the
+    # 2-wave M axis). Only A is split; B keeps its contiguous stride.
+    if tc == 'A' and kernel.get("_ldsSplitA", False):
+      ldsPerWave = int(writer.ldsA1Base)
     tmpSgpr = writer.sgprPool.checkOut(1)
     module.add(SMovB32(dst=sgpr(tmpSgpr), src=hex(ldsPerWave), comment="LDS bytes per wave for %s" % tc))
     module.add(VMulLOU32(dst=vgpr(waveId), src1=vgpr(waveId), src0=sgpr(tmpSgpr), comment="waveOffset"))

@@ -1153,7 +1153,12 @@ def initTDMDescriptorSubtile(writer, kernel, tP, fused=False):
     # matching the cooperative split in tdmGlobalOffsetSubtile. The union
     # over all waves covers the whole mt-row tile (identity map global-row
     # r -> LDS-row r).
-    if padIntervalBytes != 0 and padAmountBytes != 0:
+    if fused and tc == 'A' and kernel.get("_ldsSplitA", False):
+      # A0-B-A1 segment split: half0 -> base 0 (A0), half1 -> ldsA1Base (past B).
+      # woffset = half * ldsA1Base; ldsConstOffset (A base) is 0.
+      mod.add(SMulI32(sgpr(waveOffsetSgprIdx), sgpr(waveOffsetSgprIdx), int(writer.ldsA1Base),
+              f"woffset = half * ldsA1Base({int(writer.ldsA1Base)}) (A0-B-A1 split)"))
+    elif padIntervalBytes != 0 and padAmountBytes != 0:
       tileBytes = round(mt // tensorWaves * du * bpe)
       padBytes = tileBytes // padIntervalBytes * padAmountBytes
       mod.add(SMulI32(sgpr(waveOffsetSgprIdx), sgpr(waveOffsetSgprIdx), tileBytes + padBytes,

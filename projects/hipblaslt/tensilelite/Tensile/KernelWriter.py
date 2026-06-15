@@ -333,6 +333,10 @@ class StateValues:
   ldsStartOffsetB: int                   = -1
   ldsStartOffsetMXSA: int                = -1
   ldsStartOffsetMXSB: int                = -1
+  # gfx1250 segment-conflict split (A0-B-A1 layout): base of the A1 half.
+  # Only meaningful when kernel["_ldsSplitA"] is set; equals ldsStartOffsetA
+  # otherwise.
+  ldsA1Base: int                         = 0
   ldsTotalSize: int                      = 0
 
   dtvKIntervalA: int                     = 1
@@ -6401,6 +6405,25 @@ class KernelWriter(metaclass=abc.ABCMeta):
         self.ldsStartOffsetMXSB = sizeA + sizeB + sizeMXSA
 
       self.ldsTotalSize = sizeA + sizeB + sizeMXSA + sizeMXSB
+      # Default: A is one contiguous block; A1 base coincides with A's base.
+      self.ldsA1Base = self.ldsStartOffsetA
+      kernel["_ldsSplitA"] = False
+
+      # gfx1250 segment-conflict avoidance: split A into A0-B-A1 so SIMDPair0
+      # (A0) and SIMDPair1 (A1) never share a 64KB LDS segment. A-only, built
+      # on fused A/B GR; gated to 2x2 + disjoint-segment cases (else fall back).
+      aContent = int(numASubtiles * aTileInfo.subtileSize + padA)   # mtA * rowBytesA
+      a0Content = aContent // 2
+      ldsBBaseSplit = int(((a0Content + readSize - 1) // readSize) * readSize)
+      ldsA1BaseSplit = ldsBBaseSplit + sizeB
+      a1Content = aContent - a0Content
+      ldsTotalSplit = int(((ldsA1BaseSplit + a1Content + readSize - 1) // readSize) * readSize) \
+                      + sizeMXSA + sizeMXSB
+      if shouldSplitLdsSegmentsA(kernel, a0Content, ldsA1BaseSplit):
+        self.ldsStartOffsetB = ldsBBaseSplit
+        self.ldsA1Base = ldsA1BaseSplit
+        self.ldsTotalSize = ldsTotalSplit
+        kernel["_ldsSplitA"] = True
 
       kernel["LdsNumBytes"] = max(1, int(self.ldsTotalSize * kernel["NumLdsBlk"]))
       if kernel["LdsNumBytes"] > self.states.archCaps["DeviceLDS"]:

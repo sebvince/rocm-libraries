@@ -1275,6 +1275,34 @@ def shouldFuseGRAB(kernel):
   return True
 
 
+def shouldSplitLdsSegmentsA(kernel, a0_end, a1_start, seg=65536):
+  """Eligibility for the A0-B-A1 LDS layout (gfx1250 segment-conflict avoidance).
+
+  Splits A so SIMDPair0 (A0) and SIMDPair1 (A1) never share a 64KB LDS segment.
+  Builds on fused A/B GR (the A write destination is parity-routed there).
+
+  First-cut scope (restrict): fused GR on, MIWaveGroup==[2,2], and the gap
+  between A0's end and A1's start spans at least one full 64KB segment:
+
+      a1_start - a0_end >= seg
+
+  Two bytes >= seg apart always fall in different 64KB segments regardless of
+  the buffer's base offset, so this guarantees A0/A1 segment-disjointness in
+  BOTH double buffers (base 0 and base +ldsTotalSize) without requiring
+  ldsTotalSize itself to be segment-aligned (it isn't, once row padding is on).
+
+  a0_end   : byte offset one past A0 (== A0 content size; A0 base is 0)
+  a1_start : byte offset of A1's base (B sits in [a0_end .. a1_start))
+  """
+  if not shouldFuseGRAB(kernel):
+    return False
+  if list(kernel.get("MIWaveGroup", [])) != [2, 2]:
+    return False
+  if (a1_start - a0_end) < seg:
+    return False
+  return True
+
+
 def mainLoop(writer, kernel):
   module = Module()
   tensorParametersA = writer.tPA
