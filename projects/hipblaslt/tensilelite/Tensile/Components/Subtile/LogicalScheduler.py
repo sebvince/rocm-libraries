@@ -2458,17 +2458,14 @@ class LogicalScheduler:
         """
         from Tensile.Components.Subtile.InstructionScheduler import (
             instructionSchedule,
-            _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT,
-            _MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250,
+            resolveScheduleConfig,
         )
         from Tensile.Components.Subtile.WaitAluInsertion import insertLRSwapWaitAlu,setMatrixAReuse
         from rocisa.code import Module
 
-        # gfx1250 needs a larger ds_read->waitcnt gap.
-        isGfx1250 = writer.states.archCaps.get("HasWmmaArbStallBit", False)
-        minGapDsReadToWait = (_MIN_MFMA_GAP_DS_READ_TO_WAIT_GFX1250
-                              if isGfx1250
-                              else _MIN_MFMA_GAP_DS_READ_TO_WAIT_DEFAULT)
+        # Scheduler knobs (slots/interval, ds_read cap, ds_read->waitcnt gap)
+        # depend on arch + matrix-instruction data type.
+        scheduleConfig = resolveScheduleConfig(writer, kernel)
 
         module = Module(label)
         module.addComment0(f"{label} start")
@@ -2476,7 +2473,7 @@ class LogicalScheduler:
             for k, em_list in enumerate(partition_emitted):
                 module.addComment0(f"partition={pi} subIterK={k}")
                 if schedule and em_list:
-                    scheduled = instructionSchedule(em_list, minGapDsReadToWait=minGapDsReadToWait)
+                    scheduled = instructionSchedule(em_list, config=scheduleConfig)
                     module.add(scheduled)
                 else:
                     for em in em_list:
