@@ -1223,8 +1223,9 @@ def preLoop(writer, kernel):
   for i in range(plr):
     module.addComment("Add correct waits..")
     module.addComment0("Emitting LR to read data loaded by %u-th set of GRs"%(i))
+    # TESTING: temporarily disable LR for B only (keep A).
     module.add(localReadDoSubtile('A', writer, kernel))
-    module.add(localReadDoSubtile('B', writer, kernel))
+    # module.add(localReadDoSubtile('B', writer, kernel))
     # Scale LR in preloop
     module.add(localReadDoScaleSubtile('A', writer, kernel))
     module.add(localReadDoScaleSubtile('B', writer, kernel))
@@ -1275,7 +1276,7 @@ def shouldFuseGRAB(kernel):
   return True
 
 
-def shouldSplitLdsSegmentsA(kernel, a0_base, a1_base, seg=65536):
+def shouldSplitLdsSegmentsA(kernel, a0_base, a1_base, seg=65536, allow_pad_up=False):
   """Eligibility for the A0-B-A1 LDS layout (gfx1250 segment-conflict avoidance).
 
   Splits A so SIMDPair0 (reads A0) and SIMDPair1 (reads A1) never touch the same
@@ -1292,9 +1293,15 @@ def shouldSplitLdsSegmentsA(kernel, a0_base, a1_base, seg=65536):
   matters, and it is buffer-invariant (both halves shift by +ldsTotalSize in
   buffer 1, leaving delta unchanged).
 
-  First-cut scope (restrict): fused GR on, MIWaveGroup==[2,2], and:
+  Scope: fused GR on, MIWaveGroup==[2,2], and the base-to-base distance reaches
+  a full segment:
 
       a1_base - a0_base >= seg
+
+  When allow_pad_up=True the distance check is dropped: the caller guarantees
+  delta >= seg by padding A1's base up to the next segment boundary (the
+  pad-up-to-segment path), so structural eligibility (fused + 2x2) is all that
+  remains to decide here. Budget (LDS fit) is checked by the caller separately.
 
   a0_base : LDS byte base of A0 (A's region base; 0 in the subtile layout)
   a1_base : LDS byte base of A1
@@ -1303,7 +1310,7 @@ def shouldSplitLdsSegmentsA(kernel, a0_base, a1_base, seg=65536):
     return False
   if list(kernel.get("MIWaveGroup", [])) != [2, 2]:
     return False
-  if (a1_base - a0_base) < seg:
+  if not allow_pad_up and (a1_base - a0_base) < seg:
     return False
   return True
 

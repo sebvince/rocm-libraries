@@ -6411,15 +6411,24 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       # gfx1250 segment-conflict avoidance: split A into A0-B-A1 so SIMDPair0
       # (A0) and SIMDPair1 (A1) never share a 64KB LDS segment. A-only, built
-      # on fused A/B GR; gated to 2x2 + disjoint-segment cases (else fall back).
+      # on fused A/B GR; gated to 2x2 + LDS-budget-fits (else fall back).
+      SEG_BYTES = 65536
       aContent = int(numASubtiles * aTileInfo.subtileSize + padA)   # mtA * rowBytesA
       a0Content = aContent // 2
-      ldsBBaseSplit = int(((a0Content + readSize - 1) // readSize) * readSize)
-      ldsA1BaseSplit = ldsBBaseSplit + sizeB
       a1Content = aContent - a0Content
+      ldsBBaseSplit = int(((a0Content + readSize - 1) // readSize) * readSize)
+      naturalA1Base = ldsBBaseSplit + sizeB
+      # Pad-up-to-segment: if the natural A0-B-A1 packing leaves A1's base less
+      # than one full 64KB segment from A0 (e.g. small depthU, where A0+B span
+      # < 64KB), bump A1's base up to the segment boundary so delta >= SEG and
+      # A0/A1 are never co-resident in a segment. Costs a small LDS hole between
+      # B and A1; only applied when the result still fits DeviceLDS.
+      ldsA1BaseSplit = naturalA1Base if naturalA1Base >= SEG_BYTES else SEG_BYTES
       ldsTotalSplit = int(((ldsA1BaseSplit + a1Content + readSize - 1) // readSize) * readSize) \
                       + sizeMXSA + sizeMXSB
-      if shouldSplitLdsSegmentsA(kernel, self.ldsStartOffsetA, ldsA1BaseSplit):
+      splitFits = (ldsTotalSplit * kernel["NumLdsBlk"]) <= self.states.archCaps["DeviceLDS"]
+      if splitFits and shouldSplitLdsSegmentsA(kernel, self.ldsStartOffsetA, ldsA1BaseSplit,
+                                               seg=SEG_BYTES, allow_pad_up=True):
         self.ldsStartOffsetB = ldsBBaseSplit
         self.ldsA1Base = ldsA1BaseSplit
         self.ldsTotalSize = ldsTotalSplit

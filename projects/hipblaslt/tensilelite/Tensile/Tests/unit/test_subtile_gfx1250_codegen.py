@@ -388,3 +388,47 @@ class TestGfx1250LdsSegmentSplit:
         k = _create_gfx1250_kernel(256, 256, mi_wave_group=[2, 2], depth_u=128)
         k["enableTDMA"] = False  # disables fused GR eligibility
         assert shouldSplitLdsSegmentsA(k, 0, 106496) is False
+
+
+class TestGfx1250LdsSegmentSplitPadUp:
+    """Pad-up-to-segment path: small-depthU shapes whose natural A0-B-A1 packing
+    falls short of a 64KB base distance still split, by bumping A1 to the segment
+    boundary (delta guaranteed >= SEG by the caller)."""
+
+    SEG = 65536  # 64KB gfx1250 LDS segment
+
+    def test_pad_up_makes_subsegment_eligible(self):
+        from Tensile.Components.Subtile.Kernel import shouldSplitLdsSegmentsA
+        k = _create_gfx1250_kernel(320, 256, mi_wave_group=[2, 2], depth_u=64)
+        # Natural A1 base ~59904 < SEG would reject on the default path...
+        assert shouldSplitLdsSegmentsA(k, 0, 59904) is False
+        # ...but with pad-up the caller guarantees delta >= SEG, so structural
+        # eligibility (fused + 2x2) is enough.
+        assert shouldSplitLdsSegmentsA(k, 0, 59904, allow_pad_up=True) is True
+
+    def test_pad_up_does_not_bypass_structural_gates(self):
+        from Tensile.Components.Subtile.Kernel import shouldSplitLdsSegmentsA
+        k = _create_gfx1250_kernel(128, 32, mi_wave_group=[4, 1], depth_u=64)
+        assert shouldSplitLdsSegmentsA(k, 0, 59904, allow_pad_up=True) is False
+        k2 = _create_gfx1250_kernel(320, 256, mi_wave_group=[2, 2], depth_u=64)
+        k2["enableTDMA"] = False
+        assert shouldSplitLdsSegmentsA(k2, 0, 59904, allow_pad_up=True) is False
+
+    def test_pad_up_layout_arithmetic_fits_budget(self):
+        """Mirror KernelWriter's pad-up math for the profiled MT320x256x64 kernel:
+        A1 base is bumped 59904 -> 65536, and the padded total fits 160KB."""
+        DeviceLDS = 163840
+        readSize = 32
+        # bf16 (bpe=2), TDM row pad 16B; A=320 rows, B=256 rows, depthU=64.
+        aContent = 320 * 64 * 2 + 16 * 320
+        bContent = 256 * 64 * 2 + 16 * 256
+        sizeB = ((bContent + readSize - 1) // readSize) * readSize
+        a0Content = aContent // 2
+        a1Content = aContent - a0Content
+        ldsBBaseSplit = ((a0Content + readSize - 1) // readSize) * readSize
+        naturalA1Base = ldsBBaseSplit + sizeB
+        ldsA1Base = naturalA1Base if naturalA1Base >= self.SEG else self.SEG
+        ldsTotalSplit = ((ldsA1Base + a1Content + readSize - 1) // readSize) * readSize
+        assert naturalA1Base < self.SEG          # would have been rejected pre-fix
+        assert ldsA1Base == self.SEG             # padded up to the boundary
+        assert ldsTotalSplit <= DeviceLDS        # fits single-buffered (NumLdsBlk=1)
