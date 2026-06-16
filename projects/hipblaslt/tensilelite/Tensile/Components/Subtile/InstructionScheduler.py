@@ -16,7 +16,7 @@ from rocisa.instruction import SWaitCnt, MFMAInstruction, MXMFMAInstruction, \
 class _SlotPlacer:
     """Generic slot placement engine for interleaving instructions between MFMAs.
 
-    Each interval (pair of adjacent MFMAs) has 2 placement slots.
+    Each interval (pair of adjacent MFMAs) has _SLOTS_PER_INTERVAL placement slots.
     Rules are injected via callbacks:
       - validators: (placer, pos, inst) -> bool — reject invalid slots
       - adjusters:  (placer, limit, inst) -> limit — shift search start
@@ -26,7 +26,7 @@ class _SlotPlacer:
     def __init__(self, intervals: int, numModules: int,
                  pathOrders: List[List[int]],
                  validators=None, adjusters=None, onPlace=None):
-        self.totalSlots = intervals * 2
+        self.totalSlots = intervals * _SLOTS_PER_INTERVAL
         self._n = numModules
         self._prevInPath: List[int] = [-1] * numModules
         self._nextInPath: List[int] = [-1] * numModules
@@ -134,8 +134,8 @@ class _SlotPlacer:
         result = Module()
         result.add(mfmas[0])
         for i in range(intervals):
-            for slot in (2 * i, 2 * i + 1):
-                for item in self._placed[slot]:
+            for s in range(_SLOTS_PER_INTERVAL):
+                for item in self._placed[_SLOTS_PER_INTERVAL * i + s]:
                     result.add(item[1])
             result.add(mfmas[i + 1])
         for _, inst in self.leftovers:
@@ -146,7 +146,20 @@ class _SlotPlacer:
 # ── Scheduling rules ──
 
 # Hardcoded gap to hide ds_read latency. TODO: compute this more accurately.
-_MIN_MFMA_GAP_DS_READ_TO_WAIT = 8
+_MIN_MFMA_GAP_DS_READ_TO_WAIT = 10
+
+# Number of placement slots between each pair of adjacent MFMAs (one interval).
+_SLOTS_PER_INTERVAL = 4
+
+# Max ds_read instructions packed into one interval. With _SLOTS_PER_INTERVAL=4
+# and limit-advancing placement, this lands one ds_read per slot.
+_MAX_DS_READ_PER_INTERVAL = 4
+
+def _intervalSlots(placer, pos):
+    """All slot indices belonging to the same interval as `pos`."""
+    base = (pos // _SLOTS_PER_INTERVAL) * _SLOTS_PER_INTERVAL
+    return range(base, min(base + _SLOTS_PER_INTERVAL, placer.totalSlots))
+
 
 _isDsRead = lambda x: isinstance(x, LocalReadInstruction)
 _isBufferLoad = lambda x: isinstance(x, GlobalReadInstruction)
@@ -177,35 +190,37 @@ class _SchedulingRules:
     # ── Validators: (placer, pos, inst) -> bool ──
 
     def oneDsReadPerInterval(self, placer, pos, inst):
-        """At most one ds_read per interval (pair of slots) to avoid same SIMD pair stalls as we have a single codepath"""
+        """At most _MAX_DS_READ_PER_INTERVAL ds_read per interval (_SLOTS_PER_INTERVAL slots).
+
+        Counts ds_reads already placed across all slots of this interval; rejects
+        once the interval is full. (_canPlace separately caps each slot at 2 items.)"""
         if not _isDsRead(inst):
             return True
-        peer = pos ^ 1
-        return not (0 <= peer < placer.totalSlots
-                    and any(_isDsRead(item[1]) for item in placer._placed[peer]))
+        count = sum(1 for s in _intervalSlots(placer, pos)
+                    for item in placer._placed[s] if _isDsRead(item[1]))
+        return count < _MAX_DS_READ_PER_INTERVAL
 
     def minGapDsReadBeforeWait(self, placer, pos, inst):
         """Reject ds_read too close to an already-placed waitcnt ahead."""
         if not _isDsRead(inst):
             return True
-        gap = _MIN_MFMA_GAP_DS_READ_TO_WAIT * 2
+        # gap is in MFMAs; convert to slots via slots-per-interval.
+        gap = _MIN_MFMA_GAP_DS_READ_TO_WAIT * _SLOTS_PER_INTERVAL
         return self.earliestWaitCntPos - pos >= gap
 
     def minGapDsReadToWait(self, placer, pos, inst):
         """Reject waitcnt too close to the last placed ds_read."""
         if not _isWaitCnt(inst) or self.lastDsReadPos < 0:
             return True
-        gap = _MIN_MFMA_GAP_DS_READ_TO_WAIT * 2
+        # gap is in MFMAs; convert to slots via slots-per-interval.
+        gap = _MIN_MFMA_GAP_DS_READ_TO_WAIT * _SLOTS_PER_INTERVAL
         return pos - self.lastDsReadPos >= gap
 
     def noM0WithBufferLoad(self, placer, pos, inst):
         """Avoid placing M0 updates and buffer_loads in the same MFMA interval."""
         if not _isM0Update(inst) and not _isBufferLoad(inst):
             return True
-        peer = pos ^ 1
-        slots = [pos]
-        if 0 <= peer < placer.totalSlots:
-            slots.append(peer)
+        slots = list(_intervalSlots(placer, pos))
         if _isM0Update(inst):
             return not any(_isBufferLoad(item[1]) for s in slots for item in placer._placed[s])
         return not any(_isM0Update(item[1]) for s in slots for item in placer._placed[s])
@@ -362,12 +377,12 @@ def extractPathsFromBeforeDeps(emittedModules) -> Tuple[int, List[List[int]], Li
 
 
 def instructionSchedule(emittedModules):
-    """Interleave non-MFMA instructions between MFMAs using 2 slots/interval.
+    """Interleave non-MFMA instructions between MFMAs using _SLOTS_PER_INTERVAL slots/interval.
 
     Rules:
       - MFMA order is preserved.
-      - Between two adjacent MFMAs there are 2 placement slots.
-      - At most one ds_read (LocalReadInstruction) per interval.
+      - Between two adjacent MFMAs there are _SLOTS_PER_INTERVAL placement slots.
+      - At most _MAX_DS_READ_PER_INTERVAL ds_read (LocalReadInstruction) per interval.
       - Before dependencies are respected at module order level.
       - Minimm distance between ds_read and it waitcnt (hardcoded for now)
       - Module-internal instruction order is preserved.
@@ -404,7 +419,7 @@ def instructionSchedule(emittedModules):
         return result
 
     paths = _classifyPaths(pathOrders, emittedModules)
-    rules = _SchedulingRules(totalSlots=(len(mfmas) - 1) * 2)
+    rules = _SchedulingRules(totalSlots=(len(mfmas) - 1) * _SLOTS_PER_INTERVAL)
     placer = _SlotPlacer(
         len(mfmas) - 1, n, pathOrders,
         validators=[rules.oneDsReadPerInterval, rules.minGapDsReadBeforeWait, rules.minGapDsReadToWait, rules.noM0WithBufferLoad],

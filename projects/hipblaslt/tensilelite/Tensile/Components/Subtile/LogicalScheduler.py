@@ -2507,7 +2507,7 @@ class LogicalScheduler:
         module.addComment0(f"{label} end")
         # SCHED_MODE 2: guard the LR offset-swap -> ds_read RAW hazard once, against
         # the final post-schedule order (no-op on other archs).
-        module = insertLRSwapWaitAlu(module, writer, kernel)
+        # module = insertLRSwapWaitAlu(module, writer, kernel)
         # gfx1250: enable WMMA matrix-A reuse on the final post-schedule order.
         module = setMatrixAReuse(module, writer, kernel)
         return module
