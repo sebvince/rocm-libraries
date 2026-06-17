@@ -22,8 +22,8 @@ GlobalParameters:
   ISA: [[12, 5, 0]]
   PrintSolutionRejectionReason: True
   RotatingBufferSize: 512
-  NumWarmups: 10
-  EnqueuesPerSync: 1000
+  NumWarmups: 100
+  EnqueuesPerSync: 10000
 
 BenchmarkProblems:
   -
