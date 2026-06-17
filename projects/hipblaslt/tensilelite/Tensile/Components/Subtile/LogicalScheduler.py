@@ -170,6 +170,19 @@ class SchedulerConfig:
     # kept for dependency/ordering bookkeeping but emits no instruction and
     # counts zero in-flight loads (the shared A load covers both halves).
     fuseGRAB: bool = False
+    # Overlapping (mirrored) LDS double-buffer for A (gfx1250 320x320 fit). The two
+    # prefetch buffers physically share A's "overlap" rows; to keep that shared
+    # region read-before-write, A is prefetched ONE iteration ahead into the other
+    # buffer (mt1) instead of the default 2-ahead-same-buffer (mt2), and GR(A,mt1)
+    # gets an extra same-iteration (mt_offset=0) dep on LR(A,mt0). Requires A to be
+    # unpartitioned (numPartitionsM==1) so all of A is read early. B is unchanged.
+    overlapDoubleBufferA: bool = False
+    # Number of per-wave A tiles that physically overlap between the two mirrored
+    # buffers (buffer0=B-A, buffer1=A-B). Buffer1's LOW A tiles [0, overlapTilesA)
+    # share LDS bytes with buffer0's HIGH A tiles [numMFMATilesM-overlapTilesA,
+    # numMFMATilesM) — an order-preserving translation by (numMFMATilesM -
+    # overlapTilesA). Used to place the GR(A,mt1)->LR(A,mt0) overlap dep.
+    overlapTilesA: int = 0
 
     # Resolve a partition spec into per-partition sizes along one dimension.
     # spec is either:
@@ -229,6 +242,12 @@ class SchedulerConfig:
         self.offsetPartition = 1 if self.pgr >= 2 else 0
         if self.pgr == 0:
             assert self.numPartitions == 1, "pgr=0 requires numPartitions=1"
+        if self.overlapDoubleBufferA:
+            assert self.pgr == 2, "overlapDoubleBufferA requires pgr=2"
+            assert self.numPartitionsM == 1 and self.numPartitionsN > 1, \
+                ("overlapDoubleBufferA requires A unpartitioned (numPartitionsM==1) "
+                 "and N multi-partitioned (numPartitionsN>1) so all of A is read early; "
+                 f"got M={self.numPartitionsM} N={self.numPartitionsN}")
 
     @property
     def partitionSizesM(self) -> List[int]:
@@ -982,14 +1001,28 @@ class LogicalScheduler:
         # Cross-MT dedup: if a tile/k range appears at both n+1 and n+2,
         # the n+1 load is redundant — the previous iteration's n+2 already
         # wrote the same data into LDS.  Remove the n+1 duplicate.
+        #
+        # overlapDoubleBufferA inverts this for A: A is prefetched 1-ahead into the
+        # *other* (physically overlapping) buffer, so we keep A's n+1 entry and drop
+        # its n+2 duplicate. Every other tensor keeps the default (drop n+1) behavior.
         base_mt = offsetMT
+        n1_keys = {(t, ts, te, ks, ke)
+                   for t, mt, ts, te, ks, ke, _ in gr_list
+                   if mt == base_mt}
         n2_keys = {(t, ts, te, ks, ke)
                    for t, mt, ts, te, ks, ke, _ in gr_list
                    if mt != base_mt}
-        gr_list = [entry for entry in gr_list
-                   if entry[1] != base_mt or
-                   (entry[0], entry[2], entry[3], entry[4], entry[5])
-                   not in n2_keys]
+
+        def _keep(entry):
+            t, mt, ts, te, ks, ke, _ = entry
+            key = (t, ts, te, ks, ke)
+            if self.config.overlapDoubleBufferA and t == 'A':
+                # keep n+1, drop the n+2 duplicate
+                return mt == base_mt or key not in n1_keys
+            # default: keep n+2, drop the n+1 duplicate
+            return mt != base_mt or key not in n2_keys
+
+        gr_list = [entry for entry in gr_list if _keep(entry)]
 
         return gr_list
 
@@ -1025,15 +1058,35 @@ class LogicalScheduler:
                         upper[key] = flat
         return lower, upper
 
-    @staticmethod
-    def _has_lr_conflict(lr_lower, tensor, mt_val, flat,
+    def _has_lr_conflict(self, lr_lower, tensor, mt_val, flat,
                          gr_t_start, gr_t_end, gr_k_start, gr_k_end):
         """Return True if placing GR(mt_val) at flat slot conflicts.
 
         GR(MT n+2) writes the same LDS buffer as MT n, so it conflicts if a
         later LR(MT n) — in flat execution order across all partitions —
         still reads an overlapping tile/subIterK range from that buffer.
+
+        Overlap (A, mt1): GR(A,mt1) writes buffer1, whose LOW tiles
+        [0, overlapTilesA) physically share LDS with buffer0's HIGH tiles
+        (mirror: tile t -> t + (numMFMATilesM - overlapTilesA)). So it must be
+        placed after every later LR(A,mt0) reading those mirrored high tiles,
+        or the prefetch clobbers current-iteration A data still being read.
         """
+        cfg = self.config
+        if (cfg.overlapDoubleBufferA and tensor == 'A' and mt_val == 1
+                and cfg.overlapTilesA > 0):
+            lo = gr_t_start
+            hi = min(gr_t_end, cfg.overlapTilesA)
+            if hi <= lo:
+                return False  # this GR writes no buffer1-overlap (low) tiles
+            off = cfg.numMFMATilesM - cfg.overlapTilesA
+            m_lo, m_hi = lo + off, hi + off  # mirrored buffer0 high-tile range
+            for lr_flat, lr_ts, lr_te, lr_ks, lr_ke in lr_lower.get('A', []):
+                if (lr_flat > flat and
+                        m_lo < lr_te and lr_ts < m_hi and
+                        gr_k_start < lr_ke and lr_ks < gr_k_end):
+                    return True
+            return False
         if mt_val != 2:
             return False
         for lr_flat, lr_ts, lr_te, lr_ks, lr_ke in lr_lower.get(tensor, []):
@@ -1211,6 +1264,35 @@ class LogicalScheduler:
 
         self._completed.add(Pass.DEPS)
 
+    def _add_overlap_a_deps(self, gr: GRPlacement, lr_by_tensor: dict):
+        """Add the GR(A,mt1) -> LR(A,mt0) same-iteration overlap dependency.
+
+        With the mirrored overlap layout, buffer1's low A tiles [0, overlapTilesA)
+        occupy the same LDS bytes as buffer0's high A tiles, translated by
+        off = numMFMATilesM - overlapTilesA  (order-preserving: buffer1 tile t maps
+        to buffer0 tile t+off). So GR(A,mt1) writing tile t (t < overlapTilesA)
+        clobbers buffer0 tile t+off, read this iteration by LR(A,mt0). Emit an
+        mt_offset=0 dep on every k-overlapping LR(A,mt0) in that mirrored range;
+        _dedup_deps then keeps the latest, serializing the write after the read.
+        """
+        cfg = self.config
+        if not (cfg.overlapDoubleBufferA and gr.tensor == 'A'
+                and gr.mtIteration == 1 and cfg.overlapTilesA > 0):
+            return
+        lo = gr.tiles.tileId_start
+        hi = min(gr.tiles.tileId_end, cfg.overlapTilesA)
+        if hi <= lo:
+            return  # this GR writes no buffer1-overlap tiles
+        off = cfg.numMFMATilesM - cfg.overlapTilesA
+        m_lo, m_hi = lo + off, hi + off  # mirrored buffer0 tile range
+        for lr in lr_by_tensor.get('A', []):
+            if lr.mtIteration != 0:
+                continue
+            if (lr.tiles.tileId_start < m_hi and lr.tiles.tileId_end > m_lo and
+                    lr.tiles.subIterK_start < gr.tiles.subIterK_end and
+                    lr.tiles.subIterK_end > gr.tiles.subIterK_start):
+                gr.deps.append(Dep(ref=lr, mt_offset=0))
+
     def _annotate_deps_partition(self, pi: int, slots: List[SubIterKSlot],
                                  cfg: SchedulerConfig, lr_by_data: list,
                                  gr_by_tensor: dict, lr_by_tensor: dict):
@@ -1326,6 +1408,11 @@ class LogicalScheduler:
                     if _range_overlaps(lr.tiles, gr.tiles):
                         mt_off = target_data - lr.mtIteration
                         gr.deps.append(Dep(ref=lr, mt_offset=mt_off))
+                # Overlapping double-buffer (A): GR(A,mt1) writes buffer1, whose LOW
+                # A tiles physically share LDS with buffer0's HIGH A tiles being read
+                # THIS iteration by LR(A,mt0). The clobber is cross-tile (mirror) and
+                # same-iteration (mt_offset=0), which the period-2 rule above misses.
+                self._add_overlap_a_deps(gr, lr_by_tensor)
                 if not gr.deps:
                     raise ValueError(
                         f"GR {gr.tensor} mt={fmt_mt(gr.mtIteration)} at slot {k} "
@@ -2466,14 +2553,25 @@ class LogicalScheduler:
                 SkipOp(compare='LE', value=1, target='NLL'),
             ])
         else:
+            gr_inc_ops = self._make_depops_all_tensors(GRIncOp)
+            mt1_grs = self._make_preloop_mt1_grs()
+            if cfg.overlapDoubleBufferA:
+                # A is prefetched 1-ahead into the other (overlapping) buffer, so it
+                # is NOT primed into buffer1 here: that MT1 write would land on
+                # buffer0's A-high overlap rows that the mainloop hasn't read yet.
+                # Drop A's preloop gr_inc AND A's MT1 prefetch (A keeps write-ptr ==
+                # read-ptr == buffer0); the mainloop/NGLL issue A's first mt1 GR,
+                # ordered after the current-buffer A read. B keeps its 2-ahead prime.
+                gr_inc_ops = [op for op in gr_inc_ops if op.tensor != 'A']
+                mt1_grs = [gr for gr in mt1_grs if gr.tensor != 'A']
             emitted = self._to_emitted([
                 *self._make_gr_all_tensors(0, all_tiles),
-                *self._make_depops_all_tensors(GRIncOp),
+                *gr_inc_ops,
                 WaitGROp(wait_gr_counts=WaitGRCounts()),
                 SyncOp(),
                 *self._make_lr_all_tensors(lr_tiles),
                 SkipOp(compare='LE', value=1, target='NLL'),
-                *self._make_preloop_mt1_grs(),
+                *mt1_grs,
                 SkipOp(compare='LE', value=2, target='NGLL'),
             ])
 

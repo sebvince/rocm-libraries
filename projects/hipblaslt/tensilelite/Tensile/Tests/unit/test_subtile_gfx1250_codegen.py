@@ -388,3 +388,87 @@ class TestGfx1250LdsSegmentSplit:
         k = _create_gfx1250_kernel(256, 256, mi_wave_group=[2, 2], depth_u=128)
         k["enableTDMA"] = False  # disables fused GR eligibility
         assert shouldSplitLdsSegmentsA(k, 0, 106496) is False
+
+
+class TestGfx1250OverlapDoubleBuffer:
+    """Gate + geometry for the mirrored overlap LDS double-buffer (A)."""
+
+    def test_should_overlap_gating(self):
+        from Tensile.Components.Subtile.Kernel import shouldOverlapDoubleBufferA
+
+        # Eligible: gfx1250 TDM + 2x2 + PGR=2 + not segment-split.
+        k = _create_gfx1250_kernel(320, 320, mi_wave_group=[2, 2], depth_u=128)
+        k["PrefetchGlobalRead"] = 2
+        assert shouldOverlapDoubleBufferA(k) is True
+
+        # PGR != 2: not eligible (overlap needs the 2-buffer prefetch).
+        k_pgr1 = dict(k); k_pgr1["PrefetchGlobalRead"] = 1
+        assert shouldOverlapDoubleBufferA(k_pgr1) is False
+
+        # Segment-split on: mutually exclusive (first cut).
+        k_split = dict(k); k_split["_ldsSplitA"] = True
+        assert shouldOverlapDoubleBufferA(k_split) is False
+
+        # Non-2x2: not eligible.
+        k_4x1 = _create_gfx1250_kernel(128, 32, mi_wave_group=[4, 1], depth_u=128)
+        k_4x1["PrefetchGlobalRead"] = 2
+        assert shouldOverlapDoubleBufferA(k_4x1) is False
+
+        # Fusion off (TDM off): not eligible.
+        k_notdm = dict(k); k_notdm = _create_gfx1250_kernel(320, 320, [2, 2], 128)
+        k_notdm["PrefetchGlobalRead"] = 2
+        k_notdm["enableTDMA"] = False
+        assert shouldOverlapDoubleBufferA(k_notdm) is False
+
+        # MacroTile0 > MacroTile1 (M > N): heuristic would split A, but overlap
+        # needs A unpartitioned -> not eligible.
+        k_tall = _create_gfx1250_kernel(320, 256, mi_wave_group=[2, 2], depth_u=128)
+        k_tall["PrefetchGlobalRead"] = 2
+        assert shouldOverlapDoubleBufferA(k_tall) is False
+
+        # MacroTile1 >= MacroTile0 (N >= M): eligible (heuristic splits N only).
+        k_wide = _create_gfx1250_kernel(256, 320, mi_wave_group=[2, 2], depth_u=128)
+        k_wide["PrefetchGlobalRead"] = 2
+        assert shouldOverlapDoubleBufferA(k_wide) is True
+
+    def test_overlap_layout_320x320x128(self):
+        """Exact geometry for the test1250_320.yaml target. buffer0=B-A, buffer1=A-B;
+        the union must fit in 320KB, Δ_A must be a whole number of rows, and
+        buffer0's A-content high must coincide with buffer1's A-content low."""
+        from Tensile.Components.Subtile.Kernel import computeOverlapLayoutA
+        # 320x320x128 bf16: rowBytes=272, aContent=320*272=87040,
+        # sizeA=sizeB=roundup(87040, readSize=4096-ish)=90112, MI_M=16, LDS=320KB.
+        sizeA = sizeB = 90112
+        aContent = 87040
+        rowBytesA = 272
+        maxLDS = 327680
+        r = computeOverlapLayoutA(sizeA, sizeB, aContent, rowBytesA, 16, maxLDS)
+        assert r is not None
+        assert r["ldsStartOffsetA"] == sizeB          # buffer0 = B-A
+        assert r["ldsStartOffsetB"] == 0
+        # union fits in LDS (the whole point) and is the minimal tile-aligned fit.
+        assert r["ldsNumBytes"] <= maxLDS
+        assert 2 * (sizeA + sizeB) > maxLDS            # would overflow without overlap
+        # Δ_A must be a whole number of rows so the mirror is byte-correct.
+        assert r["deltaA"] % rowBytesA == 0
+        assert r["deltaA"] == aContent - r["overlapTilesA"] * 16 * rowBytesA
+        # buffer0 A-content high coincides buffer1 A-content low.
+        overlapBytes = r["overlapTilesA"] * 16 * rowBytesA
+        assert r["ldsStartOffsetA"] + aContent - overlapBytes == r["buffer1Base"]
+        # B stays disjoint: overlap may not exceed A's content.
+        assert overlapBytes <= aContent
+        # deltaB places buffer1's B region just past buffer1's A region.
+        assert r["deltaB"] == r["buffer1Base"] + sizeA
+
+    def test_overlap_layout_none_when_fits(self):
+        """No overlap when a plain disjoint double-buffer already fits."""
+        from Tensile.Components.Subtile.Kernel import computeOverlapLayoutA
+        # 2*total <= maxLDS -> None.
+        assert computeOverlapLayoutA(40960, 40960, 38912, 272, 16, 327680) is None
+
+    def test_overlap_layout_none_when_infeasible(self):
+        """No overlap when even fully overlapping A's content cannot fit."""
+        from Tensile.Components.Subtile.Kernel import computeOverlapLayoutA
+        # total <= maxLDS but the needed overlap would exceed A's content.
+        # sizeA tiny vs sizeB huge: overlapping all of A can't shed enough.
+        assert computeOverlapLayoutA(8192, 200704, 8160, 272, 16, 327680) is None

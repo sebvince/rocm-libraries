@@ -1172,12 +1172,14 @@ def initTDMDescriptorSubtile(writer, kernel, tP, fused=False):
     # Save LDS offset to tracking SGPR for runtime double-buffer swap
     ldsTrackSgpr = f"tdmLdsAddr{tc}"
     mod.add(SMovB32(dst=sgpr(ldsTrackSgpr), src=sgpr(waveOffsetSgprIdx), comment=f"init {ldsTrackSgpr} for buffer tracking"))
-    # Compute swap mask: swapMask = addr XOR (addr + ldsTotalSize)
+    # Compute swap mask: swapMask = addr XOR (addr + swapDelta)
     # Used by globalReadLDSBufferSwap to toggle between buffer 0 and buffer 1.
+    # swapDelta is per-tensor: ldsTotalSize for the default disjoint double-buffer,
+    # or the mirrored-overlap delta (ldsSwapDelta{tc}) when overlap is enabled.
     swapMaskSgpr = f"tdmLdsSwapMask{tc}"
-    ldsTotalSize = writer.ldsTotalSize
-    mod.add(SAddU32(dst=sgpr(swapMaskSgpr), src0=sgpr(waveOffsetSgprIdx), src1=ldsTotalSize, comment=f"addr + ldsTotalSize({ldsTotalSize})"))
-    mod.add(SXorB32(dst=sgpr(swapMaskSgpr), src0=sgpr(waveOffsetSgprIdx), src1=sgpr(swapMaskSgpr), comment=f"swapMask = addr XOR (addr + ldsTotalSize)"))
+    swapDelta = getattr(writer, f"ldsSwapDelta{tc}", writer.ldsTotalSize)
+    mod.add(SAddU32(dst=sgpr(swapMaskSgpr), src0=sgpr(waveOffsetSgprIdx), src1=swapDelta, comment=f"addr + swapDelta({swapDelta})"))
+    mod.add(SXorB32(dst=sgpr(swapMaskSgpr), src0=sgpr(waveOffsetSgprIdx), src1=sgpr(swapMaskSgpr), comment=f"swapMask = addr XOR (addr + swapDelta)"))
   sizeShifter = 1 if dtype.isFloat4() else 0
   sizeShifterDim = sizeShifter
 

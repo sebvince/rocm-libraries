@@ -3053,3 +3053,114 @@ class TestFuseGRAB:
                     gr_parts.setdefault(gr.tensor, set()).add(pi)
         assert gr_parts.get('A') == gr_parts.get('B') and len(gr_parts['A']) == 1, \
             f"fused A/B GRs not co-located: {gr_parts}"
+
+
+class TestOverlapDoubleBufferA:
+    """Overlapping (mirrored) LDS double-buffer for A (gfx1250 320x320 fit).
+
+    A is prefetched 1-ahead into the other (physically overlapping) buffer (mt1)
+    instead of 2-ahead-same-buffer (mt2). The mirrored layout makes buffer1's LOW
+    A tiles share LDS with buffer0's HIGH A tiles, so GR(A,mt1) on the low tiles
+    must wait for THIS iteration's LR(A,mt0) on the mirrored high tiles
+    (mt_offset=0). See lds_overlap_double_buffer_plan.md.
+    """
+
+    # 320x320x128 bf16 gfx1250 2x2: per-wave M tiles = 10, subIterK = 4,
+    # N-split (A unpartitioned), tile-aligned overlap = 5 per-wave tiles.
+    def _cfg(self, overlap):
+        return SchedulerConfig(
+            numMFMATilesM=10, numMFMATilesN=10, numSubIterK=4,
+            lrA=ReadGranularity(mn=1, k=1), lrB=ReadGranularity(mn=1, k=1),
+            grA=ReadGranularity(mn=1, k=2), grB=ReadGranularity(mn=1, k=2),
+            partitionSizeM=10, partitionSizeN=5, pgr=2,
+            overlapDoubleBufferA=overlap, overlapTilesA=5 if overlap else 0)
+
+    def _gr_mts(self, sched, tensor):
+        return {gr.mtIteration
+                for slots in sched._partitions for slot in slots
+                for gr in slot.grs if gr.tensor == tensor}
+
+    def test_a_rerouted_to_mt1(self):
+        """With the flag, every A GR is 1-ahead (mt1); B is unchanged (keeps mt2)."""
+        sched = LogicalScheduler(self._cfg(True))
+        sched.place_LRs(); sched.assign_vgpr_tiles(); sched.place_GRs()
+        assert self._gr_mts(sched, 'A') == {1}, "A must be prefetched 1-ahead (mt1)"
+        assert 2 in self._gr_mts(sched, 'B'), "B must keep its 2-ahead (mt2) GR"
+
+    def test_default_keeps_a_at_mt2(self):
+        """Without the flag, A keeps the default 2-ahead-same-buffer (mt2)."""
+        sched = LogicalScheduler(self._cfg(False))
+        sched.place_LRs(); sched.assign_vgpr_tiles(); sched.place_GRs()
+        assert self._gr_mts(sched, 'A') == {2}, "default A must be 2-ahead (mt2)"
+
+    def test_overlap_dep_edge(self):
+        """GR(A,mt1) on overlap (low) tiles gets a same-iteration (mt_offset=0)
+        dep on LR(A,mt0); GR(A,mt1) on non-overlap (high) tiles does not."""
+        cfg = self._cfg(True)
+        sched = LogicalScheduler(cfg)
+        sched.place_LRs(); sched.assign_vgpr_tiles()
+        sched.place_GRs(); sched.annotate_deps()
+
+        low_seen = high_seen = False
+        for slots in sched._partitions:
+            for slot in slots:
+                for gr in slot.grs:
+                    if gr.tensor != 'A':
+                        continue
+                    assert gr.mtIteration == 1
+                    mt0_deps = [d for d in gr.deps
+                                if isinstance(d.ref, LRPlacement)
+                                and d.ref.tensor == 'A'
+                                and d.ref.mtIteration == 0]
+                    has_same_iter = any(d.mt_offset == 0 for d in mt0_deps)
+                    if gr.tiles.tileId_start < cfg.overlapTilesA:
+                        # writes buffer1's overlap (low) tiles -> needs the edge
+                        low_seen = True
+                        assert has_same_iter, (
+                            f"overlap GR A tile[{gr.tiles.tileId_start}:"
+                            f"{gr.tiles.tileId_end}] missing mt_offset=0 dep")
+                    else:
+                        # non-overlap (high) tiles -> bulk prev-iter dep only
+                        high_seen = True
+                        assert not has_same_iter, (
+                            f"non-overlap GR A tile[{gr.tiles.tileId_start}:"
+                            f"{gr.tiles.tileId_end}] should not have mt_offset=0 dep")
+        assert low_seen and high_seen, "test must exercise both low and high A GRs"
+
+    def test_overlap_dep_targets_mirrored_high_tiles(self):
+        """The mt_offset=0 dep of a low-tile GR points at an LR(A,mt0) whose tile
+        range covers the mirrored high tiles (low + (numMFMATilesM-overlapTilesA))."""
+        cfg = self._cfg(True)
+        sched = LogicalScheduler(cfg)
+        sched.place_LRs(); sched.assign_vgpr_tiles()
+        sched.place_GRs(); sched.annotate_deps()
+        off = cfg.numMFMATilesM - cfg.overlapTilesA
+        checked = False
+        for slots in sched._partitions:
+            for slot in slots:
+                for gr in slot.grs:
+                    if gr.tensor != 'A' or gr.tiles.tileId_start >= cfg.overlapTilesA:
+                        continue
+                    m_lo = gr.tiles.tileId_start + off
+                    m_hi = min(gr.tiles.tileId_end, cfg.overlapTilesA) + off
+                    for d in gr.deps:
+                        if d.mt_offset != 0:
+                            continue
+                        lr = d.ref
+                        assert (lr.tiles.tileId_start < m_hi
+                                and lr.tiles.tileId_end > m_lo), (
+                            f"dep LR tile[{lr.tiles.tileId_start}:{lr.tiles.tileId_end}]"
+                            f" does not cover mirrored range [{m_lo}:{m_hi}]")
+                        checked = True
+        assert checked, "no overlap dep was checked"
+
+    def test_requires_a_unpartitioned(self):
+        """overlapDoubleBufferA must reject M-partitioned (A-split) configs."""
+        import pytest
+        with pytest.raises(AssertionError):
+            SchedulerConfig(
+                numMFMATilesM=10, numMFMATilesN=10, numSubIterK=4,
+                lrA=ReadGranularity(mn=1, k=1), lrB=ReadGranularity(mn=1, k=1),
+                grA=ReadGranularity(mn=1, k=2), grB=ReadGranularity(mn=1, k=2),
+                partitionSizeM=5, partitionSizeN=5, pgr=2,
+                overlapDoubleBufferA=True, overlapTilesA=5)

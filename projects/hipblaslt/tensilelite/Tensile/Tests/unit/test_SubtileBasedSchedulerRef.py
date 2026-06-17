@@ -1647,3 +1647,236 @@ def test_320x320_bf16_preloop_1x5_offset_all():
         f"--- Expected ---\n{EXPECTED_PRELOOP_320x320_BF16_1x5_OFFSET_ALL}\n"
         f"--- Actual ---\n{actual}"
     )
+
+
+def make_320x320_bf16_gfx1250_tdm_overlap():
+    """Overlapping (mirrored) LDS double-buffer variant of make_320x320_bf16_gfx1250_tdm,
+    at the test1250_320.yaml target (du=128 -> numSubIterK=4).
+
+    Equivalent CLI: --arch gfx1250 --mt0 320 --mt1 320 --du 128 --dtype bf16
+                    --pgr 2 --wg 2x2 --partition-size 0x2  (+ overlap double-buffer A)
+
+    Identical to the non-overlap TDM builder (whole-MT TDM GR granularity:
+    mn=localMMATileGrid[0], k=localMMATileGrid[1]) except overlapDoubleBufferA is on.
+    That reroutes A from 2-ahead-same-buffer (mt2) to 1-ahead into the other,
+    physically overlapping buffer (mt1); the mirrored buffers share overlapTilesA=7
+    per-wave A tiles, so GR(A,mt1) waits for THIS iteration's LR(A,mt0) on the
+    mirrored high tiles. A is unpartitioned (1x5: N-split only) so all of A is read
+    early; B is unchanged (stays mt2). See lds_overlap_double_buffer_plan.md.
+    """
+    kernel = create_kernel(320, 320, fp4=False, depthU=128)
+    kernel["enableTDMA"] = True
+    kernel["enableTDMB"] = True
+    tiA = makeTileInfo('A', kernel)
+    tiB = makeTileInfo('B', kernel)
+    return SchedulerConfig(
+        numMFMATilesM=tiA.localMMATileGrid[0],
+        numMFMATilesN=tiB.localMMATileGrid[0],
+        numSubIterK=tiA.localMMATileGrid[1],
+        lrA=ReadGranularity(mn=1, k=1),
+        lrB=ReadGranularity(mn=1, k=1),
+        grA=ReadGranularity(mn=tiA.localMMATileGrid[0], k=tiA.localMMATileGrid[1]),
+        grB=ReadGranularity(mn=tiB.localMMATileGrid[0], k=tiB.localMMATileGrid[1]),
+        partitionSizeN=2,
+        grPlacement=GRPlacementStrategy.BUNCHED,
+        overlapDoubleBufferA=True,
+        overlapTilesA=7,  # computeOverlapLayoutA() for du=128 320x320 (see Kernel.py)
+    )
+
+
+# Diff against the non-overlap baseline (same builder, no overlap flag): the whole-MT
+# TDM "GR A (MT n+2, subIterK [0,3]) ids [0-9]" becomes "GR A (MT n+1, ...)" (A
+# prefetched 1-ahead into the other buffer); B keeps "GR B (MT n+2, ...)".
+EXPECTED_EMIT_DEP_ORDER_320x320_BF16_GFX1250_TDM_OVERLAP_1x5 = """\
+MAINLOOP (dependency paths):
+  Partition 0:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [0-9] , B : [0-1] <- [4]
+      preMFMA path 0:
+        [ 4] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR A  (MT n, subIterK [1]) [0-9]
+        [ 2] lr         LR B  (MT n, subIterK [1]) [0-1]
+      path 1:
+        [ 5] sync       sync
+        [ 6] gr_inc     gr_inc(A)
+        [ 3] gr         GR A (MT n+1, subIterK [0,3]) ids [0-9]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [0-9] , B : [0-1] <- [3]
+      preMFMA path 0:
+        [ 3] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR A  (MT n, subIterK [2]) [0-9]
+        [ 2] lr         LR B  (MT n, subIterK [2]) [0-1]
+    subIterK=2:
+      MFMA: [ 0] MFMAs (MT n, subIterK 2  ) A : [0-9] , B : [0-1] <- [3]
+      preMFMA path 0:
+        [ 3] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR A  (MT n, subIterK [3]) [0-9]
+        [ 2] lr         LR B  (MT n, subIterK [3]) [0-1]
+    subIterK=3:
+      MFMA: [ 0] MFMAs (MT n, subIterK 3  ) A : [0-9] , B : [0-1] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [0]) [2-3]
+  Partition 1:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [0-9] , B : [2-3] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [1]) [2-3]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [0-9] , B : [2-3] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [2]) [2-3]
+    subIterK=2:
+      MFMA: [ 0] MFMAs (MT n, subIterK 2  ) A : [0-9] , B : [2-3] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [3]) [2-3]
+    subIterK=3:
+      MFMA: [ 0] MFMAs (MT n, subIterK 3  ) A : [0-9] , B : [2-3] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [0]) [4-5]
+  Partition 2:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [0-9] , B : [4-5] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [1]) [4-5]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [0-9] , B : [4-5] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [2]) [4-5]
+    subIterK=2:
+      MFMA: [ 0] MFMAs (MT n, subIterK 2  ) A : [0-9] , B : [4-5] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [3]) [4-5]
+    subIterK=3:
+      MFMA: [ 0] MFMAs (MT n, subIterK 3  ) A : [0-9] , B : [4-5] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [0]) [6-7]
+  Partition 3:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [0-9] , B : [6-7] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [1]) [6-7]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [0-9] , B : [6-7] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [2]) [6-7]
+    subIterK=2:
+      MFMA: [ 0] MFMAs (MT n, subIterK 2  ) A : [0-9] , B : [6-7] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [3]) [6-7]
+    subIterK=3:
+      MFMA: [ 0] MFMAs (MT n, subIterK 3  ) A : [0-9] , B : [6-7] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [0]) [8-9]
+  Partition 4:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [0-9] , B : [8-9] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [1]) [8-9]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [0-9] , B : [8-9] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [2]) [8-9]
+    subIterK=2:
+      MFMA: [ 0] MFMAs (MT n, subIterK 2  ) A : [0-9] , B : [8-9] <- [3]
+      preMFMA path 0:
+        [ 3] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [3]) [8-9]
+        [ 4] wait_lr    wait_lr
+        [ 5] sync       sync
+        [ 6] gr_inc     gr_inc(B)
+        [ 2] gr         GR B (MT n+2, subIterK [0,3]) ids [0-9]
+    subIterK=3:
+      MFMA: [ 0] MFMAs (MT n, subIterK 3  ) A : [0-9] , B : [8-9] <- [3]
+      preMFMA path 0:
+        [ 3] wait_lr    wait_lr
+      path 0:
+        [ 4] wait_gr    wait_gr(B=1)
+        [ 5] sync       sync
+        [ 6] lr_inc     lr_inc(A)
+        [ 7] lr_inc     lr_inc(B)
+        [ 1] lr         LR A  (MT n+1, subIterK [0]) [0-9]
+        [ 2] lr         LR B  (MT n+1, subIterK [0]) [0-1]
+"""
+
+
+def test_320x320_bf16_gfx1250_tdm_overlap_1x5():
+    """Exact check of emit dep order for the 320x320 gfx1250+TDM overlapping
+    (mirrored) double-buffer case (A prefetched 1-ahead / mt1, whole-MT TDM GR)."""
+    cfg = make_320x320_bf16_gfx1250_tdm_overlap()
+    sched = LogicalScheduler(cfg)
+    sched.emit()
+    actual = sched.print_emit_dep_order()
+    assert actual == EXPECTED_EMIT_DEP_ORDER_320x320_BF16_GFX1250_TDM_OVERLAP_1x5, (
+        f"Emit dependency order mismatch.\n"
+        f"--- Expected ---\n{EXPECTED_EMIT_DEP_ORDER_320x320_BF16_GFX1250_TDM_OVERLAP_1x5}\n"
+        f"--- Actual ---\n{actual}"
+    )
+
+
+# Overlap preloop: A is prefetched 1-ahead, so (vs the disjoint baseline
+# EXPECTED_PRELOOP_320x320_BF16_1x5_OFFSET1) A's preloop gr_inc and A's MT1
+# prefetch are DROPPED -- only gr_inc(B) and "GR B (MT n+1)" remain. A's first
+# mt1 GR is issued by the mainloop/NGLL, ordered after the current A read.
+EXPECTED_PRELOOP_320x320_BF16_GFX1250_TDM_OVERLAP_1x5 = """\
+MAINLOOP:
+  Partition 0:
+    subIterK=0:
+      [ 0] gr         GR A (MT n, subIterK [0,3]) ids [0-9]
+      [ 1] gr         GR B (MT n, subIterK [0,3]) ids [0-9]
+      [ 2] gr_inc     gr_inc(B)
+      [ 3] wait_gr    wait_gr(0)
+      [ 4] sync       sync
+      [ 5] lr         LR A  (MT n, subIterK [0]) [0-9]
+      [ 6] lr         LR B  (MT n, subIterK [0]) [0-1]
+      [ 7] skip       skip(LE:1:NLL)
+      [ 8] gr         GR B (MT n+1, subIterK [0,3]) ids [0-9]
+      [ 9] skip       skip(LE:2:NGLL)
+"""
+
+
+def test_320x320_bf16_gfx1250_tdm_overlap_preloop_1x5():
+    """Exact check of the overlap-mode preloop: A is NOT primed into buffer1
+    (1-ahead), so A's gr_inc and MT1 prefetch are absent; B keeps its 2-ahead prime."""
+    cfg = make_320x320_bf16_gfx1250_tdm_overlap()
+    sched = LogicalScheduler(cfg)
+    sched.emit()
+    actual = sched.print_emit(sched.build_preloop())
+    assert actual == EXPECTED_PRELOOP_320x320_BF16_GFX1250_TDM_OVERLAP_1x5, (
+        f"Preloop mismatch.\n"
+        f"--- Expected ---\n{EXPECTED_PRELOOP_320x320_BF16_GFX1250_TDM_OVERLAP_1x5}\n"
+        f"--- Actual ---\n{actual}"
+    )

@@ -6408,24 +6408,58 @@ class KernelWriter(metaclass=abc.ABCMeta):
       # Default: A is one contiguous block; A1 base coincides with A's base.
       self.ldsA1Base = self.ldsStartOffsetA
       kernel["_ldsSplitA"] = False
+      # Default per-tensor double-buffer swap delta = one full buffer (XOR with
+      # ldsTotalSize toggles buffer0<->buffer1). The overlap layout below makes
+      # these per-tensor (mirrored buffers); GR/LR swap-mask code reads them.
+      self.ldsSwapDeltaA = self.ldsTotalSize
+      self.ldsSwapDeltaB = self.ldsTotalSize
+      self.ldsBuffer1Base = self.ldsTotalSize
+      kernel["_ldsOverlapA"] = False
+      kernel["_ldsOverlapTilesA"] = 0
 
-      # gfx1250 segment-conflict avoidance: split A into A0-B-A1 so SIMDPair0
-      # (A0) and SIMDPair1 (A1) never share a 64KB LDS segment. A-only, built
-      # on fused A/B GR; gated to 2x2 + disjoint-segment cases (else fall back).
       aContent = int(numASubtiles * aTileInfo.subtileSize + padA)   # mtA * rowBytesA
-      a0Content = aContent // 2
-      ldsBBaseSplit = int(((a0Content + readSize - 1) // readSize) * readSize)
-      ldsA1BaseSplit = ldsBBaseSplit + sizeB
-      a1Content = aContent - a0Content
-      ldsTotalSplit = int(((ldsA1BaseSplit + a1Content + readSize - 1) // readSize) * readSize) \
-                      + sizeMXSA + sizeMXSB
-      if shouldSplitLdsSegmentsA(kernel, self.ldsStartOffsetA, ldsA1BaseSplit):
-        self.ldsStartOffsetB = ldsBBaseSplit
-        self.ldsA1Base = ldsA1BaseSplit
-        self.ldsTotalSize = ldsTotalSplit
-        kernel["_ldsSplitA"] = True
+      maxLDS = self.states.archCaps["DeviceLDS"]
 
-      kernel["LdsNumBytes"] = max(1, int(self.ldsTotalSize * kernel["NumLdsBlk"]))
+      # Overlapping (mirrored) double-buffer for A: reclaim duplicated padding so
+      # the otherwise-overflowing case fits (e.g. gfx1250 320x320x128 bf16). Takes
+      # precedence over segment-split (mutually exclusive, first cut). A is then
+      # prefetched 1-ahead into the other buffer by the scheduler.
+      overlap = None
+      if shouldOverlapDoubleBufferA(kernel):
+        rowBytesA = aContent // mtA
+        overlap = computeOverlapLayoutA(sizeA, sizeB, aContent, rowBytesA,
+                                        int(kernel["MatrixInstM"]), maxLDS)
+      if overlap is not None:
+        self.ldsStartOffsetA = overlap["ldsStartOffsetA"]
+        self.ldsStartOffsetB = overlap["ldsStartOffsetB"]
+        self.ldsBuffer1Base = overlap["buffer1Base"]
+        self.ldsSwapDeltaA = overlap["deltaA"]
+        self.ldsSwapDeltaB = overlap["deltaB"]
+        kernel["_ldsOverlapA"] = True
+        kernel["_ldsOverlapTilesA"] = overlap["overlapTilesA"]
+        kernel["LdsNumBytes"] = max(1, int(overlap["ldsNumBytes"]))
+      else:
+        # gfx1250 segment-conflict avoidance: split A into A0-B-A1 so SIMDPair0
+        # (A0) and SIMDPair1 (A1) never share a 64KB LDS segment. A-only, built
+        # on fused A/B GR; gated to 2x2 + disjoint-segment cases (else fall back).
+        a0Content = aContent // 2
+        ldsBBaseSplit = int(((a0Content + readSize - 1) // readSize) * readSize)
+        ldsA1BaseSplit = ldsBBaseSplit + sizeB
+        a1Content = aContent - a0Content
+        ldsTotalSplit = int(((ldsA1BaseSplit + a1Content + readSize - 1) // readSize) * readSize) \
+                        + sizeMXSA + sizeMXSB
+        if shouldSplitLdsSegmentsA(kernel, self.ldsStartOffsetA, ldsA1BaseSplit):
+          self.ldsStartOffsetB = ldsBBaseSplit
+          self.ldsA1Base = ldsA1BaseSplit
+          self.ldsTotalSize = ldsTotalSplit
+          kernel["_ldsSplitA"] = True
+
+        # Non-overlap double-buffer: both tensors' swap stride is one full buffer.
+        # Set AFTER segment-split so it reflects the final ldsTotalSize (split or not).
+        self.ldsSwapDeltaA = self.ldsTotalSize
+        self.ldsSwapDeltaB = self.ldsTotalSize
+        kernel["LdsNumBytes"] = max(1, int(self.ldsTotalSize * kernel["NumLdsBlk"]))
+
       if kernel["LdsNumBytes"] > self.states.archCaps["DeviceLDS"]:
         self.states.overflowedResources = 8
 

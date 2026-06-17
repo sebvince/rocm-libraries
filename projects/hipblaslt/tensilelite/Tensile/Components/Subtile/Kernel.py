@@ -1256,6 +1256,14 @@ def shouldFuseGRAB(kernel):
   boundaries, so StreamKLocalStart==0 and Address{A,B}/the descriptor are never
   offset post-merge), so it composes with the fused descriptor build.
   """
+  # Overlap double-buffer needs A and B as INDEPENDENT descriptors / loads / swaps
+  # (A is prefetched 1-ahead, B 2-ahead). Fusion couples them into one shared
+  # tensor_load_to_lds + one shared swap, which forces the same prefetch distance
+  # and buffer phase. They are mutually exclusive -> overlap disables fusion.
+  # (Safe vs the shouldOverlapDoubleBufferA -> shouldFuseGRAB call: _ldsOverlapA is
+  # False when that gate runs in _initKernel; it is only set True afterward.)
+  if kernel.get("_ldsOverlapA", False):
+    return False
   if not (kernel.get("enableTDMA") and kernel.get("enableTDMB")):
     return False
   if not kernel.get("UseSubtileImpl"):
@@ -1308,6 +1316,81 @@ def shouldSplitLdsSegmentsA(kernel, a0_base, a1_base, seg=65536):
   return True
 
 
+def shouldOverlapDoubleBufferA(kernel):
+  """Static eligibility for the overlapping (mirrored) LDS double-buffer for A.
+
+  Reclaims the duplicated A/B padding by overlapping the two prefetch buffers:
+  buffer0 = B-A, buffer1 = A-B placed so their A regions share the top
+  `overlap` tile-rows. Combined with the scheduler's overlapDoubleBufferA
+  (A prefetched 1-ahead into the other buffer), the shared rows are rewritten
+  just-in-time onto already-read data. See lds_overlap_double_buffer_plan.md.
+
+  This is the size-independent half of the gate; computeOverlapLayoutA() decides
+  whether overlap is actually needed and fits (size-dependent). First-cut scope
+  (restrict): fused A/B GR on, MIWaveGroup==[2,2], PGR=2, and NOT segment-split
+  (mutually exclusive for now). A-unpartitioned is enforced scheduler-side.
+  """
+  if not shouldFuseGRAB(kernel):
+    return False
+  if list(kernel.get("MIWaveGroup", [])) != [2, 2]:
+    return False
+  if kernel.get("PrefetchGlobalRead") != 2:
+    return False
+  if kernel.get("_ldsSplitA"):
+    return False
+  # Overlap needs A unpartitioned (all of A read early). get_partition_candidates
+  # splits the LARGER of M/N, so require N >= M (== MacroTile1 >= MacroTile0) so the
+  # heuristic only ever splits N and keeps numPartitionsM == 1.
+  if kernel["MacroTile1"] < kernel["MacroTile0"]:
+    return False
+  return True
+
+
+def computeOverlapLayoutA(sizeA, sizeB, aContent, rowBytesA, rowsPerTileM, maxLDS):
+  """Geometry for the mirrored overlap double-buffer (A). Returns a dict, or None
+  if overlap is not needed (fits without it) or cannot fit / is infeasible.
+
+  Layout (buffer0 = B-A, buffer1 = A-B), with `total = sizeA + sizeB`:
+
+      buffer0:  B=[0,sizeB)            A=[sizeB, sizeB+sizeA)   (content sizeB..sizeB+aContent)
+      buffer1:  A=[B1, B1+sizeA)       B=[B1+sizeA, B1+total)
+
+  buffer1's A-content LOW coincides buffer0's A-content HIGH, so
+  B1 = (sizeB + aContent) - overlap. The overlap is rounded up to a whole number
+  of per-wave M tiles (tileBytesA = rowsPerTileM * rowBytesA) so the scheduler's
+  tile-granular mirror is exact and Δ_A is a whole number of rows (byte-correct
+  coincidence). Per-tensor swap deltas toggle the XOR double-buffer:
+
+      ldsSwapDeltaA = B1 - sizeB  (= aContent - overlap)
+      ldsSwapDeltaB = B1 + sizeA
+
+  Returns keys: ldsStartOffsetA, ldsStartOffsetB, buffer1Base, deltaA, deltaB,
+  overlapTilesA, ldsNumBytes.
+  """
+  total = sizeA + sizeB
+  if 2 * total <= maxLDS:
+    return None  # fits as a normal disjoint double-buffer; no overlap needed
+  if total > maxLDS:
+    return None  # a single buffer doesn't even fit; overlap can't help
+  tileBytesA = rowsPerTileM * rowBytesA
+  aHighEnd = sizeB + aContent            # end of buffer0's A content
+  need = aHighEnd + total - maxLDS       # bytes the union must shed to fit
+  overlapTilesA = (need + tileBytesA - 1) // tileBytesA
+  overlapBytes = overlapTilesA * tileBytesA
+  if overlapBytes > aContent:
+    return None  # would overlap past A's content (B no longer disjoint) — infeasible
+  B1 = aHighEnd - overlapBytes
+  return dict(
+      ldsStartOffsetA=sizeB,            # buffer0 = B-A
+      ldsStartOffsetB=0,
+      buffer1Base=B1,
+      deltaA=B1 - sizeB,                # = aContent - overlapBytes (multiple of rowBytesA)
+      deltaB=B1 + sizeA,
+      overlapTilesA=overlapTilesA,
+      ldsNumBytes=B1 + total,           # union span (<= maxLDS by construction)
+  )
+
+
 def mainLoop(writer, kernel):
   module = Module()
   tensorParametersA = writer.tPA
@@ -1352,10 +1435,23 @@ def mainLoop(writer, kernel):
   M = tiA.localMMATileGrid[0]
   N = tiB.localMMATileGrid[0]
   candidates = [(M, N)] if pgr == 0 else MFMASchedulerConfig.get_partition_candidates(tiA, tiB)
+  overlapA = kernel.get("_ldsOverlapA", False)
   for partSizeM, partSizeN in candidates:
       hasTDM = bool(kernel.get("enableTDMA")) and bool(kernel.get("enableTDMB"))
       grPlacement = (GRPlacementStrategy.BUNCHED if hasTDM
                      else GRPlacementStrategy.SPREAD)
+      if overlapA:
+          # Overlap requires A unpartitioned + N split (all of A read early). The
+          # candidate list leads with the single-partition (M,N) case; skip any
+          # candidate that isn't A-unpartitioned/N-split so we never feed an
+          # incompatible partition to the committed overlap layout.
+          probe = MFMASchedulerConfig(
+              numMFMATilesM=M, numMFMATilesN=N, numSubIterK=tiA.localMMATileGrid[1],
+              lrA=lrAGran, lrB=lrBGran, grA=grAGran, grB=grBGran,
+              lrSA=lrSAGran, lrSB=lrSBGran, grSA=grSAGran, grSB=grSBGran,
+              partitionSizeM=partSizeM, partitionSizeN=partSizeN, pgr=schedulerPgr)
+          if not (probe.numPartitionsM == 1 and probe.numPartitionsN > 1):
+              continue
       cfg = MFMASchedulerConfig(
           numMFMATilesM=M,
           numMFMATilesN=N,
@@ -1373,6 +1469,8 @@ def mainLoop(writer, kernel):
           pgr=schedulerPgr,
           grPlacement=grPlacement,
           fuseGRAB=kernel.get("_fuseGRAB", False),
+          overlapDoubleBufferA=kernel.get("_ldsOverlapA", False),
+          overlapTilesA=kernel.get("_ldsOverlapTilesA", 0),
       )
 
       scheduler = LogicalScheduler(cfg)

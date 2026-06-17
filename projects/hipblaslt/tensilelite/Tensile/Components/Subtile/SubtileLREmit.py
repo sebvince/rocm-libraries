@@ -584,6 +584,14 @@ def _lraTileAssignment_fp8_legacy(writer, kernel, module):
                src0=sgpr(stmp),
                src1=vgpr(tileInfoB.sharedVgprLROffset[vgprId]),
                comment="B matrix offset in LDS"))
+  # A's LDS base (nonzero only for the B-A overlap layout; no-op otherwise).
+  if writer.ldsStartOffsetA:
+    module.add(SMovB32(dst=sgpr(stmp), src=writer.ldsStartOffsetA, comment="ldsStartOffsetA"))
+    for vgprId in range(len(tileInfoA.sharedVgprLROffset)):
+      module.add(VAddU32(dst=vgpr(tileInfoA.sharedVgprLROffset[vgprId]),
+                 src0=sgpr(stmp),
+                 src1=vgpr(tileInfoA.sharedVgprLROffset[vgprId]),
+                 comment="A matrix offset in LDS"))
   writer.sgprPool.checkIn(stmp)
   return module
 
@@ -637,6 +645,15 @@ def _lraTileAssignment_legacy(writer, kernel):
   _lraWavePartitioning_legacy(module, writer, kernel)
   for vgprId in range(len(tileInfoB.sharedVgprLROffset)):
     module.add(VAddU32(dst=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), src0=writer.ldsStartOffsetB, src1=vgpr(tileInfoB.sharedVgprLROffset[vgprId]), comment="B matrix offset in LDS"))
+  # A's LDS base. 0 in the default/segment-split layouts (A first), but the
+  # overlap layout uses B-A order so A starts at ldsStartOffsetA (= sizeB). Add it
+  # so A's reads match the GR write base (no-op when 0).
+  if writer.ldsStartOffsetA:
+    stmpA = writer.sgprPool.checkOut(1)
+    module.add(SMovB32(dst=sgpr(stmpA), src=writer.ldsStartOffsetA, comment="ldsStartOffsetA"))
+    for vgprId in range(len(tileInfoA.sharedVgprLROffset)):
+      module.add(VAddU32(dst=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), src0=sgpr(stmpA), src1=vgpr(tileInfoA.sharedVgprLROffset[vgprId]), comment="A matrix offset in LDS"))
+    writer.sgprPool.checkIn(stmpA)
   return module
 
 
@@ -759,14 +776,21 @@ def localReadDTLInitCommonSwapVgpr(writer, kernel):
   atile = writer.states.a.tileInfo
   btile = writer.states.b.tileInfo
 
+  # Per-tensor double-buffer swap delta: ldsTotalSize for the default disjoint
+  # double-buffer, or the mirrored-overlap delta (ldsSwapDelta{tc}) when overlap
+  # is enabled. Must match the GR-side delta (initTDMDescriptorSubtile).
+  deltaA = getattr(writer, "ldsSwapDeltaA", writer.ldsTotalSize)
+  deltaB = getattr(writer, "ldsSwapDeltaB", writer.ldsTotalSize)
   stmp = writer.sgprPool.checkOut(1)
-  module.add(SMovB32(dst=sgpr(stmp), src=writer.ldsTotalSize, comment="Store Total Lds Size for one buffer"))
+  module.add(SMovB32(dst=sgpr(stmp), src=deltaA, comment="A: swap delta (buffer stride)"))
   for i in range(len(atile.sharedVgprLROffset)):
     vgprId = atile.sharedVgprLROffset[i]
     vgprSwapId = atile.sharedVgprLROffsetSwap[i]
     module.add(VAddU32(dst=vgpr(vgprSwapId), src0=vgpr(vgprId), src1=sgpr(stmp), comment=""))
     module.add(VXorB32(dst=vgpr(vgprSwapId), src0=vgpr(vgprId), src1=vgpr(vgprSwapId), comment=""))
 
+  if deltaB != deltaA:
+    module.add(SMovB32(dst=sgpr(stmp), src=deltaB, comment="B: swap delta (buffer stride)"))
   for i in range(len(btile.sharedVgprLROffset)):
     vgprId = btile.sharedVgprLROffset[i]
     vgprSwapId = btile.sharedVgprLROffsetSwap[i]
