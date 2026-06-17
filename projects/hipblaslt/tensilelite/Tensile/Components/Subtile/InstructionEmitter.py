@@ -105,6 +105,20 @@ class InstructionEmitter:
         # emit_mask_k_init, consumed by every emit_mask_k call in the tail body.
         self._tail_vDiff = None
 
+        # Cluster-barrier handshake: when armed (per mainloop unroll copy), the
+        # next first GR A (TDM A) prepends the barrier as a single atomic module
+        # so the scheduler can't interleave MFMAs into its branch-over-signal.
+        self._clusterBarrierPending = False
+        self._clusterBarrierLabel = ""
+
+    def arm_cluster_barrier(self, label):
+        """Arm the cluster barrier so the next first GR A (TDM A) emits it.
+
+        Consumed (disarmed) by the first emit_gr(tensor='A') call after this.
+        """
+        self._clusterBarrierPending = True
+        self._clusterBarrierLabel = label
+
     def emit_mfma(self, placement, unroll_iter=0):
         """Emit MFMA instructions from MFMAPlacement."""
         module = Module()
@@ -195,7 +209,20 @@ class InstructionEmitter:
         elif tensor in ('SA', 'SB'):
             tc = 'MXSA' if tensor == 'SA' else 'MXSB'
             module.add(globalReadDoScaleSubtile(tc, self.writer, self.kernel))
-        return list(module.flatitems())
+        insts = list(module.flatitems())
+
+        # Multicast TDM: emit the cluster barrier once, just before the first
+        # GR A (TDM A) of the mainloop body. Kept as a single Module element so
+        # the instruction scheduler places it atomically (its branch-over-signal
+        # must not have MFMAs interleaved into it).
+        if (tensor == 'A' and self._clusterBarrierPending
+                and self.kernel.get("ClusterBarrier")):
+            from Tensile.Components.Subtile.ClusterBarrier import subtileClusterBarrier
+            barrier = subtileClusterBarrier(self.writer, self.kernel,
+                                            label=self._clusterBarrierLabel)
+            insts = [barrier] + insts
+            self._clusterBarrierPending = False
+        return insts
 
     def emit_wait_gr(self, source):
         """Emit SWaitCnt for wait_gr from BaseOp with wait_gr_counts."""

@@ -2494,7 +2494,10 @@ class LogicalScheduler:
 
         module = Module(label)
         module.addComment0(f"{label} start")
-        if kernel.get("ClusterBarrier"):
+        # MAINLOOP emits the cluster barrier as part of its first GR A (TDM A)
+        # via InstructionEmitter (kept atomic for the scheduler); all other
+        # sections emit it here, contiguous at the top of the loop body.
+        if kernel.get("ClusterBarrier") and not label.startswith("MAINLOOP"):
             from Tensile.Components.Subtile.ClusterBarrier import subtileClusterBarrier
             for inst in subtileClusterBarrier(writer, kernel, label=label).flatitems():
                 module.add(inst)
@@ -2955,7 +2958,14 @@ class LogicalScheduler:
         self._nll_per_unroll = []
         for ui in range(self.unroll_factor):
             em_copy = copy.deepcopy(self._emitted)
+            # Arm the cluster barrier so it is emitted as part of the first GR A
+            # (TDM A) of this mainloop unroll copy, instead of at the top of the
+            # loop body (see _emitLoop). NGLL/NLL/preloop/tail keep the
+            # top-of-loop barrier and must not consume this arm, so disarm after.
+            if kernel.get("ClusterBarrier"):
+                emitter.arm_cluster_barrier(f"MAINLOOP_C{ui}")
             emitter.populate(em_copy, unroll_iter=ui)
+            emitter._clusterBarrierPending = False
             self._emitted_per_unroll.append(em_copy)
 
             ngll_copy = copy.deepcopy(self._ngll_emitted)
