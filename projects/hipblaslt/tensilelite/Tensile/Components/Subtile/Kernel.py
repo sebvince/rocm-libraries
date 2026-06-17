@@ -1327,7 +1327,9 @@ def mainLoop(writer, kernel):
 
   # gfx1250: enable expert scheduling mode and disable WMMA arb stall
   # before entering the mainloop / any wmma issue.
-  if writer.states.archCaps.get("HasWmmaArbStallBit", False):
+  # Clustered multicast kernels fail validation with schedmode=2 / disabled WMMA
+  # arb-stall; keep the default scheduler mode for that path until validated.
+  if writer.states.archCaps.get("HasWmmaArbStallBit", False) and not kernel.get("Multicast", False):
     module.add(SNop(waitState=0, comment="nop before SSetReg"))
     module.add(SSetRegIMM32B32(dst=HWRegContainer(reg="26", value=[0, 2]),
                                src=2,
@@ -1341,7 +1343,7 @@ def mainLoop(writer, kernel):
   module.add(scheduler.emitMainAndExitLoops(writer, kernel))
 
   # gfx1250: disable expert scheduling mode after NLL.
-  if writer.states.archCaps.get("HasWmmaArbStallBit", False):
+  if writer.states.archCaps.get("HasWmmaArbStallBit", False) and not kernel.get("Multicast", False):
     module.add(SNop(waitState=0, comment="nop before SSetReg"))
     module.add(SSetRegIMM32B32(dst=HWRegContainer(reg="26", value=[0, 2]),
                                src=0,
