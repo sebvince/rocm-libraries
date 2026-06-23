@@ -181,6 +181,10 @@ class SchedulerConfig:
     partitionSizeN: Union[int, List[int]] = 0  # partition size(s) in N dimension (0 = full dim)
     pgr: int = 2              # Prefetch Global Read
     grPlacement: GRPlacementStrategy = GRPlacementStrategy.SPREAD
+    # When True, the per-DU-iteration issue order is subIterK-outer / partition-inner
+    # (subIterK 0: part 0,1,..; subIterK 1: part 0,1,..; ...). When False (default),
+    # it is partition-outer / subIterK-inner. Auto-enabled for multi-partition gfx1250.
+    subIterKOuter: bool = False
 
     # Resolve a partition spec into per-partition sizes along one dimension.
     # spec is either:
@@ -569,6 +573,34 @@ class LogicalScheduler:
         for p in prerequisites:
             if p not in self._completed:
                 getattr(self, _PASS_PIPELINE[p][0])()
+
+    # ── Issue-order helpers ───────────────────────────────
+    # The within-DU-iteration linear issue order is encoded here so every
+    # scheduling pass agrees. Default is partition-outer / subIterK-inner
+    # (flat = partition*numK + subIterK). With subIterKOuter the order is
+    # subIterK-outer / partition-inner (flat = subIterK*numP + partition).
+
+    def _flat_pos(self, partition: int, subIterK: int) -> int:
+        """Linear issue position of a (partition, subIterK) slot."""
+        numP = self.config.numPartitions
+        numK = self.config.numSubIterK
+        if self.config.subIterKOuter:
+            return subIterK * numP + partition
+        return partition * numK + subIterK
+
+    def _unflat_pos(self, flat: int) -> tuple:
+        """Inverse of _flat_pos: return (partition, subIterK)."""
+        numP = self.config.numPartitions
+        numK = self.config.numSubIterK
+        if self.config.subIterKOuter:
+            return flat % numP, flat // numP
+        return flat // numK, flat % numK
+
+    def _order_key(self, partition: int, subIterK: int) -> tuple:
+        """Ordering key (most-significant first) for the active issue order."""
+        if self.config.subIterKOuter:
+            return (subIterK, partition)
+        return (partition, subIterK)
 
     # ── Place LRs ─────────────────────────────────────────
 
@@ -1017,12 +1049,11 @@ class LogicalScheduler:
         upper: (tensor, mt) -> first flat slot index with LR(tensor, mt).
                GR(tensor, mt) must be placed strictly before this slot.
         """
-        numK = self.config.numSubIterK
         lower = {}
         upper = {}
         for pi, partition_slots in enumerate(self._partitions):
             for slot in partition_slots:
-                flat = pi * numK + slot.subIterK
+                flat = self._flat_pos(pi, slot.subIterK)
                 for lr in slot.lrs:
                     if lr.mtIteration == 0:
                         lower.setdefault(lr.tensor, []).append(
@@ -1090,7 +1121,7 @@ class LogicalScheduler:
 
         weight_prefix = [0]
         for s in range(numSlots):
-            weight_prefix.append(weight_prefix[-1] + mfma_per_partition[s // numK])
+            weight_prefix.append(weight_prefix[-1] + mfma_per_partition[self._unflat_pos(s)[0]])
         total_weight = weight_prefix[numSlots]
         slot_boundaries = [p * nAtoms for p in weight_prefix[1:]]
 
@@ -1109,8 +1140,7 @@ class LogicalScheduler:
 
         # 2c. Remerge consecutive atoms and place into partitions
         for flat, bucket in enumerate(buckets):
-            pi = flat // numK
-            si = flat % numK
+            pi, si = self._unflat_pos(flat)
             target_slot = self._partitions[pi][si]
             for atom in bucket:
                 tensor, mt_val, ts, te, ks, ke = atom
@@ -1237,15 +1267,11 @@ class LogicalScheduler:
 
         def _slot_offset(consumer_partition, consumer_slot, consumer_type, producer):
             """Offset from partition+slot ordering: 0 if producer ran first, -1 otherwise."""
-            prod_partition = producer.partition
-            if prod_partition < consumer_partition:
+            prod_key = self._order_key(producer.partition, producer.subIterK_slot)
+            cons_key = self._order_key(consumer_partition, consumer_slot)
+            if prod_key < cons_key:
                 return 0
-            if prod_partition > consumer_partition:
-                return -1
-            prod_slot = producer.subIterK_slot
-            if prod_slot < consumer_slot:
-                return 0
-            if prod_slot > consumer_slot:
+            if prod_key > cons_key:
                 return -1
             prod_type = 'LR' if isinstance(producer, LRPlacement) else 'GR'
             return -1 if _order[prod_type] >= _order[consumer_type] else 0
@@ -1282,7 +1308,8 @@ class LogicalScheduler:
             if len(deps) <= 1:
                 return deps
             def _exec_order(dep):
-                return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
+                return (dep.mt_offset,
+                        *self._order_key(dep.ref.partition, dep.ref.subIterK_slot))
             return [max(deps, key=_exec_order)]
 
         for k, slot in enumerate(slots):
@@ -1353,8 +1380,7 @@ class LogicalScheduler:
         def _dep_exec_order(dep):
             gr = dep.ref
             return (dep.mt_offset,
-                    gr.partition,
-                    gr.subIterK_slot,
+                    *self._order_key(gr.partition, gr.subIterK_slot),
                     gr_intra_rank[id(gr)])
         return _dep_exec_order
 
@@ -1526,7 +1552,7 @@ class LogicalScheduler:
         numK = len(self._partitions[0])
         flat_len = numP * numK
 
-        consumer_flat = consumer_pi * numK + consumer_slot
+        consumer_flat = self._flat_pos(consumer_pi, consumer_slot)
         wraps_needed = abs(dep_ref.mt_offset)
 
         # Locate dep_flat: the flat position of the dependency GR in the schedule.
@@ -1534,7 +1560,7 @@ class LogicalScheduler:
         for p_idx, pslots in enumerate(self._partitions):
             for k_idx, slot in enumerate(pslots):
                 if any(gr is dep_ref.ref for gr in slot.grs):
-                    dep_flat = p_idx * numK + k_idx
+                    dep_flat = self._flat_pos(p_idx, k_idx)
                     break
             if dep_flat is not None:
                 break
@@ -1563,8 +1589,7 @@ class LogicalScheduler:
         pos = consumer_flat
         for step in range(total_steps):
             pos = (pos - 1) % flat_len
-            pi = pos // numK
-            slot_k = pos % numK
+            pi, slot_k = self._unflat_pos(pos)
             slot = self._partitions[pi][slot_k]
 
             # On the final step we are at dep's slot: stop when we reach the dep GR.
@@ -2504,29 +2529,41 @@ class LogicalScheduler:
         pap_merge_label = Label("SubtilePAPPreloopFirstGRMerge", "") if use_pap_preloop_skip else None
         skipping_first_gr_group = False
         first_gr_group_done = False
-        for pi, partition_emitted in enumerate(emitted_3d):
-            for k, em_list in enumerate(partition_emitted):
-                module.addComment0(f"partition={pi} subIterK={k}")
-                if schedule and em_list:
-                    scheduled = instructionSchedule(em_list, minGapDsReadToWait=minGapDsReadToWait)
-                    module.add(scheduled)
-                else:
-                    for em in em_list:
-                        if use_pap_preloop_skip and not first_gr_group_done:
-                            if em.opType == 'gr':
-                                if not skipping_first_gr_group:
-                                    module.add(SCmpEQU32(src0=sgpr("SkPrefetchPrimed"), src1=0,
-                                                         comment="Subtile PAP: first PRELOOP GR already issued?"))
-                                    module.add(SCBranchSCC0(labelName=pap_merge_label.getLabelName(),
-                                                            comment="skip first PRELOOP GR group if primed"))
-                                    skipping_first_gr_group = True
-                            elif skipping_first_gr_group:
-                                module.add(pap_merge_label)
-                                module.add(SMovB32(dst=sgpr("SkPrefetchPrimed"), src=0,
-                                                   comment="Subtile PAP: clear after first PRELOOP GR merge"))
-                                first_gr_group_done = True
-                        for inst in em.instructions:
-                            module.add(inst)
+        # Issue order: subIterK-outer / partition-inner when configured, else
+        # partition-outer / subIterK-inner. Storage stays [partition][subIterK].
+        if self.config.subIterKOuter:
+            numK = max((len(p) for p in emitted_3d), default=0)
+            issue_order = [(pi, k)
+                           for k in range(numK)
+                           for pi, partition_emitted in enumerate(emitted_3d)
+                           if k < len(partition_emitted)]
+        else:
+            issue_order = [(pi, k)
+                           for pi, partition_emitted in enumerate(emitted_3d)
+                           for k in range(len(partition_emitted))]
+        for pi, k in issue_order:
+            em_list = emitted_3d[pi][k]
+            module.addComment0(f"partition={pi} subIterK={k}")
+            if schedule and em_list:
+                scheduled = instructionSchedule(em_list, minGapDsReadToWait=minGapDsReadToWait)
+                module.add(scheduled)
+            else:
+                for em in em_list:
+                    if use_pap_preloop_skip and not first_gr_group_done:
+                        if em.opType == 'gr':
+                            if not skipping_first_gr_group:
+                                module.add(SCmpEQU32(src0=sgpr("SkPrefetchPrimed"), src1=0,
+                                                     comment="Subtile PAP: first PRELOOP GR already issued?"))
+                                module.add(SCBranchSCC0(labelName=pap_merge_label.getLabelName(),
+                                                        comment="skip first PRELOOP GR group if primed"))
+                                skipping_first_gr_group = True
+                        elif skipping_first_gr_group:
+                            module.add(pap_merge_label)
+                            module.add(SMovB32(dst=sgpr("SkPrefetchPrimed"), src=0,
+                                               comment="Subtile PAP: clear after first PRELOOP GR merge"))
+                            first_gr_group_done = True
+                    for inst in em.instructions:
+                        module.add(inst)
         if use_pap_preloop_skip and skipping_first_gr_group and not first_gr_group_done:
             module.add(pap_merge_label)
             module.add(SMovB32(dst=sgpr("SkPrefetchPrimed"), src=0,
@@ -3064,30 +3101,50 @@ class LogicalScheduler:
         return tensor.ljust(2)
 
 
+    def _write_grouped(self, buf, numP, numK, body) -> None:
+        """Write two-level grouped debug sections in the *active issue order*.
+
+        Default (subIterKOuter=False): partition-outer / subIterK-inner.
+        subIterKOuter=True: subIterK-outer / partition-inner — so the dump
+        matches the real instruction issue order (the point of the display).
+        `body(buf, pi, k)` writes the per-slot content at 6-space indent.
+        """
+        if self.config.subIterKOuter:
+            for k in range(numK):
+                buf.write(f"  subIterK={k}:\n")
+                for pi in range(numP):
+                    buf.write(f"    Partition {pi}:\n")
+                    body(buf, pi, k)
+        else:
+            for pi in range(numP):
+                buf.write(f"  Partition {pi}:\n")
+                for k in range(numK):
+                    buf.write(f"    subIterK={k}:\n")
+                    body(buf, pi, k)
+
     def print_lr(self, partitions: List[List[SubIterKSlot]] = None) -> str:
         """Print place_LRs output in design doc format."""
         if partitions is None:
             partitions = self._partitions
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
-        for pi, slots in enumerate(partitions):
-            buf.write(f"  Partition {pi}:\n")
-            self._print_lr_partition(buf, slots)
+
+        def body(buf, pi, k):
+            self._print_lr_slot(buf, partitions[pi][k])
+
+        self._write_grouped(buf, len(partitions), self.config.numSubIterK, body)
         return buf.getvalue()
 
-    def _print_lr_partition(self, buf, slots):
-        for slot in slots:
-            buf.write(f"    subIterK={slot.subIterK}:\n")
-            if slot.mfma:
-                m = slot.mfma
-                buf.write(f"      MFMAs (MT n, subIterK {m.subIterK}  ) "
-                          f"A : {m.tileA.fmt_tiles()} , B : {m.tileB.fmt_tiles()}\n")
-            for lr in slot.lrs:
-                t = self._fmt_tensor(lr.tensor)
-                buf.write(f"      LR {t} (MT {fmt_mt(lr.mtIteration)}, "
-                          f"subIterK {lr.tiles.fmt_k()}) "
-                          f"{lr.tiles.fmt_tiles()}\n")
-        return buf.getvalue()
+    def _print_lr_slot(self, buf, slot):
+        if slot.mfma:
+            m = slot.mfma
+            buf.write(f"      MFMAs (MT n, subIterK {m.subIterK}  ) "
+                      f"A : {m.tileA.fmt_tiles()} , B : {m.tileB.fmt_tiles()}\n")
+        for lr in slot.lrs:
+            t = self._fmt_tensor(lr.tensor)
+            buf.write(f"      LR {t} (MT {fmt_mt(lr.mtIteration)}, "
+                      f"subIterK {lr.tiles.fmt_k()}) "
+                      f"{lr.tiles.fmt_tiles()}\n")
 
     def print_vgpr(self) -> str:
         """Print assign_vgpr_tiles output: LRs + MFMAs with vgprTileId annotations."""
@@ -3105,31 +3162,33 @@ class LogicalScheduler:
                 buf.write(f"MAINLOOP (unroll {ui}):\n")
             else:
                 buf.write("MAINLOOP:\n")
-            for pi, slots in enumerate(partitions):
-                buf.write(f"  Partition {pi}:\n")
-                for slot in slots:
-                    buf.write(f"    subIterK={slot.subIterK}:\n")
-                    if slot.mfma:
-                        m = slot.mfma
-                        tiles_str = ""
-                        parts = []
-                        for tensor in self.tensors:
-                            maps = m.vgpr_tile_maps.get(tensor)
-                            if maps:
-                                parts.append(f"{tensor}:" + str(maps[ui]))
-                        if parts:
-                            tiles_str = " " + ", ".join(parts)
-                        buf.write(f"      MFMAs (MT n, subIterK {m.subIterK}  ) "
-                                  f"A : {m.tileA.fmt_tiles()} , "
-                                  f"B : {m.tileB.fmt_tiles()}{tiles_str}\n")
-                    for lr in slot.lrs:
-                        tile_str = ""
-                        if lr.vgpr_tile_map:
-                            tile_str = f" tiles:{lr.vgpr_tile_map[ui]}"
-                        t = self._fmt_tensor(lr.tensor)
-                        buf.write(f"      LR {t} (MT {fmt_mt(lr.mtIteration)}, "
-                                  f"subIterK {lr.tiles.fmt_k()}) "
-                                  f"{lr.tiles.fmt_tiles()}{tile_str}\n")
+
+            def body(buf, pi, k, ui=ui):
+                slot = partitions[pi][k]
+                if slot.mfma:
+                    m = slot.mfma
+                    tiles_str = ""
+                    parts = []
+                    for tensor in self.tensors:
+                        maps = m.vgpr_tile_maps.get(tensor)
+                        if maps:
+                            parts.append(f"{tensor}:" + str(maps[ui]))
+                    if parts:
+                        tiles_str = " " + ", ".join(parts)
+                    buf.write(f"      MFMAs (MT n, subIterK {m.subIterK}  ) "
+                              f"A : {m.tileA.fmt_tiles()} , "
+                              f"B : {m.tileB.fmt_tiles()}{tiles_str}\n")
+                for lr in slot.lrs:
+                    tile_str = ""
+                    if lr.vgpr_tile_map:
+                        tile_str = f" tiles:{lr.vgpr_tile_map[ui]}"
+                    t = self._fmt_tensor(lr.tensor)
+                    buf.write(f"      LR {t} (MT {fmt_mt(lr.mtIteration)}, "
+                              f"subIterK {lr.tiles.fmt_k()}) "
+                              f"{lr.tiles.fmt_tiles()}{tile_str}\n")
+
+            self._write_grouped(buf, len(partitions),
+                                 self.config.numSubIterK, body)
         return buf.getvalue()
 
     def print_gr(self) -> str:
@@ -3137,40 +3196,43 @@ class LogicalScheduler:
         partitions = self._partitions
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
-        for pi, slots in enumerate(partitions):
-            buf.write(f"  Partition {pi}:\n")
-            for slot in slots:
-                buf.write(f"    subIterK={slot.subIterK}:\n")
-                if slot.mfma:
-                    m = slot.mfma
-                    buf.write(f"      MFMAs (MT n, subIterK {m.subIterK}  ) "
-                              f"A : {m.tileA.fmt_tiles()} , "
-                              f"B : {m.tileB.fmt_tiles()}\n")
-                for lr in slot.lrs:
-                    t = self._fmt_tensor(lr.tensor)
-                    buf.write(f"      LR {t} (MT {fmt_mt(lr.mtIteration)}, "
-                              f"subIterK {lr.tiles.fmt_k()}) "
-                              f"{lr.tiles.fmt_tiles()}\n")
-                for gr in slot.grs:
-                    buf.write(f"      GR {gr.tensor} (MT {fmt_mt(gr.mtIteration)}, "
-                              f"subIterK {gr.tiles.fmt_k()}) "
-                              f"ids {gr.tiles.fmt_tiles()}\n")
+
+        def body(buf, pi, k):
+            slot = partitions[pi][k]
+            if slot.mfma:
+                m = slot.mfma
+                buf.write(f"      MFMAs (MT n, subIterK {m.subIterK}  ) "
+                          f"A : {m.tileA.fmt_tiles()} , "
+                          f"B : {m.tileB.fmt_tiles()}\n")
+            for lr in slot.lrs:
+                t = self._fmt_tensor(lr.tensor)
+                buf.write(f"      LR {t} (MT {fmt_mt(lr.mtIteration)}, "
+                          f"subIterK {lr.tiles.fmt_k()}) "
+                          f"{lr.tiles.fmt_tiles()}\n")
+            for gr in slot.grs:
+                buf.write(f"      GR {gr.tensor} (MT {fmt_mt(gr.mtIteration)}, "
+                          f"subIterK {gr.tiles.fmt_k()}) "
+                          f"ids {gr.tiles.fmt_tiles()}\n")
+
+        self._write_grouped(buf, len(partitions), self.config.numSubIterK, body)
         return buf.getvalue()
 
     def print_deps(self) -> str:
         """Print annotate_deps output: placements with their before-dependencies."""
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
-        for pi, slots in enumerate(self._partitions):
-            buf.write(f"  Partition {pi}:\n")
-            for slot in slots:
-                buf.write(f"    subIterK={slot.subIterK}:\n")
-                if slot.mfma:
-                    self._print_placement_with_deps(buf, slot.mfma, slot)
-                for lr in slot.lrs:
-                    self._print_placement_with_deps(buf, lr, slot)
-                for gr in slot.grs:
-                    self._print_placement_with_deps(buf, gr, slot)
+
+        def body(buf, pi, k):
+            slot = self._partitions[pi][k]
+            if slot.mfma:
+                self._print_placement_with_deps(buf, slot.mfma, slot)
+            for lr in slot.lrs:
+                self._print_placement_with_deps(buf, lr, slot)
+            for gr in slot.grs:
+                self._print_placement_with_deps(buf, gr, slot)
+
+        self._write_grouped(buf, len(self._partitions),
+                             self.config.numSubIterK, body)
         return buf.getvalue()
 
     def _print_placement_with_deps(self, buf, placement, slot: SubIterKSlot):
@@ -3186,32 +3248,36 @@ class LogicalScheduler:
         """Print remove_cross_deps output: placements with preOps and remaining deps."""
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
-        for pi, slots in enumerate(self._partitions):
-            buf.write(f"  Partition {pi}:\n")
-            for slot in slots:
-                buf.write(f"    subIterK={slot.subIterK}:\n")
-                if slot.mfma:
-                    self._print_placement_with_preops(buf, slot.mfma, slot)
-                for lr in slot.lrs:
-                    self._print_placement_with_preops(buf, lr, slot)
-                for gr in slot.grs:
-                    self._print_placement_with_preops(buf, gr, slot)
+
+        def body(buf, pi, k):
+            slot = self._partitions[pi][k]
+            if slot.mfma:
+                self._print_placement_with_preops(buf, slot.mfma, slot)
+            for lr in slot.lrs:
+                self._print_placement_with_preops(buf, lr, slot)
+            for gr in slot.grs:
+                self._print_placement_with_preops(buf, gr, slot)
+
+        self._write_grouped(buf, len(self._partitions),
+                             self.config.numSubIterK, body)
         return buf.getvalue()
 
     def print_group_lr_gr(self) -> str:
         """Print group_lr_gr output: placements with chained deps and merged preOps."""
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
-        for pi, slots in enumerate(self._partitions):
-            buf.write(f"  Partition {pi}:\n")
-            for slot in slots:
-                buf.write(f"    subIterK={slot.subIterK}:\n")
-                if slot.mfma:
-                    self._print_placement_with_preops(buf, slot.mfma, slot)
-                for lr in slot.lrs:
-                    self._print_placement_with_preops(buf, lr, slot)
-                for gr in slot.grs:
-                    self._print_placement_with_preops(buf, gr, slot)
+
+        def body(buf, pi, k):
+            slot = self._partitions[pi][k]
+            if slot.mfma:
+                self._print_placement_with_preops(buf, slot.mfma, slot)
+            for lr in slot.lrs:
+                self._print_placement_with_preops(buf, lr, slot)
+            for gr in slot.grs:
+                self._print_placement_with_preops(buf, gr, slot)
+
+        self._write_grouped(buf, len(self._partitions),
+                             self.config.numSubIterK, body)
         return buf.getvalue()
 
     def _print_placement_with_preops(self, buf, placement, slot: SubIterKSlot):
@@ -3248,13 +3314,15 @@ class LogicalScheduler:
             all_partitions = self._emitted
         buf = io.StringIO()
         buf.write("MAINLOOP:\n")
-        for pi, partition_emitted in enumerate(all_partitions):
-            buf.write(f"  Partition {pi}:\n")
-            for k, emitted in enumerate(partition_emitted):
-                buf.write(f"    subIterK={k}:\n")
-                for em in emitted:
-                    before_str = f" <- [{em.before}]" if em.before is not None else ""
-                    buf.write(f"      [{em.moduleId:2d}] {em.opType:10s} {em.source}{before_str}\n")
+        numP = len(all_partitions)
+        numK = len(all_partitions[0]) if all_partitions else 0
+
+        def body(buf, pi, k):
+            for em in all_partitions[pi][k]:
+                before_str = f" <- [{em.before}]" if em.before is not None else ""
+                buf.write(f"      [{em.moduleId:2d}] {em.opType:10s} {em.source}{before_str}\n")
+
+        self._write_grouped(buf, numP, numK, body)
         return buf.getvalue()
 
     def print_emit_dep_order(self, all_partitions: List[List[List[EmittedModule]]] = None) -> str:
@@ -3264,22 +3332,25 @@ class LogicalScheduler:
             all_partitions = self._emitted
         buf = io.StringIO()
         buf.write("MAINLOOP (dependency paths):\n")
-        for pi, partition_emitted in enumerate(all_partitions):
-            buf.write(f"  Partition {pi}:\n")
-            for k, emitted in enumerate(partition_emitted):
-                buf.write(f"    subIterK={k}:\n")
-                mfmaIdx, paths, preMfmaPaths = extractPathsFromBeforeDeps(emitted)
-                em = emitted[mfmaIdx]
-                buf.write(f"      MFMA: [{em.moduleId:2d}] {em.source}")
-                if em.before is not None:
-                    buf.write(f" <- [{em.before}]")
-                buf.write("\n")
-                for i, path in enumerate(preMfmaPaths):
-                    buf.write(f"      preMFMA path {i}:\n")
-                    for idx in path:
-                        buf.write(f"        [{emitted[idx].moduleId:2d}] {emitted[idx].opType:10s} {emitted[idx].source}\n")
-                for i, path in enumerate(paths):
-                    buf.write(f"      path {i}:\n")
-                    for idx in path:
-                        buf.write(f"        [{emitted[idx].moduleId:2d}] {emitted[idx].opType:10s} {emitted[idx].source}\n")
+        numP = len(all_partitions)
+        numK = len(all_partitions[0]) if all_partitions else 0
+
+        def body(buf, pi, k):
+            emitted = all_partitions[pi][k]
+            mfmaIdx, paths, preMfmaPaths = extractPathsFromBeforeDeps(emitted)
+            em = emitted[mfmaIdx]
+            buf.write(f"      MFMA: [{em.moduleId:2d}] {em.source}")
+            if em.before is not None:
+                buf.write(f" <- [{em.before}]")
+            buf.write("\n")
+            for i, path in enumerate(preMfmaPaths):
+                buf.write(f"      preMFMA path {i}:\n")
+                for idx in path:
+                    buf.write(f"        [{emitted[idx].moduleId:2d}] {emitted[idx].opType:10s} {emitted[idx].source}\n")
+            for i, path in enumerate(paths):
+                buf.write(f"      path {i}:\n")
+                for idx in path:
+                    buf.write(f"        [{emitted[idx].moduleId:2d}] {emitted[idx].opType:10s} {emitted[idx].source}\n")
+
+        self._write_grouped(buf, numP, numK, body)
         return buf.getvalue()

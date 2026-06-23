@@ -1295,6 +1295,11 @@ def mainLoop(writer, kernel):
           grPlacement=grPlacement,
       )
 
+      # gfx1250 multi-partition: issue subIterK-outer / partition-inner.
+      # HasWmmaArbStallBit is the gfx1250 probe used elsewhere in the subtile path.
+      isGfx1250 = writer.states.archCaps.get("HasWmmaArbStallBit", False)
+      cfg.subIterKOuter = bool(isGfx1250) and cfg.numPartitions > 1
+
       scheduler = LogicalScheduler(cfg)
       scheduler.build()
 

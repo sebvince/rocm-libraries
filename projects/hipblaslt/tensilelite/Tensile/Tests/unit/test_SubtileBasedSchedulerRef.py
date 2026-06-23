@@ -548,6 +548,201 @@ def test_320x320_bf16_gfx1250_tdm_partition_1x5():
     )
 
 
+def make_320x320_bf16_gfx1250_tdm_du128():
+    """gfx1250 TDM variant of make_320x320_bf16 with DepthU=128 (1x5 partition).
+
+    Matches test1250_320.yaml: MatrixInstruction [16,16,32,1,1,10,10,2,2]
+    (MT 320x320, MIWaveTile 10x10, WaveGroup 2x2), DepthU 128, bf16, TN,
+    UseSubtileImpl, TDMInst 3, PGR 2, StreamK 3.
+
+    Equivalent CLI: --arch gfx1250 --mt0 320 --mt1 320 --du 128 --dtype bf16
+                    --pgr 2 --wg 2x2 --partition-size 0x2
+
+    vs make_320x320_bf16_gfx1250_tdm() this doubles DepthU (64 -> 128), so
+    numSubIterK doubles (2 -> 4): exercises the BUNCHED GR placement across
+    four subIterKs per partition.
+    """
+    kernel = create_kernel(320, 320, fp4=False, depthU=128)
+    kernel["enableTDMA"] = True
+    kernel["enableTDMB"] = True
+    tiA = makeTileInfo('A', kernel)
+    tiB = makeTileInfo('B', kernel)
+    # TDM: one tensor_load_to_lds covers the full localMMATileGrid, so GR
+    # granularity k = localMMATileGrid[1] (=4 at DepthU=128), matching the
+    # production derivation in Subtile/Kernel.py.
+    return SchedulerConfig(
+        numMFMATilesM=tiA.localMMATileGrid[0],
+        numMFMATilesN=tiB.localMMATileGrid[0],
+        numSubIterK=tiA.localMMATileGrid[1],
+        lrA=ReadGranularity(mn=1, k=1),
+        lrB=ReadGranularity(mn=1, k=1),
+        grA=ReadGranularity(mn=tiA.localMMATileGrid[0], k=tiA.localMMATileGrid[1]),
+        grB=ReadGranularity(mn=tiB.localMMATileGrid[0], k=tiB.localMMATileGrid[1]),
+        partitionSizeN=2,
+        grPlacement=GRPlacementStrategy.BUNCHED,
+    )
+
+
+EXPECTED_EMIT_DEP_ORDER_320x320_BF16_GFX1250_TDM_DU128_1x5 = """\
+MAINLOOP (dependency paths):
+  Partition 0:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [0-9] , B : [0-1] <- [3]
+      preMFMA path 0:
+        [ 3] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR A  (MT n, subIterK [1]) [0-9]
+        [ 2] lr         LR B  (MT n, subIterK [1]) [0-1]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [0-9] , B : [0-1] <- [3]
+      preMFMA path 0:
+        [ 3] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR A  (MT n, subIterK [2]) [0-9]
+        [ 2] lr         LR B  (MT n, subIterK [2]) [0-1]
+    subIterK=2:
+      MFMA: [ 0] MFMAs (MT n, subIterK 2  ) A : [0-9] , B : [0-1] <- [4]
+      preMFMA path 0:
+        [ 4] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR A  (MT n, subIterK [3]) [0-9]
+        [ 2] lr         LR B  (MT n, subIterK [3]) [0-1]
+        [ 5] wait_lr    wait_lr
+        [ 6] sync       sync
+        [ 7] gr_inc     gr_inc(A)
+        [ 3] gr         GR A (MT n+2, subIterK [0,3]) ids [0-9]
+    subIterK=3:
+      MFMA: [ 0] MFMAs (MT n, subIterK 3  ) A : [0-9] , B : [0-1] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [0]) [2-3]
+  Partition 1:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [0-9] , B : [2-3] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [1]) [2-3]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [0-9] , B : [2-3] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [2]) [2-3]
+    subIterK=2:
+      MFMA: [ 0] MFMAs (MT n, subIterK 2  ) A : [0-9] , B : [2-3] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [3]) [2-3]
+    subIterK=3:
+      MFMA: [ 0] MFMAs (MT n, subIterK 3  ) A : [0-9] , B : [2-3] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [0]) [4-5]
+  Partition 2:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [0-9] , B : [4-5] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [1]) [4-5]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [0-9] , B : [4-5] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [2]) [4-5]
+    subIterK=2:
+      MFMA: [ 0] MFMAs (MT n, subIterK 2  ) A : [0-9] , B : [4-5] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [3]) [4-5]
+    subIterK=3:
+      MFMA: [ 0] MFMAs (MT n, subIterK 3  ) A : [0-9] , B : [4-5] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [0]) [6-7]
+  Partition 3:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [0-9] , B : [6-7] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [1]) [6-7]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [0-9] , B : [6-7] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [2]) [6-7]
+    subIterK=2:
+      MFMA: [ 0] MFMAs (MT n, subIterK 2  ) A : [0-9] , B : [6-7] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [3]) [6-7]
+    subIterK=3:
+      MFMA: [ 0] MFMAs (MT n, subIterK 3  ) A : [0-9] , B : [6-7] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [0]) [8-9]
+  Partition 4:
+    subIterK=0:
+      MFMA: [ 0] MFMAs (MT n, subIterK 0  ) A : [0-9] , B : [8-9] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [1]) [8-9]
+    subIterK=1:
+      MFMA: [ 0] MFMAs (MT n, subIterK 1  ) A : [0-9] , B : [8-9] <- [2]
+      preMFMA path 0:
+        [ 2] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [2]) [8-9]
+    subIterK=2:
+      MFMA: [ 0] MFMAs (MT n, subIterK 2  ) A : [0-9] , B : [8-9] <- [3]
+      preMFMA path 0:
+        [ 3] wait_lr    wait_lr
+      path 0:
+        [ 1] lr         LR B  (MT n, subIterK [3]) [8-9]
+        [ 4] wait_lr    wait_lr
+        [ 5] sync       sync
+        [ 6] gr_inc     gr_inc(B)
+        [ 2] gr         GR B (MT n+2, subIterK [0,3]) ids [0-9]
+    subIterK=3:
+      MFMA: [ 0] MFMAs (MT n, subIterK 3  ) A : [0-9] , B : [8-9] <- [3]
+      preMFMA path 0:
+        [ 3] wait_lr    wait_lr
+      path 0:
+        [ 4] wait_gr    wait_gr(A=1,B=1)
+        [ 5] sync       sync
+        [ 6] lr_inc     lr_inc(A)
+        [ 7] lr_inc     lr_inc(B)
+        [ 1] lr         LR A  (MT n+1, subIterK [0]) [0-9]
+        [ 2] lr         LR B  (MT n+1, subIterK [0]) [0-1]
+"""
+
+
+def test_320x320_bf16_gfx1250_tdm_du128_partition_1x5():
+    """Exact check of emit dep order for 320x320 BF16 gfx1250+TDM, DepthU=128,
+    1x5 partition (test1250_320.yaml config)."""
+    cfg = make_320x320_bf16_gfx1250_tdm_du128()
+    sched = LogicalScheduler(cfg)
+    sched.emit()
+    actual = sched.print_emit_dep_order()
+    assert actual == EXPECTED_EMIT_DEP_ORDER_320x320_BF16_GFX1250_TDM_DU128_1x5, (
+        f"Emit dependency order mismatch.\n"
+        f"--- Expected ---\n{EXPECTED_EMIT_DEP_ORDER_320x320_BF16_GFX1250_TDM_DU128_1x5}\n"
+        f"--- Actual ---\n{actual}"
+    )
+
+
 def make_256x256_bf16_pgr0():
     kernel = create_kernel(256, 256, fp4=False, depthU=64)
     tiA = makeTileInfo('A', kernel)

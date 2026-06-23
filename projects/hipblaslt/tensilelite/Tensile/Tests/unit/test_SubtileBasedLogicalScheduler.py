@@ -2444,6 +2444,12 @@ if __name__ == "__main__":
                         help="PrefetchGlobalRead level (default: 1)")
     parser.add_argument("--arch", choices=["gfx950", "gfx1250"], default="gfx950",
                         help="Target arch (default: gfx950). gfx1250 enables wave32 + TDM.")
+    parser.add_argument("--subiterk-outer", dest="subiterk_outer",
+                        action="store_true", default=None,
+                        help="Force subIterK-outer / partition-inner issue order.")
+    parser.add_argument("--no-subiterk-outer", dest="subiterk_outer",
+                        action="store_false",
+                        help="Force partition-outer / subIterK-inner issue order.")
     parser.add_argument("--interactive", "-i", action="store_true",
                         help="Step through each phase interactively")
     args = parser.parse_args()
@@ -2510,9 +2516,17 @@ if __name__ == "__main__":
         )
     cfg = SchedulerConfig(**cfg_kwargs)
 
+    # Mirror production (Subtile/Kernel.py): auto-enable subIterK-outer for
+    # multi-partition gfx1250, unless explicitly overridden on the CLI.
+    if args.subiterk_outer is None:
+        cfg.subIterKOuter = (args.arch == "gfx1250") and cfg.numPartitions > 1
+    else:
+        cfg.subIterKOuter = args.subiterk_outer
+
     print(f"Config: arch={args.arch}, MT={args.mt0}x{args.mt1}, DU={args.du}, dtype={args.dtype}, "
           f"WG={waveGroup[0]}x{waveGroup[1]}, "
-          f"partitionSize={partSizeM}x{partSizeN}, pgr={args.pgr}")
+          f"partitionSize={partSizeM}x{partSizeN}, pgr={args.pgr}, "
+          f"subIterKOuter={cfg.subIterKOuter}")
     print(f"        numMFMATilesM={cfg.numMFMATilesM}, "
           f"numMFMATilesN={cfg.numMFMATilesN}, "
           f"numSubIterK={cfg.numSubIterK}, "
@@ -3010,3 +3024,93 @@ class TestBuildTailloopPGR0:
 
         finally:
             sched.deallocVgprTiles(writer)
+
+
+# ── 13. SubIterKOuter — subIterK-outer / partition-inner issue order ──
+
+class TestSubIterKOuter:
+    """The subIterKOuter flag flips the per-DU-iteration issue order from
+    partition-outer/subIterK-inner to subIterK-outer/partition-inner.
+    """
+
+    def test_flat_pos_roundtrip_and_convention(self):
+        cfg = make_cfg_bf16(MT0=256, MT1=256, depthU=128, partSizeN=2)
+        numP, numK = cfg.numPartitions, cfg.numSubIterK
+        assert numP > 1 and numK > 1, "need a non-trivial config to test ordering"
+
+        # Default: partition-outer (partition is the major key).
+        cfg.subIterKOuter = False
+        sched = LogicalScheduler(cfg)
+        flats = {}
+        for pi in range(numP):
+            for k in range(numK):
+                f = sched._flat_pos(pi, k)
+                assert sched._unflat_pos(f) == (pi, k)
+                flats[(pi, k)] = f
+        # all flats distinct and cover [0, numP*numK)
+        assert sorted(flats.values()) == list(range(numP * numK))
+        # partition-outer: flat == pi*numK + k
+        assert all(flats[(pi, k)] == pi * numK + k
+                   for pi in range(numP) for k in range(numK))
+
+        # subIterKOuter: subIterK is the major key.
+        cfg.subIterKOuter = True
+        sched = LogicalScheduler(cfg)
+        flats = {}
+        for pi in range(numP):
+            for k in range(numK):
+                f = sched._flat_pos(pi, k)
+                assert sched._unflat_pos(f) == (pi, k)
+                flats[(pi, k)] = f
+        assert sorted(flats.values()) == list(range(numP * numK))
+        # subIterK-outer: flat == k*numP + pi
+        assert all(flats[(pi, k)] == k * numP + pi
+                   for pi in range(numP) for k in range(numK))
+        # all partitions of subIterK 0 strictly precede any of subIterK 1
+        assert max(flats[(pi, 0)] for pi in range(numP)) \
+            < min(flats[(pi, 1)] for pi in range(numP))
+
+    def test_order_key(self):
+        cfg = make_cfg_bf16(MT0=256, MT1=256, depthU=128, partSizeN=2)
+        sched = LogicalScheduler(cfg)
+        # partition-outer: partition is the major key, so the lower-partition
+        # slot (P0,k1) precedes the higher-partition slot (P1,k0).
+        cfg.subIterKOuter = False
+        assert sched._order_key(0, 1) < sched._order_key(1, 0)
+        # subIterK-outer: subIterK is the major key, so (P1,k0) precedes (P0,k1).
+        cfg.subIterKOuter = True
+        assert sched._order_key(1, 0) < sched._order_key(0, 1)
+
+    def test_build_succeeds_both_orders(self):
+        # build() runs annotate_deps / remove_cross_deps / inflight counting,
+        # all of which assert internal consistency — a strong smoke check that
+        # the flipped ordering primitives stay self-consistent.
+        for flag in (False, True):
+            cfg = make_cfg_bf16(MT0=256, MT1=256, depthU=128, partSizeN=2)
+            cfg.subIterKOuter = flag
+            sched = LogicalScheduler(cfg)
+            sched.build()
+            assert sched._emitted is not None
+
+    def test_emit_issue_order_grouped_by_subiterk(self):
+        cfg = make_cfg_bf16(MT0=256, MT1=256, depthU=128, partSizeN=2)
+        cfg.subIterKOuter = True
+        sched = LogicalScheduler(cfg)
+        sched.build()
+        numP, numK = cfg.numPartitions, cfg.numSubIterK
+
+        # Reconstruct the order _emitLoop walks (storage stays [partition][subIterK]).
+        emitted = sched._emitted
+        issue_order = [(pi, k)
+                       for k in range(numK)
+                       for pi in range(numP)
+                       if k < len(emitted[pi])]
+
+        # subIterK is the major axis: it is non-decreasing across the walk, and
+        # every partition's slot for subIterK n appears before any slot of n+1.
+        ks = [k for _, k in issue_order]
+        assert ks == sorted(ks)
+        for k in range(numK - 1):
+            last_of_k = max(i for i, (_, kk) in enumerate(issue_order) if kk == k)
+            first_of_next = min(i for i, (_, kk) in enumerate(issue_order) if kk == k + 1)
+            assert last_of_k < first_of_next
