@@ -635,6 +635,9 @@ class LogicalScheduler:
         if self.config.plr == 0:
             return self._place_LRs_PLR0()
 
+        if self.config.subIterKOuter:
+            return self._place_LRs_subiterk_outer()
+
         cfg = self.config
         numP = cfg.numPartitions
         part_ranges = [self._partition_tile_range(pi) for pi in range(numP)]
@@ -664,6 +667,86 @@ class LogicalScheduler:
             for side in ('A', 'B'):
                 if load[side]:
                     loaded_ranges[side] = {cur[side], nxt[side]}
+
+        self._partitions = partitions
+        self._completed.add(Pass.LR)
+        return partitions
+
+    def _place_LRs_subiterk_outer(self) -> List[List[SubIterKSlot]]:
+        """LR placement for subIterK-outer / partition-inner issue order.
+
+        Issue order is flat = subIterK*numP + partition. The two operands stream
+        along different axes of that order:
+
+        - Per-partition tensors (B-side): every flat step (K, p) reads B[p, K],
+          which differs each step.  Stream B by prefetching the *next* flat
+          step's columns one step ahead; the 2 vgpr sets alternate per step so
+          the load never clobbers data the current/previous MFMA still needs.
+        - Shared tensors (A-side): A[*, K] is identical for all partitions at a
+          given K, so it changes only when subIterK advances.  Prefetch the next
+          K-chunk once, at partition 0 of the current chunk.
+
+        This mirrors the partition-outer placement with the partition and
+        subIterK roles swapped — the role swap is exactly what subIterKOuter
+        means.  Storage stays [partition][subIterK]; the emit/_order_key passes
+        linearize it to the flat issue order.
+        """
+        cfg = self.config
+        numK = cfg.numSubIterK
+        numP = cfg.numPartitions
+        part_ranges = [self._partition_tile_range(pi) for pi in range(numP)]
+        partitions = [self._create_partition_slots(part_ranges[pi])
+                      for pi in range(numP)]
+        nsteps = numK * numP
+
+        for tensor, gran in self._lr_tensors():
+            side = 'A' if tensor in ('A', 'SA') else 'B'
+            kg = gran.k
+            if side == 'B':
+                # Stream per-partition B across the flat issue order.
+                for i in range(nsteps):
+                    K, p = i // numP, i % numP
+                    j = i + 1
+                    if j < nsteps:
+                        nK, np_ = j // numP, j % numP
+                        mt = 0
+                    else:
+                        nK, np_ = 0, 0      # wrap to next macrotile iteration
+                        mt = 1
+                    nks = (nK // kg) * kg
+                    cur_ks = (K // kg) * kg
+                    # Skip when the next step reads the same (partition, chunk)
+                    # already resident — only relevant for gran.k > 1.
+                    if mt == 0 and np_ == p and nks == cur_ks:
+                        continue
+                    ts, te = part_ranges[np_][side]
+                    lr = LRPlacement(
+                        tensor=tensor,
+                        mtIteration=mt,
+                        tiles=MFMATileRange(nks, nks + kg, ts, te),
+                        subIterK_slot=K,
+                        partition=p,
+                    )
+                    partitions[p][K].lrs.append(lr)
+            else:
+                # Shared A: one prefetch per K-chunk, issued at partition 0.
+                for K in range(numK):
+                    if (K % kg) != 0:
+                        continue
+                    nks = K + kg
+                    if nks < numK:
+                        mt, nkse = 0, nks
+                    else:
+                        mt, nkse = 1, 0
+                    ts, te = part_ranges[0][side]
+                    lr = LRPlacement(
+                        tensor=tensor,
+                        mtIteration=mt,
+                        tiles=MFMATileRange(nkse, nkse + kg, ts, te),
+                        subIterK_slot=K,
+                        partition=0,
+                    )
+                    partitions[0][K].lrs.append(lr)
 
         self._partitions = partitions
         self._completed.add(Pass.LR)
@@ -906,6 +989,26 @@ class LogicalScheduler:
         for tensor in self.tensors:
             num_k_groups[tensor] = numK // lr_grans[tensor].k
 
+        # ── subIterK-outer: per-partition tensors stream by *flat step* ──
+        # Under subIterK-outer the per-partition (non-shared) operand changes
+        # every flat step (K*numP + partition), not every K.  Its 2 vgpr sets
+        # must therefore alternate per flat step so partition p+1's columns do
+        # not clobber partition p's before the MFMA reads them.  Shared operands
+        # keep the K-based parity (unchanged).
+        flat_streamed = set()
+        range_to_part = {}
+        if cfg.subIterKOuter and numP > 1:
+            for tensor in self.tensors:
+                side = TENSOR_SIDE[tensor]
+                shared = all(part_ranges[pi][side] == part_ranges[0][side]
+                             for pi in range(numP))
+                if not shared:
+                    flat_streamed.add(tensor)
+            for pi in range(numP):
+                for tensor in flat_streamed:
+                    side = TENSOR_SIDE[tensor]
+                    range_to_part[(side, part_ranges[pi][side])] = pi
+
         unroll_factor = 1
         for tensor in self.tensors:
             if num_k_groups[tensor] % 2 != 0:
@@ -918,6 +1021,17 @@ class LogicalScheduler:
         if pgr0:
             unroll_factor = 1
 
+        def _set_idx(tensor, mt, kk, part):
+            """VGPR set index for a (tensor, mt-iter, subIterK, partition)."""
+            if pgr0:
+                return 0
+            gran = lr_grans[tensor]
+            if tensor in flat_streamed:
+                nunits = (numK // gran.k) * numP
+                return (mt * nunits + (kk // gran.k) * numP + part) % 2
+            nkg = num_k_groups[tensor]
+            return (mt * nkg + kk // gran.k) % 2
+
         # ── Deterministic tile assignment ──
         for unroll_iter in range(unroll_factor):
             for pi, slots in enumerate(self._partitions):
@@ -927,8 +1041,7 @@ class LogicalScheduler:
                     if slot.mfma:
                         for tensor in self.tensors:
                             gran = lr_grans[tensor]
-                            nkg = num_k_groups[tensor]
-                            set_idx = 0 if pgr0 else (unroll_iter * nkg + k // gran.k) % 2
+                            set_idx = _set_idx(tensor, unroll_iter, k, pi)
                             side = TENSOR_SIDE[tensor]
                             tileRange = (slot.mfma.tileA if side == 'A'
                                          else slot.mfma.tileB)
@@ -944,10 +1057,15 @@ class LogicalScheduler:
                     for lr in slot.lrs:
                         tensor = lr.tensor
                         gran = lr_grans[tensor]
-                        nkg = num_k_groups[tensor]
                         target_mt = unroll_iter + lr.mtIteration
                         target_k = lr.tiles.subIterK_start
-                        set_idx = 0 if pgr0 else (target_mt * nkg + target_k // gran.k) % 2
+                        if tensor in flat_streamed:
+                            side = TENSOR_SIDE[tensor]
+                            tp = range_to_part[
+                                (side, (lr.tiles.tileId_start, lr.tiles.tileId_end))]
+                        else:
+                            tp = pi
+                        set_idx = _set_idx(tensor, target_mt, target_k, tp)
 
                         tile_map = {}
                         for t in lr.tiles.tileId_list:
@@ -1438,13 +1556,17 @@ class LogicalScheduler:
         order, skipping the current slot) providing a last LR for the same
         tensor. If that last LR's exec_order >= curLR's, the dep is redundant.
 
-        Exec order: (mt_offset, partition, subIterK_slot). On wrap-around
-        the mt_offset is shifted by -1.
+        Exec order: (mt_offset, *issue-order key). The issue-order key is
+        partition-outer (partition, subIterK) by default and subIterK-outer
+        (subIterK, partition) when subIterKOuter is set — using the wrong axis
+        order here would walk "previous syncs" in the wrong sequence and prune
+        a still-needed GR→LR collision dep. On wrap-around mt_offset is -1.
         """
         self._ensure_pass(Pass.REMOVE_GR_DEPS)
 
         def _dep_exec_order(dep):
-            return (dep.mt_offset, dep.ref.partition, dep.ref.subIterK_slot)
+            return (dep.mt_offset,
+                    *self._order_key(dep.ref.partition, dep.ref.subIterK_slot))
 
         # Step 1: collect one sync entry per sync slot.
         # Each entry: (pos, last_lr_by_tensor, [grs_to_check])
@@ -1481,7 +1603,9 @@ class LogicalScheduler:
             self._completed.add(Pass.REMOVE_LR_DEPS)
             return
 
-        sync_slots.sort(key=lambda x: x[0])
+        # Sort in issue order (subIterKOuter-aware); pos stays (pi, subIterK)
+        # for the same-slot equality check below.
+        sync_slots.sort(key=lambda x: self._order_key(x[0][0], x[0][1]))
         n = len(sync_slots)
 
         # Step 2 & 3: for each GR with LR dep, walk backward (with
