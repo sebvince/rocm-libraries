@@ -2491,10 +2491,15 @@ class LogicalScheduler:
 
         module = Module(label)
         module.addComment0(f"{label} start")
+        clusterBarrierWait = None
         if kernel.get("ClusterBarrier"):
-            from Tensile.Components.Subtile.ClusterBarrier import subtileClusterBarrier
-            for inst in subtileClusterBarrier(writer, kernel, label=label).flatitems():
+            from Tensile.Components.Subtile.ClusterBarrier import (
+                subtileClusterBarrierSignal, subtileClusterBarrierWait)
+            # Signal at the top of the section; the wait is spliced in below, a
+            # few WMMAs later, so the cluster barrier's latency is hidden.
+            for inst in subtileClusterBarrierSignal(writer, kernel, label=label).flatitems():
                 module.add(inst)
+            clusterBarrierWait = subtileClusterBarrierWait(writer, kernel, label=label)
         use_pap_preloop_skip = (
             label == "PRELOOP"
             and kernel.get("UseSubtileImpl")
@@ -2542,6 +2547,13 @@ class LogicalScheduler:
         # them (swap hoisted ahead, dscnt drain between), so no WAR can form.
         if self.config.pgr == 0 and label.startswith("MAINLOOP"):
             module = insertLRSwapWarWaitAlu(module, writer, kernel)
+        # Cluster barrier: splice the wait `gap` WMMAs after the signal, against
+        # the final post-schedule order, to hide its cross-CU latency.
+        if clusterBarrierWait is not None:
+            from Tensile.Components.Subtile.ClusterBarrier import (
+                spliceClusterBarrierWait, CLUSTER_BARRIER_WMMA_GAP)
+            gap = kernel.get("ClusterBarrierWmmaGap", CLUSTER_BARRIER_WMMA_GAP)
+            module = spliceClusterBarrierWait(module, clusterBarrierWait, gap)
         return module
 
     def emitMainAndExitLoops(self, writer, kernel, tensorParametersA=None, tensorParametersB=None):
@@ -2634,7 +2646,7 @@ class LogicalScheduler:
 
         # ── Mainloop ──
         module.addComment0("MAINLOOP")
-        loopBegin = Label("LoopBeginL", "")
+        loopBegin = Label("LoopBeginL", "", alignment=16)
 
         exitValue = self.config.pgr
 
