@@ -186,6 +186,13 @@ class SchedulerConfig:
     # it is partition-outer / subIterK-inner. Auto-enabled for multi-partition gfx1250.
     subIterKOuter: bool = False
 
+    # Overlapping LDS double-buffer (A-on-A): the two A buffers physically overlap
+    # ([B0|A0|A1|B1], A1 starts before A0 ends), so prefetching A clobbers the
+    # other A buffer's overlap region only ONE iteration away, not two. Prefetch
+    # 1-ahead (GR at mt n+1, offsetPartition=0) and detect the LDS collision on
+    # MT n & MT n+1 (period 1) instead of n & n+2. Applies to both A and B.
+    overlap1Ahead: bool = False
+
     # Resolve a partition spec into per-partition sizes along one dimension.
     # spec is either:
     #  - an explicit list (must sum to total)
@@ -1140,17 +1147,28 @@ class LogicalScheduler:
                                     tr.tileId_end, tr.subIterK_start,
                                     tr.subIterK_end, gr_gran))
 
-        # Cross-MT dedup: if a tile/k range appears at both n+1 and n+2,
-        # the n+1 load is redundant — the previous iteration's n+2 already
-        # wrote the same data into LDS.  Remove the n+1 duplicate.
+        # Cross-MT dedup: if a tile/k range appears at both n+1 and n+2, one is
+        # redundant. Default (2-ahead): keep n+2, drop the n+1 duplicate.
+        # Overlapping A-on-A 1-ahead: KEEP n+1, drop the n+2 duplicate — A1 must
+        # be written just one iteration ahead (it physically overlaps A0), and B
+        # follows the same 1-ahead cadence.
         base_mt = offsetMT
-        n2_keys = {(t, ts, te, ks, ke)
-                   for t, mt, ts, te, ks, ke, _ in gr_list
-                   if mt != base_mt}
-        gr_list = [entry for entry in gr_list
-                   if entry[1] != base_mt or
-                   (entry[0], entry[2], entry[3], entry[4], entry[5])
-                   not in n2_keys]
+        if self.config.overlap1Ahead:
+            n1_keys = {(t, ts, te, ks, ke)
+                       for t, mt, ts, te, ks, ke, _ in gr_list
+                       if mt == base_mt}
+            gr_list = [entry for entry in gr_list
+                       if entry[1] == base_mt or
+                       (entry[0], entry[2], entry[3], entry[4], entry[5])
+                       not in n1_keys]
+        else:
+            n2_keys = {(t, ts, te, ks, ke)
+                       for t, mt, ts, te, ks, ke, _ in gr_list
+                       if mt != base_mt}
+            gr_list = [entry for entry in gr_list
+                       if entry[1] != base_mt or
+                       (entry[0], entry[2], entry[3], entry[4], entry[5])
+                       not in n2_keys]
 
         return gr_list
 
@@ -1185,16 +1203,18 @@ class LogicalScheduler:
                         upper[key] = flat
         return lower, upper
 
-    @staticmethod
-    def _has_lr_conflict(lr_lower, tensor, mt_val, flat,
+    def _has_lr_conflict(self, lr_lower, tensor, mt_val, flat,
                          gr_t_start, gr_t_end, gr_k_start, gr_k_end):
         """Return True if placing GR(mt_val) at flat slot conflicts.
 
         GR(MT n+2) writes the same LDS buffer as MT n, so it conflicts if a
         later LR(MT n) — in flat execution order across all partitions —
         still reads an overlapping tile/subIterK range from that buffer.
+        With the overlapping A-on-A double-buffer the prefetch is 1-ahead, so the
+        colliding GR is mt n+1 (period 1) instead of n+2.
         """
-        if mt_val != 2:
+        prefetchMt = 1 if self.config.overlap1Ahead else 2
+        if mt_val != prefetchMt:
             return False
         for lr_flat, lr_ts, lr_te, lr_ks, lr_ke in lr_lower.get(tensor, []):
             if (lr_flat > flat and
@@ -1454,8 +1474,11 @@ class LogicalScheduler:
 
             # GR: depends on collision LR (LDS double-buffer)
             # GR(n+x) collides with LR(n+x-2) — same buffer, period 2.
+            # Overlapping A-on-A buffers couple adjacent iterations, so the
+            # collision is period 1 (GR(n+1) clobbers the overlap read at n).
+            collisionPeriod = 1 if cfg.overlap1Ahead else 2
             for gr in slot.grs:
-                target_data = gr.mtIteration - 2
+                target_data = gr.mtIteration - collisionPeriod
                 for lr in lr_by_tensor.get(gr.tensor, []):
                     if _range_overlaps(lr.tiles, gr.tiles):
                         mt_off = target_data - lr.mtIteration
@@ -2524,6 +2547,13 @@ class LogicalScheduler:
         """
         self._ensure_pass(Pass.LR)
         cfg = self.config
+
+        # Overlapping A-on-A 1-ahead: the preloop must prime only buffer0. Priming
+        # buffer1 (mt1) here would write A1, which physically overlaps A0 and would
+        # clobber it before the first read. buffer1 is prefetched 1-ahead inside
+        # the mainloop instead.
+        if cfg.overlap1Ahead:
+            return []
 
         seen = set()
         result = []

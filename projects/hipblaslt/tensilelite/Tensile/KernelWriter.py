@@ -346,6 +346,13 @@ class StateValues:
   ldsStartOffsetMXSA: int                = -1
   ldsStartOffsetMXSB: int                = -1
   ldsTotalSize: int                      = 0
+  # Overlapping A-on-A LDS double-buffer ([B0|A0|A1|B1], A0/A1 overlap). See
+  # lds_overlap_split_tdm_plan.md. ldsSwapDelta{A,B} are per-operand buffer base
+  # strides for the period-2 XOR swap (== ldsTotalSize on the default path).
+  overlapActive: bool                    = False
+  overlapBytes: int                      = 0
+  ldsSwapDeltaA: int                     = 0
+  ldsSwapDeltaB: int                     = 0
 
   dtvKIntervalA: int                     = 1
   dtvKIntervalB: int                     = 1
@@ -6821,7 +6828,46 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
       self.ldsTotalSize = sizeA + sizeB + sizeMXSA + sizeMXSB
 
-      kernel["LdsNumBytes"] = max(1, int(self.ldsTotalSize * kernel["NumLdsBlk"]))
+      # ── Overlapping A-on-A LDS double-buffer ────────────────────
+      # With per-row padding the double-buffer (2*ldsTotalSize) can exceed
+      # DeviceLDS by the padding excess. Reclaim it by laying the two buffers as
+      # [B0 | A0 | A1 | B1] with A1 starting `overlap` bytes before A0 ends, so
+      # A0 and A1 physically overlap (A0's top rows == A1's bottom rows). The
+      # scheduler prefetches A (and B) 1-ahead (overlap1Ahead) and detects the
+      # collision on MT n & n+1, so A1 is written just after A0's overlap rows
+      # are read. B0/B1 stay disjoint. Gated: gfx1250 TDM, no MX, period-2
+      # double-buffer, "needs overlap but fits once overlapped".
+      maxLDS    = int(self.states.archCaps["DeviceLDS"])
+      perBuffer = self.ldsTotalSize
+      isTDM     = bool(kernel.get("enableTDMA")) and bool(kernel.get("enableTDMB"))
+      noMX      = (sizeMXSA == 0 and sizeMXSB == 0)
+      self.overlapActive = False
+      self.overlapBytes  = 0
+      self.ldsSwapDeltaA = perBuffer   # default: adjacent buffers, uniform delta
+      self.ldsSwapDeltaB = perBuffer
+      if (isTDM and noMX and int(kernel["NumLdsBlk"]) == 2
+          and perBuffer <= maxLDS < 2 * perBuffer):
+        overlap = 2 * perBuffer - maxLDS          # == padding excess
+        assert overlap <= sizeA, \
+          ("A-on-A overlap (%d) exceeds sizeA (%d); A0/A1 cannot overlap" %
+           (overlap, sizeA))
+        self.overlapActive = True
+        self.overlapBytes  = overlap
+        # Layout [A0 | A1 | B0 | B1] — A stays at offset 0 (the LR read path
+        # assumes A's base is 0; only B's read adds ldsStartOffsetB), B sits
+        # after the overlapping A0/A1 so both B buffers are disjoint:
+        #   A0=[0,sizeA)  A1=[sizeA-overlap, 2sizeA-overlap)   (overlaps A0 tail)
+        #   B0=[2sizeA-overlap, 2sizeA-overlap+sizeB)
+        #   B1=[2sizeA-overlap+sizeB, 2sizeA-overlap+2sizeB)
+        self.ldsStartOffsetA = 0
+        self.ldsStartOffsetB = 2 * sizeA - overlap
+        self.ldsSwapDeltaA   = sizeA - overlap                 # A0 -> A1 (overlap)
+        self.ldsSwapDeltaB   = sizeB                           # B0 -> B1 (disjoint)
+
+      if self.overlapActive:
+        kernel["LdsNumBytes"] = max(1, int(2 * perBuffer - self.overlapBytes))  # union == maxLDS
+      else:
+        kernel["LdsNumBytes"] = max(1, int(self.ldsTotalSize * kernel["NumLdsBlk"]))
       if kernel["LdsNumBytes"] > self.states.archCaps["DeviceLDS"]:
         self.states.overflowedResources = 8
 

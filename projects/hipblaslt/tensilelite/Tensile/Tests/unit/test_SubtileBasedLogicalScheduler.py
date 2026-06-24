@@ -2452,6 +2452,12 @@ if __name__ == "__main__":
                         help="Force partition-outer / subIterK-inner issue order.")
     parser.add_argument("--interactive", "-i", action="store_true",
                         help="Step through each phase interactively")
+    parser.add_argument("--overlap", dest="overlap", nargs="?", const=True, default=False,
+                        help="Overlapping A-on-A LDS double-buffer: prefetch 1-ahead "
+                             "(GR at mt n+1) and detect the LDS collision on MT n & n+1 "
+                             "(period 1) for both A and B. Optional value (e.g. 2x2) is "
+                             "ignored at the scheduler level (overlap size only affects "
+                             "the LDS layout, not the dep period).")
     args = parser.parse_args()
 
     fp4 = args.dtype == "fp4"
@@ -2504,6 +2510,7 @@ if __name__ == "__main__":
         partitionSizeN=partSizeN,
         pgr=args.pgr,
         grPlacement=grPlacement,
+        overlap1Ahead=bool(args.overlap),
     )
     if fp4:
         cfg_kwargs.update(

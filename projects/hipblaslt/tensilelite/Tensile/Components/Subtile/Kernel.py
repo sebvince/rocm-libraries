@@ -1293,6 +1293,10 @@ def mainLoop(writer, kernel):
           partitionSizeN=partSizeN,
           pgr=schedulerPgr,
           grPlacement=grPlacement,
+          # Overlapping A-on-A LDS double-buffer (decided by KernelWriter LDS
+          # sizing): prefetch 1-ahead + period-1 collision. Must be a constructor
+          # arg so __post_init__ forces offsetPartition=0.
+          overlap1Ahead=bool(getattr(writer, "overlapActive", False)),
       )
 
       # gfx1250 multi-partition: issue subIterK-outer / partition-inner.

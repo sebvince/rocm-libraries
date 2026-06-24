@@ -751,14 +751,22 @@ def localReadDTLInitCommonSwapVgpr(writer, kernel):
   atile = writer.states.a.tileInfo
   btile = writer.states.b.tileInfo
 
+  # swapDelta == ldsTotalSize on the default path; with the overlapping A-on-A
+  # double-buffer the read pointer toggles by the per-operand base stride so A
+  # reads alternate A0<->A1 and B reads B0<->B1 in the [B0|A0|A1|B1] layout.
+  overlap = bool(getattr(writer, "overlapActive", False))
+  deltaA = writer.ldsSwapDeltaA if overlap else writer.ldsTotalSize
+  deltaB = writer.ldsSwapDeltaB if overlap else writer.ldsTotalSize
   stmp = writer.sgprPool.checkOut(1, tag="_localReadDTLInitCommonSwapVgpr_stmp")
-  module.add(SMovB32(dst=sgpr(stmp), src=writer.ldsTotalSize, comment="Store Total Lds Size for one buffer"))
+  module.add(SMovB32(dst=sgpr(stmp), src=deltaA, comment="A buffer swap delta"))
   for i in range(len(atile.sharedVgprLROffset)):
     vgprId = atile.sharedVgprLROffset[i]
     vgprSwapId = atile.sharedVgprLROffsetSwap[i]
     module.add(VAddU32(dst=vgpr(vgprSwapId), src0=vgpr(vgprId), src1=sgpr(stmp), comment=""))
     module.add(VXorB32(dst=vgpr(vgprSwapId), src0=vgpr(vgprId), src1=vgpr(vgprSwapId), comment=""))
 
+  if deltaB != deltaA:
+    module.add(SMovB32(dst=sgpr(stmp), src=deltaB, comment="B buffer swap delta"))
   for i in range(len(btile.sharedVgprLROffset)):
     vgprId = btile.sharedVgprLROffset[i]
     vgprSwapId = btile.sharedVgprLROffsetSwap[i]
