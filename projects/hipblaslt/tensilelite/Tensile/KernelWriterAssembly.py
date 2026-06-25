@@ -995,6 +995,16 @@ class KernelWriterAssembly(KernelWriter):
       module.add(self.defineSgpr("tdmLdsSwapMaskA", 1))
       module.add(self.defineSgpr("tdmLdsSwapMaskB", 1))
 
+    # Cluster-aware StaggerU wrap state (subtile TDM): per-tensor wrap countdown
+    # (numIter - S) and wrap delta (-(numIter-1)*depthUBytes). See
+    # emitSubtileStaggerSetup / _emitGRPtrUpdate_TLU0 in SubtileGREmit.py.
+    if (kernel["UseSubtileImpl"] and kernel["enableTDMA"] and kernel["enableTDMB"]
+        and int(kernel.get("StaggerU", 0)) != 0):
+      module.add(self.defineSgpr("StaggerCountdownA", 1))
+      module.add(self.defineSgpr("StaggerCountdownB", 1))
+      module.add(self.defineSgpr("StaggerWrapDeltaA", 1))
+      module.add(self.defineSgpr("StaggerWrapDeltaB", 1))
+
     return module
 
   def functionSignature(self) -> SignatureBase:

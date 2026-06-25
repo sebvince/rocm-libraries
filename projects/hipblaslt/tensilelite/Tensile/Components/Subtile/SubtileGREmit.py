@@ -25,8 +25,8 @@ from rocisa.enum import RegisterType
 from rocisa.instruction import (
     BufferLoadB128,
     SAddCU32, SAddU32, SAddU64, SAndB32, SMovB32, SMovB64, SMulI32, SNop, SOrB32, SXorB32,
-    SCBranchSCC1, SCmpEQU32, SEndpgm,
-    SLShiftLeftB64, SLShiftRightB32,
+    SBranch, SCBranchSCC0, SCBranchSCC1, SCmpEQU32, SCmpGeU32, SCSelectB32, SAShiftRightI32, SSubU32, SEndpgm,
+    SLShiftLeftB32, SLShiftLeftB64, SLShiftRightB32,
     VAddU32, VAndB32, VCmpXEqU32,
     VLShiftLeftB32, VLShiftRightB32, VMovB32,
     TensorLoadToLds,
@@ -515,6 +515,120 @@ def _emitGRLDSSwap_TLU0(tag, tile, ti, writer, kernel):
   return module
 
 
+# --- Cluster-aware StaggerU (subtile TDM) -----------------------------------
+
+def _subtileStaggerActive(kernel):
+  """True when cluster-aware StaggerU should be emitted for a subtile TDM kernel.
+
+  Gated on a non-zero solution StaggerU; A and B must both be TDM tensors
+  (the offset is folded into Address{A,B} which the descriptor syncs from).
+  """
+  return bool(kernel.get("UseSubtileImpl")
+              and kernel.get("enableTDMA") and kernel.get("enableTDMB")
+              and int(kernel.get("StaggerU", 0)) != 0)
+
+
+def _staggerStrideShift(kernel, bpe):
+  """Compile-time StaggerUStride shift: log2(StaggerUStride / (DepthU*bpe)).
+
+  StaggerUStride is clamped in Solution to a multiple of DepthU*bpe; for the
+  default stride (== DepthU*bpe) the shift is 0.
+  """
+  unit = int(kernel["DepthU"]) * int(bpe)
+  stride = int(kernel.get("StaggerUStride", 0)) or unit
+  if unit <= 0 or stride < unit:
+    return 0
+  return max(0, int(round(math.log2(stride / unit))))
+
+
+def emitSubtileStaggerSetup(writer, kernel):
+  """Cluster-uniform StaggerU setup for the subtile TDM path.
+
+  Offsets each cluster's K start by S*depthUBytes so consecutive clusters read
+  from different GL2 channels.  S is derived from the CLUSTER id
+  (cluster_x = WorkGroup0 >> log2(ClusterDim0)), so every workgroup in a
+  multicast cluster computes the SAME S and the shared multicast load stays
+  valid (ClusterDim0 is a power of two, so the divide is a shift; for
+  ClusterDim==[1,1] this degenerates to a per-workgroup stagger).
+
+  The K pointer is then wrapped once per loop in _emitGRPtrUpdate_TLU0 so the
+  rotated read order [S..n-1, 0..S-1] still covers every K block exactly once
+  (K-reduction is order independent).
+
+  Must be called after calculateLoopNumIter, while LoopCounterL == numIter
+  (pristine), and after the descriptor global address has been initialised.
+  """
+  module = Module("Subtile cluster StaggerU setup")
+  if not _subtileStaggerActive(kernel):
+    return module
+
+  magnitude = int(kernel["StaggerU"])                 # click count (power of two)
+  clusterX  = int(kernel["ClusterDim"][0])
+  log2cx    = int(round(math.log2(clusterX))) if clusterX > 1 else 0
+  bpeA      = int(writer.states.a.tileInfo.bpe)
+  strideShift = _staggerStrideShift(kernel, bpeA)
+
+  module.addComment1("Cluster-aware StaggerU: cluster-uniform StaggerUIter (S)")
+  with writer.allocTmpSgpr(4) as tmp:
+    curSU = tmp.idx          # currentStaggerU, shrinks to fit numIter
+    shifted = tmp.idx + 1
+    sIter = tmp.idx + 2      # final S
+    work  = tmp.idx + 3
+
+    # Fit the stagger mask to numIter: halve currentStaggerU (power of two)
+    # while (currentStaggerU << strideShift) > numIter (LoopCounterL).
+    beginL = Label(writer.labels.getNameInc("subtileStaggerFit"), "")
+    endL   = Label(writer.labels.getNameInc("subtileStaggerFitEnd"), "")
+    module.add(SMovB32(dst=sgpr(curSU), src=magnitude, comment="currentStaggerU = StaggerU"))
+    module.add(beginL)
+    module.add(SLShiftLeftB32(dst=sgpr(shifted), shiftHex=strideShift, src=sgpr(curSU),
+               comment="currentStaggerU << StaggerUStride"))
+    module.add(SCmpGeU32(src0=sgpr("LoopCounterL"), src1=sgpr(shifted), comment="numIter >= shifted?"))
+    module.add(SCBranchSCC1(labelName=endL.getLabelName(), comment="stagger fits in numIter"))
+    module.add(SLShiftRightB32(dst=sgpr(curSU), shiftHex=1, src=sgpr(curSU), comment="halve stagger"))
+    module.add(SBranch(labelName=beginL.getLabelName(), comment="retry fit"))
+    module.add(endL)
+    module.add(SSubU32(dst=sgpr(curSU), src0=sgpr(curSU), src1=1, comment="mask = currentStaggerU - 1"))
+
+    # cluster-uniform input: cluster_x = WorkGroup0 >> log2(ClusterDim0)
+    if log2cx > 0:
+      module.add(SLShiftRightB32(dst=sgpr(sIter), shiftHex=log2cx, src=sgpr("WorkGroup0"),
+                 comment="cluster_x = WorkGroup0 >> log2(ClusterDim0)"))
+    else:
+      module.add(SMovB32(dst=sgpr(sIter), src=sgpr("WorkGroup0"),
+                 comment="cluster_x = WorkGroup0 (ClusterDim0 == 1)"))
+    module.add(SAndB32(dst=sgpr(sIter), src0=sgpr(sIter), src1=sgpr(curSU), comment="S = mask & cluster_x"))
+    if strideShift > 0:
+      module.add(SLShiftLeftB32(dst=sgpr(sIter), shiftHex=strideShift, src=sgpr(sIter), comment="S <<= StaggerUStride"))
+    # Safety clamp: if S >= numIter, fall back to S = 0 (no stagger for this cluster).
+    module.add(SCmpGeU32(src0=sgpr(sIter), src1=sgpr("LoopCounterL"), comment="S >= numIter?"))
+    module.add(SCSelectB32(dst=sgpr(sIter), src0=0, src1=sgpr(sIter), comment="clamp over-large S to 0"))
+
+    # Apply per tensor: Address += S*du; init wrap state (countdown, wrap delta).
+    for tc in ("A", "B"):
+      ti = writer.states.a.tileInfo if tc == "A" else writer.states.b.tileInfo
+      du = int(ti.depthUBytes)
+      group0 = "tdm%sGroup0" % tc
+      module.addComment0("StaggerU apply %s: Address += S*%u, init wrap state" % (tc, du))
+      # Address{tc} += S * du
+      module.add(SMulI32(dst=sgpr(work), src0=sgpr(sIter), src1=du, comment="S * depthUBytes"))
+      module.add(SAddU32(dst=sgpr("Address%s+0" % tc), src0=sgpr("Address%s+0" % tc), src1=sgpr(work),
+                 comment="Address += S*du (lo)"))
+      module.add(SAddCU32(dst=sgpr("Address%s+1" % tc), src0=sgpr("Address%s+1" % tc), src1=0,
+                 comment="Address += S*du (carry)"))
+      module.add(SMovB64(dst=sgpr("%s+2" % group0, 2), src=sgpr("Address%s" % tc, 2), comment="sync descriptor global addr"))
+      module.add(SOrB32(dst=sgpr("%s+3" % group0), src0=sgpr("%s+3" % group0), src1=hex(2 << 30), comment="restore type field"))
+      # Wrap countdown = numIter - S (gr_inc that returns to row start).
+      module.add(SSubU32(dst=sgpr("StaggerCountdown%s" % tc), src0=sgpr("LoopCounterL"), src1=sgpr(sIter),
+                 comment="countdown = numIter - S"))
+      # Wrap delta = -((numIter-1)*du): added on the wrap gr_inc to return to base.
+      module.add(SSubU32(dst=sgpr(work), src0=sgpr("LoopCounterL"), src1=1, comment="numIter - 1"))
+      module.add(SMulI32(dst=sgpr(work), src0=sgpr(work), src1=du, comment="(numIter-1)*du"))
+      module.add(SSubU32(dst=sgpr("StaggerWrapDelta%s" % tc), src0=0, src1=sgpr(work),
+                 comment="wrap delta = -(numIter-1)*du"))
+  return module
+
+
 # --- GR pointer update (TLU=0) ----------------------------------------------
 
 @_emitGRPtrUpdate.register(GRTag_1x1)
@@ -527,9 +641,31 @@ def _emitGRPtrUpdate_TLU0(tag, tile, ti, writer, kernel):
   if kernel.get("enableTDM%s" % tc, False):
     module = Module(f"TDM GR Ptr Update ({tc})")
     inc = int(ti.depthUBytes)
+    group0 = "tdm%sGroup0" % tc
+    if _subtileStaggerActive(kernel):
+      # Cluster StaggerU: on the (numIter-S)-th gr_inc wrap back to row start
+      # (Address += -(numIter-1)*du) instead of +du, so the rotated read order
+      # [S..n-1, 0..S-1] covers every K block exactly once. Branchless so the
+      # instruction scheduler can interleave it with MFMAs.
+      module.addComment0("TDM addr update (cluster StaggerU wrap): %s" % tc)
+      with writer.allocTmpSgpr(2) as tmp:
+        delta = tmp.idx
+        deltaHi = tmp.idx + 1
+        module.add(SSubU32(dst=sgpr("StaggerCountdown%s" % tc), src0=sgpr("StaggerCountdown%s" % tc), src1=1,
+                   comment="countdown -= 1"))
+        module.add(SCmpEQU32(src0=sgpr("StaggerCountdown%s" % tc), src1=0, comment="wrap this gr_inc?"))
+        module.add(SCSelectB32(dst=sgpr(delta), src0=sgpr("StaggerWrapDelta%s" % tc), src1=inc,
+                   comment="delta = wrap ? -(numIter-1)*du : +du"))
+        module.add(SAShiftRightI32(dst=sgpr(deltaHi), shiftHex=31, src=sgpr(delta), comment="sign-extend delta"))
+        module.add(SAddU32(dst=sgpr("Address%s+0" % tc), src0=sgpr("Address%s+0" % tc), src1=sgpr(delta),
+                   comment="Address += delta (lo)"))
+        module.add(SAddCU32(dst=sgpr("Address%s+1" % tc), src0=sgpr("Address%s+1" % tc), src1=sgpr(deltaHi),
+                   comment="Address += delta (hi)"))
+      module.add(SMovB64(dst=sgpr("%s+2" % group0, 2), src=sgpr("Address%s" % tc, 2), comment="sync descriptor global addr"))
+      module.add(SOrB32(dst=sgpr("%s+3" % group0), src0=sgpr("%s+3" % group0), src1=hex(2 << 30), comment="restore type field"))
+      return module
     module.addComment0("TDM addr update: %s += %u" % (tc, inc))
     module.add(SAddU64(dst=sgpr("Address%s" % tc, 2), src0=sgpr("Address%s" % tc, 2), src1=inc))
-    group0 = "tdm%sGroup0" % tc
     module.add(SMovB64(dst=sgpr("%s+2" % group0, 2), src=sgpr("Address%s" % tc, 2), comment="sync descriptor global addr"))
     module.add(SOrB32(dst=sgpr("%s+3" % group0), src0=sgpr("%s+3" % group0), src1=hex(2 << 30), comment="restore type field"))
     return module

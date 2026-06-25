@@ -5039,6 +5039,12 @@ class KernelWriter(metaclass=abc.ABCMeta):
       module.add(tdmApplyStreamKOffsetSubtile(self, kernel, tensorParametersA))
       module.add(tdmApplyStreamKOffsetSubtile(self, kernel, tensorParametersB))
 
+    # Cluster-aware StaggerU: offset each cluster's K start (cluster-uniform so
+    # multicast stays valid). Runs after calculateLoopNumIter (LoopCounterL ==
+    # numIter, pristine) and after the descriptor address is initialised.
+    if hasTDM:
+      module.add(emitSubtileStaggerSetup(self, kernel))
+
     dtileInfo.allocVgprTileRegisters_legacy(self, kernel)
 
     if dtileInfo.vgprTiles:

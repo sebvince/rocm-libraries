@@ -109,6 +109,7 @@ from .SubtileGREmit import (
     emitSingleBufferLoad, emitSubtileBufferLoad, globalReadDoSubtile,
     globalReadDTLInitCommonSgpr, globalReadLDSBufferSwap, globalReadPtrUpdates,
     tdmGlobalOffsetSubtile, initTDMDescriptorSubtile, tdmApplyStreamKOffsetSubtile,
+    emitSubtileStaggerSetup,
 )
 from .SubtileLREmit import (
     _emitLocalReadOffset, _emitLocalRead,
