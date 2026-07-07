@@ -25,7 +25,7 @@ from rocisa.instruction import (
     SCBranchSCC1, SMovB32, VAddU32, VAndB32, VCmpGEI32, VCmpGTI32, VCmpLeI32,
     VCmpLtI32, VCndMaskB32, VLShiftLeftB32, VLShiftRightB32, VMovB32, VSubI32,
 )
-from rocisa.instruction import SWaitTensorcnt
+from rocisa.instruction import SWaitTensorcnt, STtraceData
 from rocisa.container import vgpr, sgpr, DSModifiers, ContinuousRegister
 from rocisa.code import Label
 
@@ -243,8 +243,13 @@ class InstructionEmitter:
         if self.kernel.get("enableTDMA", False) and self.kernel.get("enableTDMB", False):
             tdmCnt = 0 if force_drain else (counts.A + counts.B + counts.SA + counts.SB)
             label = "full drain" if force_drain else "tensor_load_to_lds"
-            return [SWaitTensorcnt(tensorcnt=tdmCnt,
-                                   comment=f"Wait TDM ({label}): A={counts.A} B={counts.B} SA={counts.SA} SB={counts.SB}")]
+            insts = []
+            # Emit a trace marker just before the tensorcnt wait on gfx1250.
+            if self.writer.states.asmCaps.get("HasClusterBarrier", False):
+                insts.append(STtraceData(comment="trace marker before tensorcnt wait"))
+            insts.append(SWaitTensorcnt(tensorcnt=tdmCnt,
+                                        comment=f"Wait TDM ({label}): A={counts.A} B={counts.B} SA={counts.SA} SB={counts.SB}"))
+            return insts
 
         # TODO. Hardcoded for now, but we should just get this from atomic emit codes (emitSingleBufferLoad, ...)
         grMap = {'A': max(1,int(1.0/self.tileInfoA.loadRatioGR)),

@@ -135,6 +135,27 @@ class TestInsertClusterBarrier:
         # exactly one WMMA -- the splice must not duplicate it
         assert sum("v_wmma" in ln for ln in lines) == 1
 
+    def test_wait_placed_five_wmma_after_signal(self):
+        """With enough WMMAs, the wait closes exactly _WMMA_SIGNAL_TO_WAIT after the signal."""
+        from Tensile.Components.Subtile.ClusterBarrier import (
+            insertClusterBarrier, _WMMA_SIGNAL_TO_WAIT)
+        _init_rocisa_gfx1250()
+        wmmas = [_fake_wmma(f"wmma{i}") for i in range(_WMMA_SIGNAL_TO_WAIT + 3)]
+        mod = _module(_wg_barrier(), *wmmas, _comment("tail"))
+        out = insertClusterBarrier(mod, _make_writer(), kernel={"ClusterBarrier": True})
+        lines = [ln for ln in str(out).splitlines() if ln.strip()]
+
+        wmma_lines = [i for i, ln in enumerate(lines) if "v_wmma" in ln]
+        signal = next(i for i, ln in enumerate(lines) if "s_barrier_signal -3" in ln)
+        wait = next(i for i, ln in enumerate(lines) if "s_barrier_wait -3" in ln)
+        # One WMMA is consumed to hide the election branch (inside the signal
+        # block); the wait then follows _WMMA_SIGNAL_TO_WAIT WMMAs after the signal.
+        after_signal = [w for w in wmma_lines if w > signal]
+        assert len(after_signal) >= _WMMA_SIGNAL_TO_WAIT
+        assert after_signal[_WMMA_SIGNAL_TO_WAIT - 1] < wait
+        # the wait is not shoved to the very end -- WMMAs remain after it
+        assert any(w > wait for w in wmma_lines)
+
     def test_signal_intact_when_no_wmma_follows(self):
         """No MFMA after the wg barrier: emit the signal block whole (best effort)."""
         from Tensile.Components.Subtile.ClusterBarrier import insertClusterBarrier

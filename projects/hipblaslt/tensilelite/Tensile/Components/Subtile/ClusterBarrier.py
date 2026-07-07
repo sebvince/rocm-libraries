@@ -17,12 +17,31 @@ from rocisa.instruction import (SBarrier, SCBranchSCC0, SCmpEQU32,
 
 _isWgBarrier = lambda x: isinstance(x, SBarrier) and "s_barrier_wait -1" in str(x)
 
+# Number of WMMAs to let issue after the signal before closing the handshake
+# with the wait. The wait is placed after this many WMMAs so the cluster
+# barrier's cross-CU latency hides behind them instead of exposing a stall.
+_WMMA_SIGNAL_TO_WAIT = 8
+
 
 def _findNextMFMA(items, start):
     """Index of the first MFMA at/after ``start``, or ``None`` if none follows."""
     for j in range(start, len(items)):
         if isinstance(items[j], (MFMAInstruction, MXMFMAInstruction)):
             return j
+    return None
+
+
+def _findNthMFMAEnd(items, start, n):
+    """Index just after the ``n``-th MFMA at/after ``start``.
+
+    Returns ``None`` if fewer than ``n`` MFMAs follow ``start``.
+    """
+    seen = 0
+    for j in range(start, len(items)):
+        if isinstance(items[j], (MFMAInstruction, MXMFMAInstruction)):
+            seen += 1
+            if seen == n:
+                return j + 1
     return None
 
 
@@ -55,9 +74,10 @@ def insertClusterBarrier(module, writer, kernel):
 
     No-op unless ``ClusterBarrier`` is enabled. The signal is spliced in right
     after the mainloop's existing workgroup barrier (reusing that sync instead of
-    emitting a second one); the wait is appended at the end of the section, so the
-    barrier's cross-CU latency overlaps the whole macro tile's WMMAs before the
-    handshake is closed.
+    emitting a second one); the wait is placed ``_WMMA_SIGNAL_TO_WAIT`` WMMAs
+    after the signal, so the barrier's cross-CU latency overlaps just those WMMAs
+    before the handshake is closed. If fewer than that many WMMAs follow the
+    signal, the wait falls back to the end of the section.
 
     If no workgroup barrier is found in this section, the signal is prepended at
     the start so the handshake is still opened (correctness over reuse).
@@ -125,8 +145,28 @@ def insertClusterBarrier(module, writer, kernel):
             head.add(inst)
         result = head
 
-    # Wait: append at the end of the section so cluster latency hides behind the
-    # whole macro tile's WMMAs before the handshake is closed.
-    for w in waitItems:
-        result.add(w)
-    return result
+    # Wait: close the handshake _WMMA_SIGNAL_TO_WAIT WMMAs after the signal so
+    # the cluster barrier's cross-CU latency hides behind exactly those WMMAs.
+    # The signal block ends at its last item (the skipPreSignal label); find it
+    # by identity and count WMMAs from just after it.
+    finalItems = result.flatitems()
+    signalMarker = signalItems[-1]
+    signalEnd = next((i for i, inst in enumerate(finalItems)
+                      if inst is signalMarker), None)
+    insertAt = (_findNthMFMAEnd(finalItems, signalEnd + 1, _WMMA_SIGNAL_TO_WAIT)
+                if signalEnd is not None else None)
+
+    if insertAt is None:
+        # Fewer than _WMMA_SIGNAL_TO_WAIT WMMAs after the signal (or no marker):
+        # fall back to closing the handshake at the end of the section.
+        for w in waitItems:
+            result.add(w)
+        return result
+
+    rebuilt = Module(module.name)
+    for i, inst in enumerate(finalItems):
+        rebuilt.add(inst)
+        if i + 1 == insertAt:
+            for w in waitItems:
+                rebuilt.add(w)
+    return rebuilt
