@@ -71,6 +71,8 @@ from .SubtileGeometry import (
   MFMA_16x16_1B_4K_8V,
   MFMA_16x16_1B_4N_4V,
   MFMA_SCALE_16x16_1B_MX32_8V,
+  WMMA_16x16_1B_4K_8V_W32,
+  WMMA_SCALE_16x16_1B_MX32_W32,
   TileGeometry,
   ABInputGeometry,
   ABGRGeometry,
@@ -302,6 +304,13 @@ AB_B8 = ABTilePair(
     lr=ABLRGeometry(tag=LRTag_1x1(), **_B8, subtileShape=(1, 1), loadShape=LoadShape(m=1, k=16)), # 128-bit LR: 16 fp8 along K
 )
 
+# Wave32 fp4: 8 VGPRs per operand (WMMA V3 gfx1250), same 1x2 subtile shape.
+_B4_W32 = dict(mmaLayout=WMMA_16x16_1B_4K_8V_W32, instK=128, bpe=0.5, supportedTypes=('fp4',))
+AB_B4_W32 = ABTilePair(
+    gr=ABGRGeometry(tag=GRTag_1x2(), **_B4_W32, subtileShape=(1, 2), loadShape=LoadShape(m=1, k=32)),
+    lr=ABLRGeometry(tag=LRTag_1x2(), **_B4_W32, subtileShape=(1, 2), loadShape=LoadShape(m=1, k=32)),
+)
+
 AB_B4_2x2 = ABTilePair(
     gr=ABGRGeometry(tag=GRTag_2x2(), **_B4, subtileShape=(2, 2), subtileCount=1, subtileStride=0, loadShape=LoadShape(m=1, k=32)),
     lr=ABLRGeometry(tag=LRTag_1x2(), **_B4, subtileShape=(2, 2), loadShape=LoadShape(m=1, k=32)),
@@ -329,6 +338,13 @@ _MXS_B8 = dict(scaleLayout=MFMA_SCALE_16x16_1B_MX32_8V, instK=128, bpe=1, suppor
 # LR: subtileShape=(2,2) -> 2 scale MMA tiles in M x 2 in K per local read
 MXSA_B4 = MXScaleTilePair(gr=MXScaleGRGeometry(**_MXS_B4, loadWidth=16), lr=MXScaleLRGeometry(**_MXS_B4, loadWidth=4))
 MXSB_B4 = MXScaleTilePair(gr=MXScaleGRGeometry(**_MXS_B4, loadWidth=16), lr=MXScaleLRGeometry(**_MXS_B4, loadWidth=4))
+
+# Wave32 (gfx1250) scale layouts: 2 scale bytes per lane instead of 1.
+_MXS_B4_W32 = dict(scaleLayout=WMMA_SCALE_16x16_1B_MX32_W32, instK=128, bpe=1, supportedTypes=('fp4',))
+MXSA_B4_W32 = MXScaleTilePair(gr=MXScaleGRGeometry(**_MXS_B4_W32, loadWidth=16),
+                              lr=MXScaleLRGeometry(**_MXS_B4_W32, loadWidth=4))
+MXSB_B4_W32 = MXScaleTilePair(gr=MXScaleGRGeometry(**_MXS_B4_W32, loadWidth=16),
+                              lr=MXScaleLRGeometry(**_MXS_B4_W32, loadWidth=4))
 MXSA_B8 = MXScaleTilePair(gr=MXScaleGRGeometry(**_MXS_B8, loadWidth=16), lr=MXScaleLRGeometry(**_MXS_B8, loadWidth=4))
 MXSB_B8 = MXScaleTilePair(gr=MXScaleGRGeometry(**_MXS_B8, loadWidth=16), lr=MXScaleLRGeometry(**_MXS_B8, loadWidth=4))
 
@@ -342,6 +358,8 @@ def selectMXScaleGeometry(kernel: dict, tc: str) -> MXScaleTilePair:
   data_tc = 'A' if tc == 'MXSA' else 'B'
   dtype = kernel["ProblemType"][f"DataType{data_tc}"]
   if dtype.is6bitFloat() or dtype.isFloat4():
+    if kernel["WavefrontSize"] == 32:
+      return MXSA_B4_W32 if tc == 'MXSA' else MXSB_B4_W32
     return MXSA_B4 if tc == 'MXSA' else MXSB_B4
   if dtype.is8bitFloat():
     return MXSA_B8 if tc == 'MXSA' else MXSB_B8
@@ -352,6 +370,7 @@ AB_GEOMETRY_MAP = {
   "AB_B16":      AB_B16,
   "AB_B16_2x2":  AB_B16_2x2,
   "AB_B4":       AB_B4,
+  "AB_B4_W32":   AB_B4_W32,
   "AB_B4_2x2":   AB_B4_2x2,
   "AB_B8":       AB_B8,
   "AB_B16_TLU1": AB_B16_TLU1,

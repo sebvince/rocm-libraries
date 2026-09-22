@@ -22,10 +22,22 @@ from rocisa.container import DSModifiers, MUBUFModifiers, vgpr, sgpr, mgpr
 from rocisa.instruction import (
     BufferLoadB128,
     DSLoadB32,
-    SAddCU32, SAddU32, SLShiftLeftB32, SMovB32, SMulI32, SNop, SXorB32,
+    SAddCU32, SAddU32, SAddU64, SLShiftLeftB32, SMovB32, SMovB64, SMulI32,
+    SNop, SOrB32, SXorB32,
+    TensorLoadToLds,
     VAddU32, VAndB32, VMulLOU32, VReadfirstlaneB32, VXorB32,
     VLShiftLeftB32, VLShiftRightB32,
 )
+
+
+def _scaleUsesTdm(kernel, tc):
+  """True when scale `tc` moves global->LDS with the TDM rather than DTL.
+
+  The DTL form (`buffer_load_b128 ... lds`) only exists on architectures with
+  HasDirectToLds -- gfx950 has it and no TDM, gfx1250 has the TDM and no DTL.
+  So the scales follow whichever mechanism their data tensor is using.
+  """
+  return bool(kernel.get("enableTDM%s" % tc[3], False))
 
 
 # ---------------------------------------------------------------------------
@@ -73,9 +85,16 @@ def emitScaleGROffset(ti, writer, kernel):
 # ---------------------------------------------------------------------------
 
 def emitScaleGRLoad(ti, writer, kernel):
-  """Emit buffer_load_b128 DTL for scale data (global -> LDS)."""
+  """Emit the scale global -> LDS load (TDM where available, else DTL)."""
   module = Module(f"Scale GR Load ({ti.tc})")
   tc = ti.tc
+
+  if _scaleUsesTdm(kernel, tc):
+    group0 = "tdm%sGroup0" % tc
+    group1 = "tdm%sGroup1" % tc
+    module.add(TensorLoadToLds(sgpr(group0, 4), sgpr(group1, 8), None, None,
+                               comment="TDM: global->LDS for %s" % tc))
+    return module
 
   isGlc = bool(kernel.get(f"NonTemporal{tc}", 0) & 0x1)
   isSlc = bool(kernel.get(f"NonTemporal{tc}", 0) & 0x2)
@@ -196,11 +215,23 @@ def emitScaleLRLoad(ti, writer, kernel):
 # ---------------------------------------------------------------------------
 
 def emitScaleGRPtrUpdate(ti, writer, kernel):
-  """Advance scale SRD base pointer by one depthU iteration."""
+  """Advance the scale base pointer by one depthU iteration."""
   module = Module()
   tc = ti.tc
 
   inc = int(ti.lrSubtileSize * ti.lrGlobalSubtileGrid[1])
+  if _scaleUsesTdm(kernel, tc):
+    # Mirrors _emitGRPtrUpdate_TLU0's TDM arm: advance Address{tc} and re-sync
+    # the descriptor, rather than bumping an SRD that the TDM never reads.
+    group0 = "tdm%sGroup0" % tc
+    module.addComment0("TDM addr update: %s += %u" % (tc, inc))
+    module.add(SAddU64(dst=sgpr(f"Address{tc}", 2), src0=sgpr(f"Address{tc}", 2), src1=inc))
+    module.add(SMovB64(dst=sgpr("%s+2" % group0, 2), src=sgpr(f"Address{tc}", 2),
+               comment="sync descriptor global addr"))
+    module.add(SOrB32(dst=sgpr("%s+3" % group0), src0=sgpr("%s+3" % group0),
+               src1=hex(2 << 30), comment="restore type field"))
+    return module
+
   module.addComment0("Scale SRD update: %s += %u" % (tc, inc))
   module.add(SAddU32(dst=sgpr(f"Srd{tc}"), src0=sgpr(f"Srd{tc}"), src1=inc))
   module.add(SAddCU32(dst=sgpr(f"Srd{tc}+1"), src0=sgpr(f"Srd{tc}+1"), src1=0))
@@ -212,9 +243,18 @@ def emitScaleGRPtrUpdate(ti, writer, kernel):
 # ---------------------------------------------------------------------------
 
 def emitScaleGRLDSSwap(ti, writer, kernel):
-  """Toggle scale GR DTL write target between double-buffer halves."""
+  """Toggle the scale GR write target between double-buffer halves."""
   module = Module()
   tc = ti.tc
+  if _scaleUsesTdm(kernel, tc):
+    # Mirrors globalReadLDSBufferSwap's TDM arm for A/B.
+    swapSgpr = "tdmLdsSwapMask%s" % tc
+    ldsAddrField = "tdm%sGroup0+1" % tc
+    module.addComment0("TDM: swap %s LDS buffer (XOR with per-tensor swap mask)" % tc)
+    module.add(SXorB32(dst=sgpr(ldsAddrField), src0=sgpr(ldsAddrField),
+               src1=sgpr(swapSgpr), comment="toggle descriptor LDS addr"))
+    return module
+
   module.addComment0("Emit code to swap %s GR m0 offsets"%tc)
   module.add(SXorB32(dst=sgpr(f"LocalWriteBaseAddr{tc}"),
              src0=sgpr(f"LocalWriteBaseAddr{tc}"), src1=sgpr(f"Swap{tc}"),
@@ -424,6 +464,12 @@ def globalReadDoScaleSubtile(tc, writer, kernel):
 
   tileInfo = writer.states.mxsa.tileInfo if tc == 'MXSA' else writer.states.mxsb.tileInfo
 
+  if _scaleUsesTdm(kernel, tc):
+    module.add(TensorLoadToLds(sgpr("tdm%sGroup0" % tc, 4), sgpr("tdm%sGroup1" % tc, 8),
+                               None, None,
+                               comment="TDM: global->LDS for %s" % tc))
+    return module
+
   isGlc = bool(kernel["NonTemporal%s"%tc] & 0x1)
   isSlc = bool(kernel["NonTemporal%s"%tc] & 0x2)
   isNT  = bool(kernel["NonTemporal%s"%tc] & 0x4)
@@ -508,6 +554,13 @@ def globalReadScalePtrUpdates(tc, writer, kernel):
 #
 def globalReadScaleSwizzledDTLInitCommonSgpr(writer, kernel):
   module = Module()
+
+  # DTL-only setup: with the TDM, the scale LDS write address lives in the
+  # descriptor -- initTDMDescriptorSubtile sets it, and emitScaleGRLDSSwap
+  # toggles it in place against tdmLdsSwapMask{tc} -- so LocalWriteBaseAddr{tc}
+  # and Swap{tc} are neither allocated nor read.
+  if _scaleUsesTdm(kernel, "MXSA") or _scaleUsesTdm(kernel, "MXSB"):
+    return module
 
   wavesize = kernel["WavefrontSize"]
   vgprWaveId = writer.vgprPool.checkOut(1, tag="globalReadScaleSwizzledDTLInitCommonSgpr_vgprWaveId")

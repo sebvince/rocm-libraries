@@ -93,6 +93,27 @@ def _needsPreLoopLocalReadDrain(kernel, numItersPLR, preLoopLocalReadDrainEmitte
               and not preLoopLocalReadDrainEmitted)
 
 
+def _subtileTdmNeedsRebase(kernel):
+  """True when the subtile TDM kernel must snapshot/re-base Address{A,B}.
+
+  Subtile+TDM advances Address{A,B} in place each unroll iteration, so a
+  workgroup that goes on to a *second* tile has to restore the tensor base
+  first. Only a persistent kernel does that: with StreamK off every workgroup
+  owns exactly one tile, the re-base is straight-line code that runs once
+  immediately after the snapshot, and AddressABase/AddressBBase are four dead
+  SGPRs -- which an MXFP4 kernel, carrying four TDM descriptor sets, cannot
+  spare. PAP is excluded because it prefetches the next tile's addresses ahead,
+  which a top-of-loop re-base would clobber.
+
+  The SGPR allocation and the emitted snapshot/re-base must agree, so both
+  sites call this.
+  """
+  return bool(kernel["enableTDMA"] and kernel["enableTDMB"]
+              and kernel["UseSubtileImpl"]
+              and not kernel["PrefetchAcrossPersistent"]
+              and kernel["StreamK"] != 0)
+
+
 # Make const values immutable
 @dataclass(frozen=True)
 class ConstValues():
@@ -5341,9 +5362,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
     # Snapshot the tensor base so each persistent iteration can re-base
     # Address{A,B} (advanced in place per iteration). PAP-off: PAP prefetches
     # next-tile addresses ahead, which a top-of-loop re-base would clobber.
-    subtileTdmRebase = (kernel["enableTDMA"] and kernel["enableTDMB"]
-                        and kernel["UseSubtileImpl"]
-                        and not kernel["PrefetchAcrossPersistent"])
+    subtileTdmRebase = _subtileTdmNeedsRebase(kernel)
     if subtileTdmRebase:
       module.add(SMovB64(dst=sgpr("AddressABase", 2), src=sgpr("AddressA", 2),
                          comment="snapshot tensor base A"))
@@ -5443,6 +5462,16 @@ class KernelWriter(metaclass=abc.ABCMeta):
       module.add(initTDMDescriptorSubtile(self, kernel, tensorParametersA))
       module.add(tdmGlobalOffsetSubtile(self, kernel, tensorParametersB))
       module.add(initTDMDescriptorSubtile(self, kernel, tensorParametersB))
+      # The MX scales move global->LDS the same way A and B do. gfx1250 has no
+      # direct-to-LDS buffer load (asmCaps HasDirectToLds=0), so the DTL scale
+      # path used on gfx950 cannot be emitted here -- the scales need their own
+      # TDM descriptors.
+      if kernel["ProblemType"]["MXBlockA"]:
+        module.add(tdmGlobalOffsetSubtile(self, kernel, tensorParametersA["MX"]))
+        module.add(initTDMDescriptorSubtile(self, kernel, tensorParametersA["MX"]))
+      if kernel["ProblemType"]["MXBlockB"]:
+        module.add(tdmGlobalOffsetSubtile(self, kernel, tensorParametersB["MX"]))
+        module.add(initTDMDescriptorSubtile(self, kernel, tensorParametersB["MX"]))
     if not hasTDM:
       module.add(graTileAssignment(self, kernel))
     module.add(lraTileAssignment(self, kernel))
@@ -9976,6 +10005,22 @@ class KernelWriter(metaclass=abc.ABCMeta):
               # do not allocate GRInc sgpr
               self.states.mxsb.numSgprGlobalReadIncs = 0
 
+      # A subtile tensor carried by the TDM never reads GlobalReadIncs at all:
+      # _emitGRPtrUpdate_TLU0's TDM arm advances Address{tc} by a compile-time
+      # increment and re-syncs the descriptor. The StreamK branch above already
+      # reclaims these, but the same holds with StreamK off, and an MXFP4
+      # kernel -- four TDM tensors instead of two -- cannot spare four dead
+      # SGPRs. Stagger is the one remaining consumer, so keep them for it.
+      if kernel["UseSubtileImpl"] and not self.states.staggerUCode:
+        for tc, st in (("A", self.states.a), ("B", self.states.b),
+                       ("MXSA", self.states.mxsa), ("MXSB", self.states.mxsb)):
+          dataTc = tc[-1]
+          if not kernel["enableTDM%s" % dataTc]:
+            continue
+          if tc.startswith("MXS") and not kernel["ProblemType"]["MXBlock%s" % dataTc]:
+            continue
+          st.numSgprGlobalReadIncs = 0
+
     ########################################
     # SGPR Assignment according to AMDGPU-ABI
     ########################################
@@ -10415,7 +10460,7 @@ class KernelWriter(metaclass=abc.ABCMeta):
 
     # Base snapshots for the subtile TDM persistent-loop re-base. Defined before
     # the nonPostLoopSgpr population so they survive the loop, like AddressA/B.
-    if kernel["UseSubtileImpl"] and kernel["enableTDMA"] and kernel["enableTDMB"]:
+    if _subtileTdmNeedsRebase(kernel):
       self.defineSgpr("AddressABase", numSgprAddressA, 2)
       self.defineSgpr("AddressBBase", numSgprAddressB, 2)
 

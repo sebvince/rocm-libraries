@@ -1237,7 +1237,11 @@ class KernelWriterAssembly(KernelWriter):
         module.add(RegSet("s", "sgprtdm%sGroup2" % mxs, "sgprtdm%sGroup2" % host))
         module.add(RegSet("s", "sgprtdm%sGroup3" % mxs, "sgprtdm%sGroup2" % host))
 
-    if kernel["enableTDMA"] and kernel["enableTDMB"] and kernel["NumWaves"] > 1:
+    # Subtile gives every tensor its own descriptor and advances it from
+    # Address{tc}, so it never parity-selects an increment: both *Incs SGPRs
+    # below would be allocated and never read.
+    if (kernel["enableTDMA"] and kernel["enableTDMB"] and kernel["NumWaves"] > 1
+        and not kernel["UseSubtileImpl"]):
       # tdmABIncs exists only to hold the parity-selected increment for the one
       # shared A/B descriptor.
       module.add(self.defineSgpr("tdmABIncs", 1))
@@ -1264,12 +1268,21 @@ class KernelWriterAssembly(KernelWriter):
       module.add(self.defineSgpr("tdmMetadataGroup0", 4, 4))
       module.add(self.defineSgpr("tdmMetadataGroup1", 8, 4))
 
-    # TDM LDS address tracking for aliased descriptors with subtile double-buffering
+    # Subtile double-buffering toggles each tensor's LDS write address between
+    # the two halves. Subtile gives every tensor its own descriptor set, and
+    # the descriptor's own LDS-address field (tdm{tc}Group0+1, nothing else
+    # packed in it) is the only writer, so the swap XORs that field in place;
+    # no shadow copy of the address is needed, only the per-tensor mask
+    # (addr XOR (addr + ldsTotalSize), which is address-dependent because
+    # ldsTotalSize is not a power of two).
     if kernel["UseSubtileImpl"] and kernel["enableTDMA"] and kernel["enableTDMB"]:
-      module.add(self.defineSgpr("tdmLdsAddrA", 1))
-      module.add(self.defineSgpr("tdmLdsAddrB", 1))
       module.add(self.defineSgpr("tdmLdsSwapMaskA", 1))
       module.add(self.defineSgpr("tdmLdsSwapMaskB", 1))
+      # The MX scales double-buffer on the same schedule as A/B.
+      if kernel["ProblemType"]["MXBlockA"]:
+        module.add(self.defineSgpr("tdmLdsSwapMaskMXSA", 1))
+      if kernel["ProblemType"]["MXBlockB"]:
+        module.add(self.defineSgpr("tdmLdsSwapMaskMXSB", 1))
 
     return module
 

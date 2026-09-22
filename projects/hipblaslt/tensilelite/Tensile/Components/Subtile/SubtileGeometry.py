@@ -160,6 +160,11 @@ class MMALayout:
 MFMA_16x16_1B_4K_4V = MMALayout(instM=16, blocks=1, vgprs=4, waveSize=64)  # bf16 / fp4
 MFMA_16x16_1B_4K_8V = MMALayout(instM=16, blocks=1, vgprs=8, waveSize=64)  # fp8
 #
+# gfx1250 WMMA is wave32: the same MMA tile is spread over half as many lanes,
+# so each lane holds twice the data. fp4 16x16x128 = 2048 elements = 1024 B;
+# over 32 lanes that is 32 B = 8 VGPRs per lane (vs 4 on wave64).
+WMMA_16x16_1B_4K_8V_W32 = MMALayout(instM=16, blocks=1, vgprs=8, waveSize=32)  # fp4 wave32
+#
 # C/D output layout (same lane mapping, groups handle M ranges instead of K):
 #   MFMA always accumulates in f32 (or i32) — 4 VGPRs per lane.
 #   Conversion to bf16 happens in the store path, not the MFMA output.
@@ -204,6 +209,10 @@ class MMAScaleLayout:
 #   Scale tile = instM(16) x 4 x 1B = 64B / 64 lanes = 1B per lane = 0.25 VGPRs.
 #   The 2x2 subtile shape covers 4 MMA scale tiles → 4 x 0.25 = 1 full VGPR per subtile.
 MFMA_SCALE_16x16_1B_MX32_8V = MMAScaleLayout(instM=16, blocks=1, vgprs=0.25, mxBlock=32, waveSize=64)
+#
+# gfx1250 wave32 counterpart: the same 64 B scale tile over 32 lanes is
+# 2 B per lane = 0.5 VGPRs.
+WMMA_SCALE_16x16_1B_MX32_W32 = MMAScaleLayout(instM=16, blocks=1, vgprs=0.5, mxBlock=32, waveSize=32)
 
 
 ################################################################################

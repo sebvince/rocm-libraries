@@ -1,0 +1,122 @@
+# Copyright Advanced Micro Devices, Inc., or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# MXFP4 counterpart of subtile_bf16_gfx1250_mt256x256_pgr2_cluster4x4_nosk.yaml.
+# Same kernel shape -- MT 256x256 (WG 2x2), PrefetchGlobalRead=2, 4x4 workgroup
+# cluster (ClusterDim [4, 4]), StreamK disabled, TDMInst 3 -- with the A/B
+# operands swapped from BF16 to MXFP4 (FP4 data plus one E8M0 scale per 32
+# elements).
+#
+# Deltas from the BF16 file, and why:
+#   MatrixInstruction  MI_K 32 -> 128.  FP4 WMMA on gfx1250 is 16x16x128
+#                      (cf. Tests/common/gemm/gfx12/mxf4_gfx1250.yaml).  MIWaveTile
+#                      stays 8x8 and MIWaveGroup stays 2x2, so MT is still 256x256.
+#   DepthU             128 -> 256.  Solution.py requires DepthU to be a multiple
+#                      of numSubIterK * MatrixInstK * LocalSplitU, and FP4 uses
+#                      numSubIterK=2 (AB_B4 subtileShape K=2), so the unit is
+#                      2 * 128 = 256.
+#   MXBlockA/B         32 -- one shared exponent per 32 FP4 elements (the "MX" in
+#                      MXFP4).  Implies the MXSA/MXSB scale tensors.
+#   DataTypeMXSA/B     e8 (E8M0), the OCP MX scale encoding.
+#   SubtileSqttMarkers dropped -- that parameter lives in uncommitted work on
+#                      develop and is not on this branch.
+#
+# MXScaleFormat is left at its "Auto" default, which this configuration
+# resolves to InMemorySwizzle (with MXLoadInst -> TDM).  Verified by deriving
+# the solution, not assumed -- do not hand-set it without re-checking.
+#
+# STATUS: this file does not produce a working kernel yet.  The solution
+# derives cleanly and the emitter runs to completion, but the subtile MX scale
+# path moves scales global->LDS with `buffer_load_b128 ... lds` (direct-to-LDS),
+# and gfx1250 has no direct-to-LDS at all (asmCaps HasDirectToLds=0,
+# HasTDM=1 -- the inverse of gfx950).  The emitted scale loads are therefore
+# not valid gfx1250 instructions.  Routing MX scales through the TDM
+# (tensor_load_to_lds), as A and B already are, is the outstanding work.
+
+TestParameters:
+  marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx950, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201, skip-stinkytofu]
+
+GlobalParameters:
+  # --- timing: these are what produce the `gflops` column ---
+  # SyncsPerBenchmark MUST be >= 1; 0 runs zero timed iterations, so time comes
+  # back NaN and gflops is NaN.
+  SyncsPerBenchmark: 1
+  EnqueuesPerSync: 200
+  MaxEnqueuesPerSync: 1000
+  NumWarmups: 2
+  NumBenchmarks: 1
+  PrintWinnersOnly: False
+  # 0 = skip element-wise validation. Set back to -1 to re-validate.
+  NumElementsToValidate: 0
+  PrintLevel: 2
+  Device: 0
+  CMakeBuildType: Release
+  KernelTime: True
+  DataInitTypeA: 3
+  DataInitTypeB: 3
+  DataInitTypeC: 3
+  DataInitTypeMXSA: 3
+  DataInitTypeMXSB: 3
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 2
+  BoundsCheck: 0
+  KeepBuildTmp: True
+  CpuThreads: 1
+  RotatingBufferSize: 0
+  Architecture: gfx1250
+  ISA: [[12, 5, 0]]
+  PrintSolutionRejectionReason: True
+
+BenchmarkProblems:
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F4
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      MXBlockA: 32
+      MXBlockB: 32
+      DataTypeMXSA: e8
+      DataTypeMXSB: e8
+      TransposeA: true
+      TransposeB: false
+      UseBeta: True
+      Batched: True
+
+    - InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [16, 16, 128, 1,  1, 8, 8,  2, 2]  # MT 256x256 WG 2x2
+        - DepthU: [256]
+        - WavefrontSize: [32]
+        - PrefetchGlobalRead: [2]
+        - PrefetchGL2: [0]
+        - ScheduleIterAlg: [3]
+        - UseSubtileImpl: [true]
+        - StreamK: [0]
+        - TDMInst: [3]
+        - StaggerU: [0]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - LdsPadMXSA: [-1]
+        - LdsPadMXSB: [-1]
+        - 1LDSBuffer: [0]
+        - StoreVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [-1]
+        - GlobalReadVectorWidthB: [-1]
+        - GlobalSplitU: [1]
+        - PreloadKernArgs: [False]
+        # Clustered launch: 16 WGs per cluster (Cs=4 M-axis peers sharing B,
+        # Ck=4 N-axis peers sharing A). Derives the cluster-scope barrier and
+        # TDM multicast for subtile.
+        - ClusterDim: [[4, 4]]
+      BenchmarkForkParameters:
+      JoinParameters:
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          # Full macro-tile multiples
+          - Exact: [4096, 4096, 1, 32768]   # exactly MT 256x256

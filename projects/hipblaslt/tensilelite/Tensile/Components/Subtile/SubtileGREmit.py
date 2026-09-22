@@ -984,13 +984,12 @@ def globalReadLDSBufferSwap(tc, writer, kernel):
   if tc in ['A', 'B']:
     ti_ = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
     if kernel.get("enableTDM%s" % tc, False):
-      ldsAddrSgpr = "tdmLdsAddr%s" % tc
       swapSgpr = "tdmLdsSwapMask%s" % tc
+      ldsAddrField = "tdm%sGroup0+1" % tc
       module = Module()
       module.addComment0("TDM: swap %s LDS buffer (XOR with per-tensor swap mask)" % tc)
-      module.add(SXorB32(dst=sgpr(ldsAddrSgpr), src0=sgpr(ldsAddrSgpr), src1=sgpr(swapSgpr), comment=""))
-      group0 = "tdm%sGroup0" % tc
-      module.add(SMovB32(dst=sgpr("%s+1" % group0), src=sgpr(ldsAddrSgpr), comment="sync descriptor LDS addr"))
+      module.add(SXorB32(dst=sgpr(ldsAddrField), src0=sgpr(ldsAddrField),
+                         src1=sgpr(swapSgpr), comment="toggle descriptor LDS addr"))
       return module
     return ti_.emitGRLDSBufferSwap(writer, kernel)
   else:
@@ -1104,6 +1103,16 @@ def initTDMDescriptorSubtile(writer, kernel, tP):
   bpe = tP["bpeGR"]
   isSubtileIter = _isSubtileIterateMode(kernel, tc)
 
+  # MX scale tensors ride the same descriptor machinery as A/B, but their
+  # extents are in scale units: one scale per MXBlock data elements along K,
+  # and the TDM walks them in groups of mxUnit (the scales one MFMA consumes).
+  isMX = tc.startswith("MXS")
+  if isMX:
+    subTc = tc[3]                                        # 'A' or 'B'
+    duScale = kernel["ProblemType"][f"MXBlock{subTc}"]   # 32
+    du //= duScale                                       # scales along K per DepthU
+    mxUnit = kernel["MatrixInstK"] // duScale            # scales per MFMA K-step
+
   numWaves = prod(kernel["MIWaveGroup"])
   wavelen = kernel["WavefrontSize"]
 
@@ -1111,6 +1120,8 @@ def initTDMDescriptorSubtile(writer, kernel, tP):
   ldsOffsetMap = {
     'A': writer.ldsStartOffsetA,
     'B': writer.ldsStartOffsetB,
+    'MXSA': getattr(writer, "ldsStartOffsetMXSA", 0),
+    'MXSB': getattr(writer, "ldsStartOffsetMXSB", 0),
   }
   ldsConstOffset = ldsOffsetMap.get(tc, 0)
 
@@ -1120,8 +1131,14 @@ def initTDMDescriptorSubtile(writer, kernel, tP):
   #   padIntervalBytes -> pad_interval [24:22], bytes written between pads
   # Sourced from TileInfo.ldsRowPadBytes so GR and LR
   # see the same value.
-  tileInfoForTc = writer.states.a.tileInfo if tc == 'A' else writer.states.b.tileInfo
-  padAmountBytes = int(getattr(tileInfoForTc, "ldsRowPadBytes", 0))
+  tileInfoMap = {
+    'A': writer.states.a.tileInfo,
+    'B': writer.states.b.tileInfo,
+    'MXSA': getattr(writer.states, "mxsa", None) and writer.states.mxsa.tileInfo,
+    'MXSB': getattr(writer.states, "mxsb", None) and writer.states.mxsb.tileInfo,
+  }
+  tileInfoForTc = tileInfoMap.get(tc)
+  padAmountBytes = int(getattr(tileInfoForTc, "ldsRowPadBytes", 0) or 0)
   padIntervalBytes = int(du * bpe) if padAmountBytes else 0
 
   mod.add(comp.initOperands(descSgprName(0), descSgprName(1), None, None))
@@ -1154,11 +1171,9 @@ def initTDMDescriptorSubtile(writer, kernel, tP):
     mod.add(SAddU32(sgpr(waveOffsetSgprIdx), sgpr(waveOffsetSgprIdx), ldsConstOffset,
             f"ldsOffset = woffset + {ldsConstOffset} (subtile LDS offset for {tc})"))
     mod.add(comp.setLdsAddr(descSgprName(0), sgpr(waveOffsetSgprIdx)))
-    # Save LDS offset to tracking SGPR for runtime double-buffer swap
-    ldsTrackSgpr = f"tdmLdsAddr{tc}"
-    mod.add(SMovB32(dst=sgpr(ldsTrackSgpr), src=sgpr(waveOffsetSgprIdx), comment=f"init {ldsTrackSgpr} for buffer tracking"))
     # Compute swap mask: swapMask = addr XOR (addr + ldsTotalSize)
-    # Used by globalReadLDSBufferSwap to toggle between buffer 0 and buffer 1.
+    # globalReadLDSBufferSwap XORs it straight into the descriptor's LDS
+    # address field to toggle between buffer 0 and buffer 1.
     swapMaskSgpr = f"tdmLdsSwapMask{tc}"
     ldsTotalSize = writer.ldsTotalSize
     mod.add(SAddU32(dst=sgpr(swapMaskSgpr), src0=sgpr(waveOffsetSgprIdx), src1=ldsTotalSize, comment=f"addr + ldsTotalSize({ldsTotalSize})"))
@@ -1171,13 +1186,35 @@ def initTDMDescriptorSubtile(writer, kernel, tP):
     mod.add(comp.setPadding(descSgprName(1), 0, 0))
   else:
     mod.add(comp.setPadding(descSgprName(1), padIntervalBytes, padAmountBytes))
-  mod.add(comp.setTensorDim0(descSgprName(1), sizeRefName(3), writer, sizeShifterDim))
-  mod.add(comp.setTensorDim1(descSgprName(1), sizeRefName(ti), writer))
+  if isMX:
+    # Scale tensors are laid out [free, K/MXBlock], i.e. transposed relative to
+    # a TLU=0 data tile, so dim0 carries the free extent and dim1 the K extent
+    # -- the opposite assignment from A/B below. Shifters convert element
+    # counts into the mxUnit-grouped units the descriptor walks. Mirrors the
+    # MXS branch of KernelWriterAssembly.initTDMDescriptorWaveSeparatedImpl.
+    mod.add(comp.setTensorDim0(descSgprName(1), sizeRefName(ti), writer,
+                               ceil(log2(mxUnit)), True))
+    mod.add(comp.setTensorDim1(descSgprName(1), sizeRefName(3), writer,
+                               ceil(log2(duScale * mxUnit)), True))
+  else:
+    mod.add(comp.setTensorDim0(descSgprName(1), sizeRefName(3), writer, sizeShifterDim))
+    mod.add(comp.setTensorDim1(descSgprName(1), sizeRefName(ti), writer))
 
   sizeShifterTile = sizeShifter
-  mod.add(comp.setTensorTile0(descSgprName(1), sizeTile0, writer, sizeShifterTile))
+  if isMX:
+    # One walk element is an mxUnit group of scales: tile0 spans this wave's
+    # rows expressed in those groups, tile1 the number of K-groups per DepthU.
+    mod.add(comp.setTensorTile0(descSgprName(1), sizeTile1 * mxUnit // numWaves,
+                                writer, sizeShifterTile))
+  else:
+    mod.add(comp.setTensorTile0(descSgprName(1), sizeTile0, writer, sizeShifterTile))
 
-  if isSubtileIter:
+  if isMX:
+    # K-groups per DepthU. The free-dim clamp the A/B branch applies below is
+    # already carried by dim0 (set from the free size above), so no runtime
+    # tile1 clamp is needed here.
+    mod.add(comp.setTensorTile1(descSgprName(1), sizeTile0 // mxUnit, writer))
+  elif isSubtileIter:
     # Iterate mode: one row per iteration.
     mod.add(comp.setTensorTile1(descSgprName(1), 1, writer))
   else:
@@ -1208,7 +1245,11 @@ def initTDMDescriptorSubtile(writer, kernel, tP):
                 sgpr(validRows), "set tile1 = clamped validRows"))
     else:
       mod.add(comp.setTensorTile1(descSgprName(1), perWaveRows, writer))
-  mod.add(comp.setTensorStride0(descSgprName(1), strideRefName(), sizeShifterTile))
+  if isMX:
+    mod.add(comp.setTensorStride0(descSgprName(1), sizeRefName(ti),
+                                  ceil(log2(mxUnit)), True))
+  else:
+    mod.add(comp.setTensorStride0(descSgprName(1), strideRefName(), sizeShifterTile))
 
   if isSubtileIter:
     dss = comp.dataSizeShift(dtype)
